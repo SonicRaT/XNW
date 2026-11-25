@@ -1,0 +1,53 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/xnw-core",
+    "crates/xnw-pe",
+    "crates/xnw-formats",
+    "crates/xnw-shader",
+    "crates/xnw-gpu",
+    "crates/xnw-hle",
+    "crates/xnw-frame",
+    "crates/xnw-device",
+    "crates/xnw-world",
+    "crates/xnw-loader",
+    "apps/xnw",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "GPL-3.0-or-later"
+publish = false
+
+[workspace.dependencies]
+xnw-pe = { path = "crates/xnw-pe" }
+xnw-core = { path = "crates/xnw-core" }
+xnw-formats = { path = "crates/xnw-formats" }
+xnw-shader = { path = "crates/xnw-shader" }
+xnw-gpu = { path = "crates/xnw-gpu" }
+xnw-hle = { path = "crates/xnw-hle" }
+xnw-frame = { path = "crates/xnw-frame" }
+xnw-device = { path = "crates/xnw-device" }
+xnw-world = { path = "crates/xnw-world" }
+xnw-loader = { path = "crates/xnw-loader" }
+# Direct3D 12 COM bindings (xnw-device, xnw-gpu, xnw-world, and xnw-shader's host checks).
+windows = "0.62"
+opus-pure = "0.2.4"
+miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"] }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+# dev = the everyday build: fast to compile, fast enough to run a title.
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+debug = "line-tables-only"

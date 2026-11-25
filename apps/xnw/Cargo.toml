@@ -1,0 +1,23 @@
+[package]
+name = "xnw"
+description = "XNW: command-line front end"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+xnw-pe.workspace = true
+xnw-gpu.workspace = true
+xnw-world.workspace = true
+xnw-core.workspace = true
+xnw-loader.workspace = true
+xnw-hle.workspace = true
+xnw-formats.workspace = true
+xnw-frame.workspace = true
+xnw-shader = { workspace = true, features = ["host"] }
+# Deflate for texture-info --sample (pack size).
+miniz_oxide.workspace = true
+
+[lints]
+workspace = true

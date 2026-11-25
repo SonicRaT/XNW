@@ -1,0 +1,15 @@
+[package]
+name = "xnw-formats"
+description = "Console data formats: texture layouts, audio codecs (XMA, Opus)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+opus-pure.workspace = true
+# Inflate for texture page files (ttpf.rs).
+miniz_oxide.workspace = true
+
+[lints]
+workspace = true

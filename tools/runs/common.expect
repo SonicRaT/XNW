@@ -1,0 +1,18 @@
+# Expectations every profile carries (read by xnw smoke).
+# #fail <regex>: any matching line fails the run. #expect <s> <regex>: must
+# appear by log second <s>. Regex: Python's subset (see apps/xnw/src/smoke.rs).
+#fail WARN  EXCEPTION 0x
+#fail UNIMPLEMENTED \S+!
+#fail run ended at the first unimplemented
+#fail panicked at
+#fail [Dd]evice removed
+#fail XErrorReport\(
+#fail d3d12x: no host device
+#fail is in no game drive folder
+# a switch value we did not understand (a mistyped watch file reads as items)
+#fail watch: skipped item
+#fail XNW_PATCH: no patch named
+#fail WARN  XNW_[A-Z_]+=\S*: not
+#fail XNW_MESH: unknown item
+# a mode that silently stops another: a profile states each mode's own line with #expect
+#expect 10 PresentX frame 1 \(

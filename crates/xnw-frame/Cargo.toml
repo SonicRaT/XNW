@@ -1,0 +1,17 @@
+[package]
+name = "xnw-frame"
+description = "Captured frames outside the title: the capture reader, the geometry decoders and the replay driver of our world pass"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+xnw-core.workspace = true
+xnw-gpu.workspace = true
+xnw-world.workspace = true
+xnw-formats.workspace = true
+xnw-shader = { workspace = true, features = ["host"] }
+
+[lints]
+workspace = true

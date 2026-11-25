@@ -1,0 +1,10 @@
+    0.000 info  run folder run-0001
+    0.106 info  mapped title at 0x7ff600000000
+    0.221 info  prebuild at launch: off (XNW_PREBUILD_LAUNCH=off)
+    0.221 info  entering title
+    1.812 WARN  frameskip: Null(Frame(1250)) (XNW_FRAMESKIP): skipped frames record but do not render
+    1.818 info  PresentX frame 1 (2 planes): the title made 0 draws, 0 dispatches; 0 other commands not recorded; 101 pipelines so far
+    2.015 info  PresentX frame 2 (2 planes): the title made 0 draws, 0 dispatches; 0 other commands not recorded; 50546 pipelines so far
+    2.427 info  frameskip: CPU per frame: title threads 0.0 ms, ours 0.0 ms
+    2.427 info  frameskip: 30 frames rendered, 0 skipped (null GPU: the wall time is the title's own CPU frame); a skipped frame 0.0 ms ours, 0.0 ms wall (min 0.0, max 0.0); game 3.43 s per wall second
+    5.891 info  present: 98.4 fps at frame 309 (2 planes per frame)

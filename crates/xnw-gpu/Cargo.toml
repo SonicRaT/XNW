@@ -1,0 +1,37 @@
+[package]
+name = "xnw-gpu"
+description = "Host D3D12 device and, later, D3D12.X on top of it"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+xnw-core.workspace = true
+xnw-device.workspace = true
+xnw-formats.workspace = true
+# Used-resource kinds for typed null descriptors (descriptor/host.rs) and
+# shader translation for pipelines (d3d12x/pipeline.rs, shader_cache.rs) and
+# the translated shaders' binding contract (draw.rs).
+# `host` on here too, so every graph with xnw-gpu builds xnw-shader once: without it
+# `cargo test -p xnw-shader` / `-p xnw-gpu` rebuilt both crates with other features.
+xnw-shader = { workspace = true, features = ["host"] }
+miniz_oxide.workspace = true
+
+[dependencies.windows]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_Performance",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+]
+
+[lints]
+workspace = true

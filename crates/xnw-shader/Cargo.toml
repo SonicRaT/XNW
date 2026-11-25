@@ -1,0 +1,47 @@
+[package]
+name = "xnw-shader"
+description = "Shader front end: RPF9 pack, SGD5 records, DXBC/DXIL containers, GFX10 decoder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Inflate for SGD5 records (raw deflate) and XBCH blobs (zlib).
+miniz_oxide.workspace = true
+# LoadLibraryW/GetProcAddress for the dxil.dll validator (Win32 declarations live in xnw-core).
+xnw-core.workspace = true
+# Host pipeline checks (`emit::host`, feature `host`); the device comes from xnw-gpu.
+windows = { workspace = true, optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_Threading",
+] }
+
+# The shader gate (a translation and validation check over a pack); needs only
+# this crate and xnw-core, so a translator edit rebuilds the two.
+[[bin]]
+name = "shader-gate"
+path = "src/bin/shader-gate.rs"
+
+[features]
+host = ["dep:windows"]
+diagnostics = []
+
+[dev-dependencies]
+# The host device for the device tests (`Host::for_tests`); not xnw-gpu, which would link this crate twice (BLD2).
+xnw-device.workspace = true
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_Threading",
+] }
+
+[lints]
+workspace = true

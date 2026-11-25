@@ -1,0 +1,6 @@
+    0.000 info  run folder run-0002
+    0.111 info  mapped title at 0x7ff600000000
+    0.217 info  entering title
+    0.939 WARN  EXCEPTION 0x80000003 (breakpoint) at title+0x1000 (fn 0xf80) on thread 9980
+    0.939 WARN    #0  title+0x1000
+    0.939 WARN    #1  xnw.exe+0xf0909

@@ -1,0 +1,27 @@
+[package]
+name = "xnw-world"
+description = "Our world pass: the title's draws as a frame list, drawn by our own host pipelines (above xnw-gpu)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+xnw-core.workspace = true
+xnw-gpu.workspace = true
+# Translated title programs in the bridge and the pre-skin (bridge.rs, preskin.rs); `host` as xnw-gpu has it (one copy).
+xnw-shader = { workspace = true, features = ["host"] }
+
+[dependencies.windows]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_Threading",
+]
+
+[lints]
+workspace = true
