@@ -32,9 +32,14 @@ pub enum Call {
     ProtectTrap,
     /// `ReadProcessMemory`: copies of title memory that must not fault.
     ReadCopy,
+    /// `ReadProcessMemory`: the app's guarded reads of title objects
+    /// (`watch::guarded_read`: the hook's buffer objects and palettes, the
+    /// texture table, the bridge taps, the geometry reads without
+    /// `geomcopy=direct`).
+    ReadProbe,
 }
 
-const NAMES: [&str; 11] = [
+const NAMES: [&str; 12] = [
     "VirtualQuery view check",
     "VirtualQuery fault",
     "VirtualQuery copy step",
@@ -46,6 +51,7 @@ const NAMES: [&str; 11] = [
     "VirtualProtect open",
     "VirtualProtect trap",
     "ReadProcessMemory copy",
+    "ReadProcessMemory probe",
 ];
 
 static COUNTS: [[AtomicU64; 2]; NAMES.len()] = [const { [const { AtomicU64::new(0) }; 2] }; NAMES.len()];

@@ -123,6 +123,16 @@ pub fn on_report(f: fn(&str)) {
     let _ = ON_REPORT.set(f);
 }
 
+/// A function the runner wants called at the first access violation
+/// outside every module (a JIT's), with the integer registers by name
+/// (`xnw run`: what each register pointing into a descriptor heap holds).
+static ON_FAULT: std::sync::OnceLock<fn(&[(&str, u64)])> = std::sync::OnceLock::new();
+
+/// Sets the [`ON_FAULT`] function, once.
+pub fn on_fault(f: fn(&[(&str, u64)])) {
+    let _ = ON_FAULT.set(f);
+}
+
 /// Calls the [`ON_REPORT`] function, if set.
 pub(crate) fn report(why: &str) {
     if let Some(f) = ON_REPORT.get() {
@@ -314,6 +324,32 @@ unsafe fn handle(info: *mut ExceptionPointers) -> i32 {
     if rec.code == 0xC000_0005 && rec.param_count >= 2 {
         let how = ["reading", "writing", "?", "?", "?", "?", "?", "?", "executing"];
         xnw_core::warn!("  {} address {:#x}: {}", how.get(rec.params[0]).unwrap_or(&"?"), rec.params[1], memory_at(rec.params[1]));
+        // Once: the code around a fault outside every module (a JIT's, such
+        // as WARP's shaders), from 0x180 before to 0x40 after, inside its
+        // page (what a WARP shader read at 0x388 through).
+        static CODE_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let loc = locate(rec.address);
+        if !loc.contains('+') && !CODE_SHOWN.swap(true, Ordering::Relaxed) {
+            let page = rec.address & !0xfff;
+            let (from, to) = (rec.address.saturating_sub(0x180).max(page), (rec.address + 0x40).min(page + 0x1000));
+            // SAFETY: the faulting instruction's own page, which the CPU fetched from.
+            let bytes = unsafe { std::slice::from_raw_parts(from as *const u8, to - from) };
+            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            xnw_core::warn!("  code from {from:#x} (fault at +{:#x}): {hex}", rec.address - from);
+            if let Some(f) = ON_FAULT.get() {
+                let mut regs: Vec<(&str, u64)> = Context::INT_NAMES.iter().enumerate().map(|(i, n)| (*n, ctx.get(Context::RAX + i * 8))).collect();
+                // The low 128 bits of xmm0-7 by dword lane (CONTEXT.Xmm0 at
+                // 0x1A0): a JIT keeps per-lane descriptor indices there.
+                const LANES: [&str; 32] = [
+                    "xmm0.0", "xmm0.1", "xmm0.2", "xmm0.3", "xmm1.0", "xmm1.1", "xmm1.2", "xmm1.3", "xmm2.0", "xmm2.1", "xmm2.2", "xmm2.3", "xmm3.0", "xmm3.1", "xmm3.2", "xmm3.3",
+                    "xmm4.0", "xmm4.1", "xmm4.2", "xmm4.3", "xmm5.0", "xmm5.1", "xmm5.2", "xmm5.3", "xmm6.0", "xmm6.1", "xmm6.2", "xmm6.3", "xmm7.0", "xmm7.1", "xmm7.2", "xmm7.3",
+                ];
+                for (k, name) in LANES.iter().enumerate() {
+                    regs.push((name, ctx.get(0x1A0 + k * 4) & 0xFFFF_FFFF));
+                }
+                f(&regs);
+            }
+        }
     }
     if rec.code == 0xC000_001D || rec.code == 0xC000_0096 {
         // SAFETY: the CPU refused the instruction at the address, so it fetched it.

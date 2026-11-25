@@ -3,7 +3,7 @@
 //! 10, 11, 62 and 86 pass) or by the first 24 bytes of one of its GFX10
 //! programs (what slots 57 and 67 pass: a code block of the title's
 //! pipeline cache starts with the same 24 bytes as the FSSM program it was
-//! compiled from; five-star-recomp `docs/pipeline-cache.md` "Shaders",
+//! compiled from; five-star-recomp "Shaders",
 //! GPL-3.0, measured there on 21,502 of 21,522 cache shaders).
 //!
 //! The index keeps places, not bytes: a container is read back from the

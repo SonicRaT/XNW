@@ -84,7 +84,7 @@ pub fn bridgems_cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, pas
     let counts = Arc::new([const { AtomicU64::new(0) }; 3]);
     pass.tex.set_provider(Some(pack.texel_provider(counts.clone())));
     let mut texels = pack.texel_provider(counts);
-    let mut decode = |key: &GeomKey| geoms.get(key).map(|(vb, idx)| HostGeometry { vertices: Vec::new(), indices: idx.clone(), raw_vb: Some(vb.clone()) });
+    let mut decode = |key: &GeomKey| geoms.get(key).map(|(vb, idx)| HostGeometry { vertices: Vec::new(), indices: idx.clone(), raw_vb: Some(vb.clone()), vb_place: 0 });
     let (w, h, n) = (pass.width, pass.height, list.draws.len() as u32);
 
     // The batch: programs once per pipeline, pipelines once per pair, one binding per row.
@@ -96,6 +96,24 @@ pub fn bridgems_cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, pas
     let empty_ps = xnw_shader::emit::HostShader { stage: xnw_shader::HwStage::Ps, dxil: Vec::new(), user_data: Vec::new(), samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: Vec::new(), root_srvs: Vec::new(), root_uavs: Vec::new(), address_map: false, descriptor_words: false };
     let (mut bridged, mut failed, mut other) = (Vec::new(), Vec::new(), 0u32);
     let mut layouts: Vec<u32> = Vec::new();
+    // `XNW_ZEROCOPY` (ZC2): the title ranges every row will bind, first, so
+    // views of one span of title memory share one buffer as they share the
+    // title's memory (rows name overlapping views of one buffer at their
+    // own addresses: MSB1's per-row large views).
+    if xnw_gpu::shared::world_part(xnw_gpu::shared::WORLD_BRIDGE) {
+        let mut ranges = Vec::new();
+        for &(k, draw, sink) in &rows {
+            let row = &list.draws[k];
+            let pipeline = pack.data.sinks.iter().find(|s| s.index == sink).map_or(0, |s| s.pipeline);
+            let Ok((_, used, hs)) = progs.entry(pipeline).or_insert_with(|| programs(&pack, sink)) else { continue };
+            if !wanted.contains(&((hs[0] >> 96) as u32)) {
+                continue;
+            }
+            let loaded = load(&pack, sink, &Row::with_palette(row, &list, &pack, draw), geoms.get(&row.geom).map(|g| &g.0[..]), used, &mut texels);
+            ranges.extend(loaded.ranges(bridge::KEEP_MIN));
+        }
+        batch.use_ranges(ranges);
+    }
     for &(k, draw, sink) in &rows {
         let row = &list.draws[k];
         let pipeline = pack.data.sinks.iter().find(|s| s.index == sink).map_or(0, |s| s.pipeline);
@@ -123,12 +141,13 @@ pub fn bridgems_cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, pas
         let mut loaded = load(&pack, sink, &Row::with_palette(row, &list, &pack, draw), geoms.get(&row.geom).map(|g| &g.0[..]), used, &mut texels);
         loaded.direct_meshlets();
         let d = loaded.draw();
+        let addrs = loaded.addrs();
         let added = bridge::bind(&p.ms, if title_ps { &p.ps } else { &empty_ps }, &d).and_then(|b| {
             let pk = batch.program(dev, (*hs, title_ps), || Ok(p.clone()))?;
             if !title_ps && batch.prog(pk).join.is_none() {
                 return Err("the mesh program writes no SV_Position".into());
             }
-            batch.add(dev, k as u32, pk, &b)
+            batch.add(dev, k as u32, pk, &b, &addrs)
         });
         match added {
             Ok(()) => bridged.push((k, title_ps)),
@@ -138,7 +157,7 @@ pub fn bridgems_cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, pas
     batch.finish(dev, &host.queue)?;
     let st = batch.stats.clone();
     println!(
-        "bridgems: {} rows of {} mesh programs ({} with the title's pixel program), {} groups; {} pipelines made in {:.0} ms; bindings {:.1} MB ({:.1} MB shared, {} large buffers merged, largest view heap {}; new MB by kind: large views {:.1}, small views {:.1}, textures {:.1}, root views {:.1}) in {:.0} ms; ring {:.1} MB; {} failed; {other} rows of other programs; prepared in {:.2} s",
+        "bridgems: {} rows of {} mesh programs ({} with the title's pixel program), {} groups; {} pipelines made in {:.0} ms; bindings {:.1} MB ({:.1} MB shared, {} large buffers merged, largest view heap {}; new MB by kind: large views {:.1}, small views {:.1}, textures {:.1}, root views {:.1}) in {:.0} ms; ring {:.1} MB; {} failed; {other} rows of other programs; prepared in {:.2} s; title memory (XNW_ZEROCOPY): in place {} views, on title spans {} views ({:.1} MB made of {} spans, {:.1} MB), {} conflicts",
         st.rows,
         st.programs,
         bridged.iter().filter(|b| b.1).count(),
@@ -156,8 +175,29 @@ pub fn bridgems_cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, pas
         st.upload_ms,
         st.ring_bytes as f64 / 1e6,
         failed.len(),
-        t0.elapsed().as_secs_f64()
+        t0.elapsed().as_secs_f64(),
+        st.in_place,
+        st.by_addr[0],
+        st.by_addr[1] as f64 / 1e6,
+        st.spans.0,
+        st.spans.1 as f64 / 1e6,
+        st.by_addr[2]
     );
+    let o = st.off_span;
+    println!(
+        "bridgems: large views off the spans (views, MB): no title address {} ({:.1}), outside every span {} ({:.1}), a byte another row holds differently {} ({:.1}), offset not a multiple of the unit {} ({:.1}); own words shadow {} B of other rows' copies, wrote over {} B",
+        o[0].0,
+        o[0].1 as f64 / 1e6,
+        o[1].0,
+        o[1].1 as f64 / 1e6,
+        o[2].0,
+        o[2].1 as f64 / 1e6,
+        o[3].0,
+        o[3].1 as f64 / 1e6,
+        st.shadowed,
+        st.overrode
+    );
+    println!("bridgems: device memory after the uploads: {}; this process: {}", xnw_gpu::d3d12x::resource::video_memory_text(), process_memory());
     for f in failed.iter().take(8) {
         println!("  {f}");
     }
@@ -274,4 +314,17 @@ mod tests {
         assert_eq!(verdict(0, 50, 0, 0.0), "ours none");
         assert_eq!(verdict(0, 0, 0, 0.0), "hidden");
     }
+}
+
+/// This process's commit and peak working set (bridgems' footprint, ZC2).
+fn process_memory() -> String {
+    use xnw_core::win::{GetCurrentProcess, K32GetProcessMemoryInfo, ProcessMemoryCounters};
+    // SAFETY: a plain query into a local of the size given.
+    let mut info: ProcessMemoryCounters = unsafe { std::mem::zeroed() };
+    info.cb = std::mem::size_of::<ProcessMemoryCounters>() as u32;
+    // SAFETY: as above.
+    if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut info, info.cb) } == 0 {
+        return "unknown".into();
+    }
+    format!("commit {} MiB (peak {}), working set peak {} MiB", info.pagefile_usage >> 20, info.peak_pagefile_usage >> 20, info.peak_working_set_size >> 20)
 }

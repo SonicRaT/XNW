@@ -403,7 +403,7 @@ fn frame_stats(frame: u64, preparing_us: u64, gpu_us: u64) {
         xnw_core::info!("frame stages to {frame} (per frame, us/count): {}; {}", stages.join(", "), super::host::texture_events_text(n));
         super::counters::lines(frame, n);
         xnw_core::info!("frame prebuild to {frame}: {}", super::pipeline::prebuild_text());
-        xnw_core::info!("frame bindless to {frame} (per frame): {}; {}", super::descriptor::host::stats_text(n), super::resource::held_text() + "; " + &super::descriptor::host::view_fix_text());
+        xnw_core::info!("frame bindless to {frame} (per frame): {}; {}", super::descriptor::host::stats_text(n), super::resource::held_text() + "; " + &super::descriptor::host::view_fix_text() + "; " + &super::descriptor::gate::stats_text());
         xnw_core::info!("frame addresses to {frame} (totals): {}", super::draw::addresses_text());
         if crate::shared::page_table_on() {
             xnw_core::info!("frame page table to {frame}: {}", super::draw::page_table_text());

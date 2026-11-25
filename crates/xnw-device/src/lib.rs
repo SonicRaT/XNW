@@ -42,6 +42,9 @@ pub struct Caps {
     pub int64_typed: bool,
     pub int64_heap: bool,
     pub enhanced_barriers: bool,
+    /// SM 6.1 barycentrics (OPTIONS3 BarycentricsSupported): `SV_Barycentrics`
+    /// and `GetAttributeAtVertex`.
+    pub barycentrics: bool,
     /// On the software adapter: the `d3d10warp.dll` the device runs on,
     /// its path and file version.
     pub warp_module: Option<String>,
@@ -128,6 +131,20 @@ fn warp_module() -> Option<String> {
     }
 }
 
+/// The last device's OPTIONS3 BarycentricsSupported (0: no device yet,
+/// 1: no, 2: yes); read by xnw-gpu's translation options.
+static HOST_BARYCENTRICS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Whether the device made last supports SM 6.1 barycentrics
+/// (`SV_Barycentrics`, `GetAttributeAtVertex`); `None` before any device.
+/// The RX 5700 XT reports no (inbox and Agility 1.610.5); WARP 1.0.22 yes.
+pub fn host_barycentrics() -> Option<bool> {
+    match HOST_BARYCENTRICS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        n => Some(n == 2),
+    }
+}
+
 pub struct Host {
     pub device: ID3D12Device,
     pub caps: Caps,
@@ -150,6 +167,17 @@ unsafe extern "system" fn layer_message(_category: D3D12_MESSAGE_CATEGORY, sever
     // SAFETY: the layer passes a NUL-terminated string that lives for the call.
     let text = unsafe { text.to_string() }.unwrap_or_default();
     xnw_core::warn!("d3d12 layer (severity {}, id {}): {text}", severity.0, id.0);
+}
+
+/// The shader patch mode `XNW_GPU_DEBUG`'s `gbv=state|unguarded|guarded`
+/// names (None: the layer's default).
+fn gbv_mode(v: &str) -> Option<D3D12_GPU_BASED_VALIDATION_SHADER_PATCH_MODE> {
+    v.split(',').find_map(|p| p.strip_prefix("gbv=")).and_then(|m| match m {
+        "state" => Some(D3D12_GPU_BASED_VALIDATION_SHADER_PATCH_MODE_STATE_TRACKING_ONLY),
+        "unguarded" => Some(D3D12_GPU_BASED_VALIDATION_SHADER_PATCH_MODE_UNGUARDED_VALIDATION),
+        "guarded" => Some(D3D12_GPU_BASED_VALIDATION_SHADER_PATCH_MODE_GUARDED_VALIDATION),
+        _ => None,
+    })
 }
 
 /// `D3D12SDKVersion` of the Agility SDK releases we know: 1.6xx.y is 6xx.
@@ -269,9 +297,38 @@ impl Host {
                 factory.CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
                 agility_version = Some(version);
             } else {
+                if std::env::var("XNW_GPU_DEBUG").is_ok_and(|v| v.contains("layer")) {
+                    // The system's validation layer (Graphics Tools) for the
+                    // inbox runtime: GPU-based validation of our own DXBC
+                    // programs on the inbox WARP (WARP 1.0.22 removes the
+                    // device under it, HANG1).
+                    let mut debug: Option<ID3D12Debug> = None;
+                    match D3D12GetDebugInterface(&mut debug).map(|()| debug.expect("interface on success")) {
+                        Ok(debug) => {
+                            debug.EnableDebugLayer();
+                            xnw_core::info!("host GPU: system validation layer on (XNW_GPU_DEBUG=layer)");
+                            if std::env::var("XNW_GPU_DEBUG").is_ok_and(|v| v.contains("gbv"))
+                                && let Ok(debug1) = debug.cast::<ID3D12Debug1>()
+                            {
+                                debug1.SetEnableGPUBasedValidation(true);
+                                xnw_core::info!("host GPU: GPU-based validation on (XNW_GPU_DEBUG=layer,gbv)");
+                            }
+                        }
+                        Err(e) => xnw_core::warn!("host GPU: no system validation layer: {e}"),
+                    }
+                }
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             }
             let device = device.expect("device on success");
+            if let Some(mode) = std::env::var("XNW_GPU_DEBUG").ok().as_deref().and_then(gbv_mode) {
+                // `gbv=state|unguarded|guarded`: how GPU-based validation
+                // patches shaders (the layer's default: unguarded).
+                let set = D3D12_DEBUG_DEVICE_GPU_BASED_VALIDATION_SETTINGS { MaxMessagesPerCommandList: 1024, DefaultShaderPatchMode: mode, PipelineStateCreateFlags: D3D12_GPU_BASED_VALIDATION_PIPELINE_STATE_CREATE_FLAG_NONE };
+                match device.cast::<ID3D12DebugDevice1>().and_then(|d| d.SetDebugParameter(D3D12_DEBUG_DEVICE_PARAMETER_GPU_BASED_VALIDATION_SETTINGS, (&raw const set).cast(), size_of_val(&set) as u32)) {
+                    Ok(()) => xnw_core::info!("host GPU: GPU-based validation shader patch mode {}", mode.0),
+                    Err(e) => xnw_core::warn!("host GPU: GPU-based validation patch mode not set: {e}"),
+                }
+            }
             if std::env::var("XNW_GPU_DEBUG").is_ok_and(|v| v.contains("layer")) {
                 // Every layer message as it is raised, on every path (the
                 // stored queue is read only where a failure is reported).
@@ -293,6 +350,7 @@ impl Host {
             }
             let o0 = feature(&device, D3D12_FEATURE_D3D12_OPTIONS, D3D12_FEATURE_DATA_D3D12_OPTIONS::default());
             let o1 = feature(&device, D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1::default());
+            let o3 = feature(&device, D3D12_FEATURE_D3D12_OPTIONS3, D3D12_FEATURE_DATA_D3D12_OPTIONS3::default());
             let o5 = feature(&device, D3D12_FEATURE_D3D12_OPTIONS5, D3D12_FEATURE_DATA_D3D12_OPTIONS5::default());
             let o7 = feature(&device, D3D12_FEATURE_D3D12_OPTIONS7, D3D12_FEATURE_DATA_D3D12_OPTIONS7::default());
             let o9 = feature(&device, D3D12_FEATURE_D3D12_OPTIONS9, D3D12_FEATURE_DATA_D3D12_OPTIONS9::default());
@@ -321,8 +379,10 @@ impl Host {
                 int64_typed: o9.is_some_and(|o| o.AtomicInt64OnTypedResourceSupported.as_bool()),
                 int64_heap: o11.is_some_and(|o| o.AtomicInt64OnDescriptorHeapResourceSupported.as_bool()),
                 enhanced_barriers: o12.is_some_and(|o| o.EnhancedBarriersSupported.as_bool()),
+                barycentrics: o3.is_some_and(|o| o.BarycentricsSupported.as_bool()),
                 warp_module: if warp() { warp_module() } else { None },
             };
+            HOST_BARYCENTRICS.store(1 + u8::from(caps.barycentrics), std::sync::atomic::Ordering::Relaxed);
             if let Some(m) = &caps.warp_module {
                 xnw_core::info!("host GPU: software adapter on {m}");
             }

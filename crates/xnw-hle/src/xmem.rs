@@ -111,6 +111,24 @@ pub extern "system" fn XMemVirtualAlloc(base: *mut c_void, size: usize, kind: u3
     at
 }
 
+/// A run's reservation made again at the address its log names (the
+/// burst's stand-in for title memory, ZC1): as [`XMemVirtualAlloc`] with
+/// that base, then kept as a reservation of our choosing is (a region, or a
+/// placeholder that may pair). False if the address is taken.
+pub fn replay_reservation(at: usize, size: usize, kind: u32, flags: u64, protect: u32) -> bool {
+    let placeholder = kind & PAGES_64K == PAGES_64K && kind & MEM_COMMIT == 0;
+    if XMemVirtualAlloc(at as *mut c_void, size, kind | MEM_RESERVE, flags, protect) as usize != at {
+        return false;
+    }
+    if !placeholder {
+        let committed = if kind & MEM_COMMIT != 0 { committed_in(at, at + size) } else { 0 };
+        lock(&REGIONS).insert(at, (size, committed));
+        COMMITTED.fetch_add(committed, Ordering::Relaxed);
+    }
+    pair_reservation(at, size, kind, protect, placeholder);
+    true
+}
+
 /// `MEMORY_BASIC_INFORMATION`, then the XMem flags and tag.
 #[repr(C)]
 pub struct BasicInformation {
@@ -393,6 +411,11 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> i
     if pages.is_null() {
         return 0;
     }
+    // Sections left without a page, and their windows: let go outside the
+    // lock (a heap release may wait for a frame of the world pass, whose
+    // lookups take this lock: ZC2).
+    let mut sections_gone = Vec::new();
+    let mut windows_gone = Vec::new();
     let freed = with_physical(|physical| {
         let mut freed = 0;
         for i in 0..n {
@@ -405,12 +428,19 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> i
             if *live == 0 {
                 // No page left: the GPU's heaps over it, then our windows go.
                 physical.sections.remove(&key);
-                xnw_gpu::shared::section_gone(key);
-                physical.windows.retain(|&(k, _), _| k != key);
+                sections_gone.push(key);
+                let gone: Vec<(usize, usize)> = physical.windows.keys().filter(|k| k.0 == key).copied().collect();
+                for k in gone {
+                    windows_gone.extend(physical.windows.remove(&k));
+                }
             }
         }
         freed
     });
+    for key in sections_gone {
+        xnw_gpu::shared::section_gone(key);
+    }
+    drop(windows_gone);
     // SAFETY: as above.
     xnw_formats::origin::registry().forget_frames(unsafe { std::slice::from_raw_parts(pages, n) });
     PHYSICAL_BYTES.fetch_sub(freed * PAGE, Ordering::Relaxed);
@@ -573,7 +603,22 @@ pub extern "system" fn XMemMapPhysicalPages(address: *mut c_void, n: usize, page
 
 fn map_physical(address: *mut c_void, n: usize, pages: Option<&[usize]>) -> *mut c_void {
     let base = address as usize;
-    with_physical(|physical| {
+    // `XNW_ZEROCOPY` (ZC2): the windows over the pages mapped, asked of the
+    // opener thread outside the lock, so a frame finds their heaps open.
+    let mut wanted: Vec<(usize, usize)> = Vec::new();
+    let out = with_physical(|physical| {
+        if xnw_gpu::shared::world_on()
+            && let Some(pages) = pages
+        {
+            for page in pages {
+                if let Some(s) = physical.pages.get(page) {
+                    let w = (section_key(&s.section), s.index * PAGE / xnw_gpu::shared::WINDOW_STRIDE);
+                    if wanted.last() != Some(&w) && !wanted.contains(&w) {
+                        wanted.push(w);
+                    }
+                }
+            }
+        }
         let done = map_pages(physical, base, n, pages);
         if let Some(gpu) = physical.pair.and_then(|p| p.gpu_of(base, n * PAGE)) {
             // A failed CPU mapping leaves both views empty there.
@@ -587,7 +632,13 @@ fn map_physical(address: *mut c_void, n: usize, pages: Option<&[usize]>) -> *mut
             }
         }
         if done { address } else { std::ptr::null_mut() }
-    })
+    });
+    if !out.is_null() {
+        for (section, w) in wanted {
+            xnw_gpu::shared::world_mapped(section, w * xnw_gpu::shared::WINDOW_STRIDE, 1);
+        }
+    }
+    out
 }
 
 fn map_pages(physical: &mut Physical, base: usize, n: usize, pages: Option<&[usize]>) -> bool {

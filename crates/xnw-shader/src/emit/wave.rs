@@ -1,4 +1,6 @@
 // Ported from VIctory crates/victory-shader/src/emit/wave.rs, commit d2a4bae1f49533ef5cb512fd1b1ba1513f2e1989, GPL-3.0-or-later.
+// The f16 reductions (`Op::AddH`, `Sym::Half`, `Shape::Half`, `half`) from VIctory 8af04727dc3d978e27b1de6abe11789878bb733a
+// (same file and licence), verbatim; its 64-bit sums (`v_add_co_u32`) left out (HEAD2).
 //! Whole-wave sections (decision 0003): code between `s_or_saveexec -1`
 //! (or `s_nand_saveexec 0`) and the restore of the saved mask runs in every lane of the console's
 //! wave, the inactive ones included, which is how the compiler expands
@@ -31,6 +33,8 @@ pub(crate) enum Op {
     Or,
     And,
     Xor,
+    /// `v_add_f16`: on the low halves (see [`Sym::Half`]).
+    AddH,
 }
 
 impl Op {
@@ -61,12 +65,13 @@ impl Op {
             Op::MaxI => k == 0x8000_0000,
             Op::MinF => k == 0x7F80_0000,
             Op::MaxF => k == 0xFF80_0000,
+            Op::AddH => k & 0x7FFF == 0,
         }
     }
 
     /// Counting a lane twice changes the result.
     fn counts(self) -> bool {
-        matches!(self, Op::AddU | Op::AddF | Op::Xor)
+        matches!(self, Op::AddU | Op::AddF | Op::Xor | Op::AddH)
     }
 }
 
@@ -87,6 +92,18 @@ pub(crate) enum Sym {
         ident: u32,
         lanes: u64,
     },
+    /// A 16-bit operation's result: the low half is `op` over `lanes` of
+    /// the low halves of `mask ? src : ident`; the high half is that of
+    /// lane `hi`'s `mask ? src : ident` (16-bit results keep the
+    /// register's high half).
+    Half {
+        op: Op,
+        src: Value,
+        mask: Value,
+        ident: u32,
+        lanes: u64,
+        hi: u32,
+    },
 }
 
 /// What a value a section leaves holds in every lane.
@@ -100,6 +117,9 @@ pub(crate) enum Shape {
     Active(Op, Value, Value, u32),
     /// `op` over the lanes below (`inclusive`: and including) each lane.
     Prefix(Op, Value, Value, u32, bool),
+    /// [`Sym::Half`] over every lane: `op`, src, mask, identity, the lane
+    /// giving the high half.
+    Half(Op, Value, Value, u32, u32),
 }
 
 /// The section starting at instruction `start` of a block: its restore
@@ -228,6 +248,69 @@ fn combine(op: Op, a: Sym, b: Sym) -> Sym {
             }
         }
         _ => Sym::Unknown,
+    }
+}
+
+/// A lane of 16-bit `op` on the low halves of `a` and `b`, the high half
+/// kept from the destination's `old` value.
+fn half(op: Op, a: Sym, b: Option<Sym>, old: Sym) -> Sym {
+    // A low half: the identity, or `op` over lanes of one masked source.
+    let low = |s: Sym| match s {
+        Sym::K(k) if op.identity(k) => Some(None),
+        Sym::Red {
+            op: None,
+            src,
+            mask,
+            ident,
+            lanes,
+        } if op.identity(ident) => Some(Some((src, mask, ident, lanes))),
+        Sym::Half {
+            op: o,
+            src,
+            mask,
+            ident,
+            lanes,
+            ..
+        } if o == op => Some(Some((src, mask, ident, lanes))),
+        _ => None,
+    };
+    let (src, mask, ident, hi) = match old {
+        Sym::Red {
+            op: None,
+            src,
+            mask,
+            ident,
+            lanes,
+        } if lanes.is_power_of_two() => (src, mask, ident, lanes.trailing_zeros()),
+        Sym::Half {
+            src,
+            mask,
+            ident,
+            hi,
+            ..
+        } => (src, mask, ident, hi),
+        _ => return Sym::Unknown,
+    };
+    let (Some(x), Some(y)) = (low(a), b.and_then(low)) else {
+        return Sym::Unknown;
+    };
+    let mut lanes = 0;
+    for (s, m, i, l) in [x, y].into_iter().flatten() {
+        if (s, m, i) != (src, mask, ident) || lanes & l != 0 {
+            return Sym::Unknown;
+        }
+        lanes |= l;
+    }
+    if lanes == 0 {
+        return Sym::Unknown;
+    }
+    Sym::Half {
+        op,
+        src,
+        mask,
+        ident,
+        lanes,
+        hi,
     }
 }
 
@@ -469,6 +552,12 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     })
                     .collect()
             }
+            ("v_add_f16", Some(a)) if v.opsel == 0 => {
+                let b = src(1).unwrap_or_default();
+                (0..wave as usize)
+                    .map(|l| half(Op::AddH, a[l], b.get(l).copied(), old[l]))
+                    .collect()
+            }
             (n, Some(a)) => match (Op::of(n), src(1)) {
                 (Some(op), Some(b)) => (0..wave as usize)
                     .map(|l| combine(op, a[l], b[l]))
@@ -531,6 +620,14 @@ fn shapes(
             ident,
             lanes,
         } if lanes == all => Some(Shape::Active(op, src, mask, ident)),
+        Sym::Half {
+            op,
+            src,
+            mask,
+            ident,
+            lanes,
+            hi,
+        } if lanes == all => Some(Shape::Half(op, src, mask, ident, hi)),
         _ => None,
     };
     for (v, s) in uni {
@@ -658,6 +755,43 @@ mod tests {
     /// the other half and enables only its own bits (five-star-recomp
     /// 2781f9c / 3160ea5 enabled every lane there). Synthetic words, same
     /// sequence: the section's result is the exclusive prefix.
+    #[test]
+    fn f16_wave_sum_is_one_half_reduction() {
+        // HEAD2: compute_graph_ops:CS_TransposeVecMatMulAlignedOperation
+        // (168936d7, 0x19c-0x1e8): a wave64 sum of f16 values (VIctory 8af04727's case).
+        let words: [u32; 21] = [
+            0xBE84_25C1, // s_or_saveexec_b64 s[4:5], -1
+            0xD501_0001,
+            0x0012_0E80, // v_cndmask_b32 v1, 0, v7, s[4:5]
+            0x6402_02E9,
+            0xDE54_C101, // v_add_f16 v1, v1, v1 dpp8:[1,0,3,2,5,4,7,6]
+            0x6402_02E9,
+            0x9360_1201, // dpp8:[2,2,0,0,6,6,4,4]
+            0x6402_02E9,
+            0x0009_2401, // dpp8:[4,4,4,4,0,0,0,0]
+            0x6402_02FA,
+            0xFF09_4001, // v_add_f16 v1, v1, v1 row_mirror bound_ctrl:1
+            0xD778_0002,
+            0x0201_0101, // v_permlanex16_b32 v2, v1, 0, 0
+            0x6402_0302, // v_add_f16 v1, v2, v1
+            0xD760_0007,
+            0x0001_4101, // v_readlane_b32 s7, v1, 32
+            0x6402_0207, // v_add_f16 v1, s7, v1
+            0xD760_0007,
+            0x0001_0101, // v_readlane_b32 s7, v1, 0
+            0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+            0xBF81_0000, // s_endpgm
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, true, 256).unwrap();
+        let insts = &p.blocks[0].insts;
+        let last = insts.iter().rposition(|i| i.name() == "v_readlane_b32").expect("v_readlane");
+        let s7 = insts[last].write(Reg::S(7)).unwrap();
+        let s = sections(&p, 0);
+        let section = s.get(&0).expect("a section");
+        assert!(matches!(section.shapes.get(&s7), Some(Shape::Half(Op::AddH, _, _, 0, 0))), "{:?}", section.shapes.get(&s7));
+    }
+
     #[test]
     fn half_exec_writes_keep_a_wave64_prefix_sum() {
         let words: [u32; 25] = [

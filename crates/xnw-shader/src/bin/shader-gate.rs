@@ -271,7 +271,7 @@ fn cell(text: &str) -> String {
 /// binary and of the switches a translation reads.
 fn build_line(select: &str, shard: (u128, u128)) -> (String, String) {
     let exe = std::env::current_exe().ok().and_then(|p| std::fs::read(p).ok()).unwrap_or_default();
-    let switches: Vec<String> = ["XNW_DESC", "XNW_FMA", "XNW_FMA_EXACT", "XNW_PAGETABLE", "XNW_SHADER_OPT", "XNW_WAVE_SIZE", "XNW_LOOP_LIMIT_PIXEL", "XNW_LOOP_LIMIT_COMPUTE", "XNW_LOOP_LIMIT_MESH", "XNW_LOOP_LIMIT_VERTEX"]
+    let switches: Vec<String> = ["XNW_DESC", "XNW_FMA", "XNW_FMA_EXACT", "XNW_PAGETABLE", "XNW_HEAP_NONUNIFORM", "XNW_HEAP_UNIFORMITY", "XNW_ADAPTER", "XNW_SHADER_OPT", "XNW_WAVE_SIZE", "XNW_LOOP_LIMIT_PIXEL", "XNW_LOOP_LIMIT_COMPUTE", "XNW_LOOP_LIMIT_MESH", "XNW_LOOP_LIMIT_VERTEX"]
         .iter()
         .map(|k| format!("{k}={}", std::env::var(k).unwrap_or_default()))
         .collect();
@@ -590,6 +590,23 @@ fn main() {
     std::process::exit(code);
 }
 
+/// XNW: with `XNW_GATE_UNIFORMITY=<file>`, one line per
+/// translated program: hash, stage, name, heap handles the uniformity pass
+/// declared non-uniform, those of them with a varying index, all heap
+/// handles.
+fn uniformity_row(row: &Row, (marked, varying, handles): (usize, usize, usize)) {
+    static FILE: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    let file = FILE.get_or_init(|| {
+        let path = std::env::var_os("XNW_GATE_UNIFORMITY")?;
+        std::fs::OpenOptions::new().create(true).append(true).open(path).ok().map(Mutex::new)
+    });
+    if let Some(f) = file
+        && let Ok(mut f) = f.lock()
+    {
+        let _ = writeln!(f, "{}	{}	{}	{marked}	{varying}	{handles}", row.hash, row.stage, row.name);
+    }
+}
+
 /// Translates one program as the runtime would and validates its DXIL
 /// unless the baseline holds the same DXIL with a verdict.
 fn gate_one(bytes: &[u8], h: u128, hash: String, name: &str, base: Option<&Row>, validator: Option<&mut Validator>) -> Row {
@@ -617,6 +634,7 @@ fn gate_one(bytes: &[u8], h: u128, hash: String, name: &str, base: Option<&Row>,
     row.dxil = format!("{:032x}", xnw_core::hash128(&[&s.dxil]));
     row.bytes = s.dxil.len();
     row.insts = xnw_shader::emit::last_insts();
+    uniformity_row(&row, xnw_shader::emit::last_nonuniform());
     if let Some(b) = base.filter(|b| b.dxil == row.dxil && b.checked != "none" && b.status != "refused") {
         row.status = b.status.clone();
         row.reason = b.reason.clone();

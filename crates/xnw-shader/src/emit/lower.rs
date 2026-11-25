@@ -8,6 +8,8 @@
 // With VIctory (permadiego/VIctory shader/mask-dword-joins 7ab94ab) and its commit 1661a3e, GPL-3.0-or-later: mask dwords at data joins; compare-and-swap image atomics.
 // With VIctory-Belobug-AMD (fork of VIctory at 8e79c80; read at 4cbe9d7), GPL-3.0-or-later: pixel quads read through quad reads, helper lanes' v_readfirstlane (03629f3, f520772; upstream 0601955).
 // With DexNom-VIctory (ddb7332), GPL-3.0-or-later: a uniform branch choosing between two immediate samplers.
+// With victory-fork (578d459, GPL-3.0-or-later): computed barycentrics (SV_Barycentrics, attributeAtVertex).
+// With victory-fork (a26859f, and 3bff182 which it gates; GPL-3.0-or-later): first halves of interpolations read as data.
 //! IR to DXIL, one machine instruction at a time (decision 0003).
 //!
 //! Every register dword is an `i32` (SCC an `i1`); float operations bitcast
@@ -93,6 +95,8 @@ pub(crate) struct Parts<'a> {
     pub loop_counts: Option<u32>,
     /// XNW: [`super::Options::pagetable`].
     pub pagetable: bool,
+    /// XNW: [`super::Options::barycentrics`].
+    pub barycentrics: bool,
 }
 
 /// XNW: the user-data root type the runtime answers with the
@@ -352,6 +356,29 @@ enum MaskData {
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
 
+// victory-fork a26859f (GPL-3.0-or-later), verbatim but for the switch
+// (VICTORY_FIRST_HALF dropped: the retry runs only for programs that are
+// refused without it).
+/// The refusal of a first half of an interpolation whose result is read
+/// as data ([`Lower::interp`]).
+pub(super) const FIRST_HALF: &str = "the first half of an interpolation";
+
+thread_local! {
+    /// Whether first halves of interpolations are evaluated as the pair
+    /// they start ([`with_first_half_pairs`]).
+    static FIRST_HALF_PAIRS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `translate` with first halves of interpolations evaluated as the
+/// pair they start: the translation of a program refused with
+/// [`FIRST_HALF`].
+pub(super) fn with_first_half_pairs<R>(translate: impl FnOnce() -> R) -> R {
+    let before = FIRST_HALF_PAIRS.replace(true);
+    let result = translate();
+    FIRST_HALF_PAIRS.set(before);
+    result
+}
+
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
 /// Samples whose level comes from derivatives across each quad of lanes.
@@ -549,6 +576,7 @@ mod tests {
             probe: false,
             loop_counts: None,
             pagetable: false,
+            barycentrics: false,
         })
     }
 
@@ -705,6 +733,7 @@ mod tests {
             probe: false,
             loop_counts: None,
             pagetable: false,
+            barycentrics: false,
         })
         .unwrap();
         let masks = |k: &str| l.insts.iter().filter(|i| i.starts_with("bin:And") && i.ends_with(k)).count();
@@ -1161,6 +1190,7 @@ mod tests {
             probe: false,
             loop_counts: Some(5),
             pagetable: false,
+            barycentrics: false,
         })
         .unwrap();
         for op in ["dx.op.atomicBinOp.i32", "dx.op.waveIsFirstLane", "dx.op.waveActiveOp.i32"] {
@@ -1358,6 +1388,7 @@ mod tests {
             probe: false,
             loop_counts: None,
             pagetable: false,
+            barycentrics: false,
         }).unwrap();
 
         let container =

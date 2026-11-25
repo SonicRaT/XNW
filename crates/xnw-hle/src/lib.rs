@@ -76,6 +76,10 @@ pub use libloader::{TitleLoad, set_thread_calls, set_title_loader};
 pub use route::{Route, route};
 pub use window::read_switches as read_window_switches;
 pub use xnw_gpu::d3d12x::console::Console;
+/// Title memory through our own xmem outside the title (the burst's stand-in, ZC1).
+pub mod title_memory {
+    pub use crate::xmem::{XMemAllocatePhysicalPages, XMemMapPhysicalPages, backing, physical_window, replay_reservation};
+}
 
 /// Chooses the console the title sees (registry, XSystem, DXGI, XMem).
 /// Call before any title code runs.

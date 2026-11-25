@@ -31,7 +31,7 @@ use super::preskin::{self as ps, Before, Bones, Inputs};
 /// Our compute program: one thread per dword of the draw's vertex buffer
 /// (the copy) and per vertex (the skin), whichever is more.
 pub const SHADER: &str = r#"
-#define RS "RootConstants(num32BitConstants=18, b0), SRV(t1), UAV(u0), DescriptorTable(SRV(t0)), SRV(t2)"
+#define RS "RootConstants(num32BitConstants=22, b0), SRV(t1), UAV(u0), DescriptorTable(SRV(t0)), SRV(t2)"
 cbuffer Item : register(b0) {
     uint b7At;       // 0: the 96-B constant block in t1 (palette bases rebased)
     uint vbAt;       // 1: the dispatch's vertex view in t2
@@ -51,6 +51,10 @@ cbuffer Item : register(b0) {
     uint threads;    // 15: max(copyDwords, vertices)
     uint deltaAt;    // 16: variant 2's t76 delta table in t1
     uint deltaBytes; // 17: its bytes (0: no delta step)
+    uint tableAt;    // 18: variant 11's face (t74 from b6+0, rebased to 0) in t1
+    uint tableBytes; // 19: its bytes (0: no table step)
+    uint tableNrm;   // 20: its normals (b6+4) from the face's header
+    uint pad;        // 21
 };
 ByteAddressBuffer geom : register(t0);
 ByteAddressBuffer inp : register(t1);
@@ -59,11 +63,13 @@ RWByteAddressBuffer outb : register(u0);
 
 uint cb(uint off) { return inp.Load(b7At + off); }
 // A dword of the vertex view at any byte; 0 when it does not lie inside.
+// Both loads stay inside the view whatever the compiler makes of the
+// branches (an unaligned dword's second word is read only when it lies inside).
 uint vw(uint a) {
-    if (a >= vbBytes || vbBytes - a < 4) return 0;
-    uint s = (a & 3) * 8, b = vbAt + (a & ~3u);
-    uint lo = kept.Load(b);
-    return s == 0 ? lo : (lo >> s) | (kept.Load(b + 4) << (32 - s));
+    bool ok = a < vbBytes && vbBytes - a >= 4;
+    uint at = ok ? a : 0, s = (at & 3) * 8, b = vbAt + (at & ~3u);
+    uint lo = kept.Load(b), hi = kept.Load(b + (s == 0 ? 0 : 4));
+    return ok ? (s == 0 ? lo : (lo >> s) | (hi << (32 - s))) : 0;
 }
 uint stream(uint desc, uint v) { return (desc >> 8) + (desc & 0xFF) * v; }
 // v_mul_legacy_f32: 0 times anything is 0.
@@ -121,8 +127,22 @@ float coef(uint a, uint i, float mag) {
 }
 
 // A dword of the delta table; 0 past its end (the title's bounded load).
-uint dl(uint a) { return a + 4 <= deltaBytes ? inp.Load(deltaAt + a) : 0; }
-float4 prow(uint i, uint r) { return i < palRows ? asfloat(inp.Load4(palAt + i * 48 + r * 16)) : float4(0, 0, 0, 0); }
+// `?:` runs both sides: the condition picks the address, then the value (a
+// root view has no bounds on the card; HANG1).
+uint dl(uint a) { bool ok = a + 4 <= deltaBytes; uint v = inp.Load(deltaAt + (ok ? a : 0)); return ok ? v : 0; }
+// A dword of the face table; 0 past its end.
+uint tl(uint a) { bool ok = a < tableBytes && tableBytes - a >= 4; uint v = inp.Load(tableAt + (ok ? a : 0)); return ok ? v : 0; }
+// Entry e of the face table: 24:24:16 through the header's bias, scale and axis order.
+float3 tpos(uint e) {
+    bool ok = e < 0x10000000;
+    uint at = 28 + 8 * (ok ? e : 0);
+    uint d0 = ok ? tl(at) : 0, d1 = ok ? tl(at + 4) : 0;
+    float3 q = float3(d0 >> 8, (d0 & 0xFF) | ((d1 & 0xFFFF) << 8), d1 >> 16);
+    float x2 = mad(asfloat(tl(16)), q.x, asfloat(tl(0))), x3 = mad(asfloat(tl(20)), q.y, asfloat(tl(4))), x4 = mad(asfloat(tl(24)), q.z, asfloat(tl(8)));
+    uint o = tl(12);
+    return o == 0 ? float3(x4, x3, x2) : o == 1 ? float3(x3, x4, x2) : float3(x2, x3, x4);
+}
+float4 prow(uint i, uint r) { bool ok = i < palRows; float4 v = asfloat(inp.Load4(palAt + (ok ? i * 48 + r * 16 : 0))); return ok ? v : float4(0, 0, 0, 0); }
 
 bool masked(uint set, uint half_, uint i) {
     if (set >= 20 || i >= 256) return false;
@@ -204,6 +224,35 @@ void cs(uint3 id : SV_DispatchThreadID) {
             p = d + p;
         }
     }
+    // Variant 11 with its face table filled (659b134d 0xb3c-0xf50): a
+    // vertex tagged 0xb6 takes entry (dword 1 >> 16) - 1 of the table (and,
+    // below dword 0 0xFFFF0000, the entry's 10:10:10 normal); one tagged
+    // 0x54 the 16-bit entry of dwords 2 and 3 plus three half-float
+    // offsets in thousandths. As `tables` in the CPU reference.
+    bool tabN = false;
+    float3 tN = float3(0, 0, 0);
+    if (tableBytes != 0 && (cb(0xC) & 0xFF) == 16) {
+        uint ia = (cb(0xC) >> 8) + 16 * v;
+        uint i0 = vw(ia), i1 = vw(ia + 4), i2 = vw(ia + 8), i3 = vw(ia + 12);
+        uint tag = i3 & 0xFF000000;
+        uint e = (tag != 0xB6000000 || i1 == 0xFFFF) ? 0xFFFF : (i1 >> 16) - 1;
+        if (e != 0xFFFF) {
+            p = tpos(e);
+            if (i0 < 0xFFFF0000) {
+                bool ok = e < 0x10000000;
+                uint w = ok ? tl(tableNrm + 4 * e) : 0;
+                float k = asfloat(0x3B002008);
+                tN = float3((w & 0x3FF) * k - 1.0, ((w >> 10) & 0x3FF) * k - 1.0, ((w >> 20) & 0x3FF) * k - 1.0);
+                tabN = true;
+            }
+        }
+        if (tag == 0x54000000) {
+            uint e2 = ((i3 >> 12) & 0xFFF) | ((i2 >> 16) & 0xF000);
+            float k2 = asfloat(0x3A83126F);
+            float3 off = float3(ml(f16tof32((i0 >> 12) & 0xFFFF), k2), ml(f16tof32((i1 >> 12) & 0xFFFF), k2), ml(f16tof32((i2 >> 12) & 0xFFFF), k2));
+            p = tpos(e2) + off;
+        }
+    }
     // Bones: four (or eight) indices through the remap, unorm8 weights over their sum.
     bool wide = (cb(0xC) & 0xFF) == 16;
     uint sets = (rule == 0 || rule == 3) ? 1 : 2;
@@ -222,7 +271,8 @@ void cs(uint3 id : SV_DispatchThreadID) {
         uint ww = vw(stream(cb(0x10 + 8 * s), v));
         [unroll] for (uint k = 0; k < 4; k++) {
             uint e = (ib[k] & 0xFFF) + cb(0x30);
-            bones[4 * s + k] = e < remapCount ? kept.Load(remapAt + 4 * e) & 0xFFF : 0;
+            uint re = kept.Load(remapAt + 4 * (e < remapCount ? e : 0));
+            bones[4 * s + k] = e < remapCount ? re & 0xFFF : 0;
             b[4 * s + k] = s < sets ? (float)((ww >> (8 * k)) & 0xFF) : 0;
         }
     }
@@ -252,6 +302,13 @@ void cs(uint3 id : SV_DispatchThreadID) {
         uint fw = vw(stream(cb(4), v));
         float3 nv, tv, nOut;
         frameOf(fw, nv, tv);
+        if (tabN) {
+            // The table's normal; the tangent made orthogonal to it.
+            float d = mad(tv.z, tN.z, mad(tv.x, tN.x, ml(tv.y, tN.y)));
+            float3 t = float3(mad(-tN.x, d, tv.x), mad(-tN.y, d, tv.y), mad(-tN.z, d, tv.z));
+            tv = unit(t, 1.0 / sqrt(len2(t)));
+            nv = tN;
+        }
         if (!stop && cb(0x1C) != 0) {
             // Every bone applied: the frame from the weight gradients (seven
             // pairs of bytes after a half-float magnitude) times each bone's
@@ -293,7 +350,7 @@ void cs(uint3 id : SV_DispatchThreadID) {
 "#;
 
 /// Root constants per dispatch (the `Item` block of [`SHADER`]).
-const CONSTANTS: usize = 18;
+const CONSTANTS: usize = 22;
 /// No hide masks / no normals.
 const NONE: u32 = u32::MAX;
 /// The hide-mask record: two halves of 20 x 256 bits.
@@ -328,6 +385,11 @@ pub struct Item {
     pub remap_key: u64,
     /// Variant 2's delta table (t76, from its header; empty: no delta step).
     pub delta: Vec<u8>,
+    /// Variant 11's face from its filled position table (t74 from b6+0,
+    /// rebased to 0: [`face_table`]) and where its normals lie (b6+4);
+    /// empty: no table step ([`BIT_FACE_TABLE`]).
+    pub table: Vec<u8>,
+    pub table_normals: u32,
 }
 
 impl Item {
@@ -360,6 +422,8 @@ impl Item {
             vb_key: content_key(inp.vb),
             remap_key: content_key(&remap_bytes),
             delta: Vec::new(),
+            table: Vec::new(),
+            table_normals: 0,
         }
     }
 
@@ -402,6 +466,41 @@ pub const BIT_MORE: u32 = 4;
 /// as the skinned props they are ([`props_unflag`]).
 pub const BIT_PROPS: u32 = 8;
 
+/// `preskinbits` bit 4 (HEAD2): variant 11 whose position table is filled
+/// (the head compute graph's, `headgraph=on`) runs its table step on the
+/// device from the item's [`Item::table`] (b6+0xc = 0: t76's delta in
+/// [`Item::delta`]), not from its bind shape. An unfilled table still runs
+/// neutral.
+pub const BIT_FACE_TABLE: u32 = 16;
+
+/// The face a variant-11 dispatch reads from t74: the bytes from b6+0
+/// (header and entries) through its last entry and normal, rebased to 0,
+/// and the normals' offset (b6+4). Empty when b6+0xc is 0 (the delta step)
+/// or t74 is empty.
+pub fn face_table(inp: &Inputs) -> (Vec<u8>, u32) {
+    let (base, normals, on) = (le32(inp.b6, 0) as usize, le32(inp.b6, 4), le32(inp.b6, 0xc));
+    if on == 0 || inp.t74.is_empty() || base >= inp.t74.len() {
+        return (Vec::new(), 0);
+    }
+    let c = |off: usize| le32(inp.b7, off);
+    let idesc = c(0xc);
+    let mut top = 0u64;
+    if idesc & 0xff == 16 {
+        for v in 0..c(0x38) {
+            let at = (idesc >> 8) as usize + 16 * v as usize;
+            let ib = [le32(inp.vb, at), le32(inp.vb, at + 4), le32(inp.vb, at + 8), le32(inp.vb, at + 12)];
+            let e = match ib[3] & 0xff00_0000 {
+                0xb600_0000 if ib[1] != 0xffff && ib[1] >> 16 != 0 => (ib[1] >> 16) - 1,
+                0x5400_0000 => ib[3] >> 12 & 0xfff | ib[2] >> 16 & 0xf000,
+                _ => continue,
+            };
+            top = top.max(u64::from(e) + 1);
+        }
+    }
+    let span = (28 + 8 * top).max(u64::from(normals) + 4 * top) as usize;
+    (inp.t74[base..(base + span).min(inp.t74.len())].to_vec(), normals)
+}
+
 /// The variants [`BIT_MORE`] adds.
 const MORE: [u32; 5] = [1, 2, 6, 7, 10];
 
@@ -426,6 +525,7 @@ pub fn rule_for(variant: u32, b7: &[u8], bits: u32, unfilled: impl FnOnce() -> b
         None => Err("variant not covered"),
         Some((b, Before::Nothing)) => Ok((b, false, false)),
         Some((b, Before::Tables)) if bits & BIT_FACE_ANY != 0 || unfilled() => Ok((b, true, false)),
+        Some((b, Before::Tables)) if bits & BIT_FACE_TABLE != 0 => Ok((b, false, false)),
         Some(_) => Err(WHY_FACE),
     }
 }
@@ -694,14 +794,15 @@ impl Kept {
 #[allow(clippy::type_complexity)]
 pub fn layout(items: &[Item], kept: &[[u32; 2]], jobs: &[Job]) -> (Vec<u8>, Vec<Option<([u32; CONSTANTS], Placed)>>, u64) {
     let mut input: Vec<u8> = Vec::new();
-    // Per item: [b7, vb, vb bytes, remap, remap n, palette, rows, mask], [delta, delta bytes].
+    // Per item: [b7, vb, vb bytes, remap, remap n, palette, rows, mask], [delta, delta bytes, table, table bytes, table normals].
     let mut blocks = Vec::with_capacity(items.len());
     for (it, at) in items.iter().zip(kept) {
         let b7 = put(&mut input, &it.b7);
         let pal = put(&mut input, &it.palette);
         let mask = it.mask.as_ref().map_or(NONE, |m| put(&mut input, m));
         let delta = if it.delta.is_empty() { 0 } else { put(&mut input, &it.delta) };
-        blocks.push(([b7, at[0], it.vb.len() as u32, at[1], it.remap.len() as u32, pal, (it.palette.len() / 48) as u32, mask], [delta, it.delta.len() as u32]));
+        let table = if it.table.is_empty() { 0 } else { put(&mut input, &it.table) };
+        blocks.push(([b7, at[0], it.vb.len() as u32, at[1], it.remap.len() as u32, pal, (it.palette.len() / 48) as u32, mask], [delta, it.delta.len() as u32, table, it.table.len() as u32, it.table_normals]));
     }
     let mut out_at = 0u64;
     let placed = jobs
@@ -722,7 +823,7 @@ pub fn layout(items: &[Item], kept: &[[u32; 2]], jobs: &[Job]) -> (Vec<u8>, Vec<
             let (b, d) = blocks[j.item as usize];
             let mut k = [0u32; CONSTANTS];
             k[..8].copy_from_slice(&b);
-            k[16..18].copy_from_slice(&d);
+            k[16..21].copy_from_slice(&d);
             k[8] = out_at as u32;
             k[9] = (copy / 4) as u32;
             k[10] = pos_at as u32;
@@ -934,12 +1035,14 @@ pub fn run(host: &xnw_gpu::host::Host, items: &[Item]) -> Result<(Vec<(Vec<[f32;
         list.Close().map_err(e)?;
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).map_err(e)?;
         queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).map_err(e)?)]);
+        let sent = xnw_gpu::gpuwatch::begin("preskin gpu");
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
         queue.Signal(&fence, 1).map_err(e)?;
         while fence.GetCompletedValue() < 1 {
             dev.GetDeviceRemovedReason().map_err(|x| format!("device removed: {}", e(x)))?;
             std::thread::yield_now();
         }
+        xnw_gpu::gpuwatch::end("preskin gpu", sent, None);
         let ms = pass.gpu_ms(queue.GetTimestampFrequency().map_err(e)?).unwrap_or(0.0);
         let mut p = std::ptr::null_mut();
         rb.Map(0, None, Some(&mut p)).map_err(e)?;
@@ -1182,7 +1285,7 @@ mod tests {
         assert_eq!(&input[k[16] as usize..k[16] as usize + 40], &[1u8; 40][..]);
         let plain = Item::from_inputs(&c.inputs(), Bones::Four);
         let (_, placed, _) = layout(std::slice::from_ref(&plain), &[[0, 0]], &jobs);
-        assert_eq!(placed[0].unwrap().0[16..], [0, 0]);
+        assert_eq!(placed[0].unwrap().0[16..], [0; CONSTANTS - 16]);
         use super::super::{Albedo, DrawRecord, FrameList, GeomKey, Material, NO_PALETTE, NO_REMAP};
         let rec = |ped: bool, remap: u32| DrawRecord { geom: GeomKey::default(), world: [0.0; 16], viewport: 1, effect: 0, albedo: Albedo::Flat([1.0; 3]), palette: 0, stage: 67, inst_first: 0, inst_count: 0, bone_first: 4, bone_count: 13, material: Material::default(), state: None, remap, ped };
         let mut list = FrameList { draws: vec![rec(true, NO_REMAP), rec(true, 24), rec(false, NO_REMAP)], ..Default::default() };
@@ -1192,6 +1295,36 @@ mod tests {
     }
 
     /// The hide-mask record is picked as the reference picks it.
+    /// HEAD2: a variant-11 face is taken from b6+0 through its last entry
+    /// (tag 0xb6 by dword 1, tag 0x54 by dwords 2 and 3) and normal; a
+    /// filled table runs under [`BIT_FACE_TABLE`], an unfilled one neutral.
+    #[test]
+    fn face_table_from_its_base() {
+        let put = |b: &mut Vec<u8>, at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        let mut b7 = vec![0u8; 96];
+        put(&mut b7, 0xc, 16 | 0x40 << 8);
+        put(&mut b7, 0x38, 2);
+        let mut vb = vec![0u8; 0x60];
+        put(&mut vb, 0x44, 3 << 16);
+        put(&mut vb, 0x4c, 0xb600_0000);
+        put(&mut vb, 0x5c, 0x5400_0000 | 5 << 12);
+        let mut b6 = vec![0u8; 16];
+        put(&mut b6, 0, 8);
+        put(&mut b6, 4, 100);
+        put(&mut b6, 0xc, 1);
+        let t74: Vec<u8> = (0..300u32).map(|i| i as u8).collect();
+        let inp = Inputs { b7: &b7, vb: &vb, b6: &b6, t74: &t74, ..Inputs::default() };
+        let (t, n) = face_table(&inp);
+        // Entries 0..=5: 28 + 8 * 6 = 76 B of positions, normals to 100 + 4 * 6.
+        assert_eq!((t.len(), n, t[0]), (124, 100, 8));
+        let mut b6z = b6.clone();
+        put(&mut b6z, 0xc, 0);
+        assert!(face_table(&Inputs { b6: &b6z, ..inp }).0.is_empty(), "b6+0xc = 0: the delta step, no table");
+        assert_eq!(rule_for(11, &b7, BIT_FACE_TABLE, || false), Ok((Bones::Four, false, false)));
+        assert_eq!(rule_for(11, &b7, BIT_FACE_TABLE, || true), Ok((Bones::Four, true, false)));
+        assert_eq!(rule_for(11, &b7, 0, || false), Err(WHY_FACE));
+    }
+
     #[test]
     fn mask_record_picked() {
         let c = case();

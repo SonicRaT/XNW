@@ -209,6 +209,7 @@ fn lower_cs(words: &[u32], threads: u32, fma: super::Fma, wave64: bool) -> HostS
         probe: false,
         loop_counts: None,
         pagetable: false,
+        barycentrics: false,
     })
     .expect("lower");
 
@@ -471,7 +472,7 @@ fn v_fma_legacy_f32_follows_the_d3d9_zero_rule() {
         ([0x3F80_0001, 0x3F80_0001, 0xBF80_0002, 0], 0x2880_0000),
         // XNW (VIctory's claim): a denormal factor counts as zero.
         ([0x0000_0001, f(f32::INFINITY), f(2.5), 0], f(2.5)),
-        // XNW (XCL's claim): the zero product is +0, so +0 + -0 = +0.
+        // XNW (another runtime claim): the zero product is +0, so +0 + -0 = +0.
         ([0, f(5.0), 0x8000_0000, 0], 0),
         ([0x8000_0000, f(5.0), 0x8000_0000, 0], 0),
     ];
@@ -1636,6 +1637,7 @@ fn build_root_srv_cs(body: &[u32]) -> HostShader {
         probe: false,
         loop_counts: None,
         pagetable: false,
+        barycentrics: false,
     })
     .expect("lower");
 
@@ -1816,4 +1818,22 @@ fn root_srv_loop_carried_pointer_induction_phi() {
             "{backend}: loop phi sum starting at {start} = {got}, want {want}",
         );
     });
+}
+
+/// `v_pk_fmac_f16` (VOP2): each half of the destination plus the product
+/// of the sources' halves. Origin: VIctory valu_tests.rs (0b35b7f); GPL-3.0-or-later.
+#[test]
+fn packed_fmac_accumulates_each_half() {
+    let shader = build_valu_cs(&[
+        vop1(0x001, 0, vgpr(3)),              // v_mov_b32 v0, v3
+        0x3C << 25 | 2 << 9 | vgpr(1) as u32, // v_pk_fmac_f16 v0, v1, v2
+    ]);
+    // (2.0, 1.0) * (3.0, 4.0) + (1.0, 0.5) = (7.0, 4.5)
+    run_cases(
+        &shader,
+        &[[0x4000_3C00, 0x4200_4400, 0x3C00_3800, 0]],
+        |backend, _, _, got| {
+            assert_eq!(got, 0x4700_4480, "{backend}");
+        },
+    );
 }

@@ -314,7 +314,7 @@ fn unpack_pos(d0: u32, d1: u32, bias: [f32; 3], scale: [f32; 3], order: u32) -> 
 
 /// Entry `e` of a position table whose header (bias, axis order, scale: 28
 /// B) stands at byte `base` and whose 8-B entries follow it.
-fn table_pos(t: &[u8], base: u32, e: u32) -> [f32; 3] {
+pub fn table_pos(t: &[u8], base: u32, e: u32) -> [f32; 3] {
     let b = u64::from(base);
     let at = b + 28 + 8 * u64::from(e);
     let f3 = |o: u64| [fl(t, b + o), fl(t, b + o + 4), fl(t, b + o + 8)];
@@ -371,6 +371,57 @@ fn tables(inp: &Inputs, ib: [u32; 4], p: [f32; 3], nv: &mut [f32; 3], tv: &mut [
         prev = add(table_pos(inp.t75, base, e));
     }
     (cur, prev)
+}
+
+/// HAIR3: the position table's entries a variant-11 dispatch reads, as its
+/// own bind positions (no blend shape): (entry, position) per vertex tagged
+/// 0xb6 (entry = high half of index dword 1 - 1, as [`tables`] reads it).
+/// The console fills the table on the GPU (the head compute graph);
+/// a capture holds it zero. The strand chain's `CS_UpdatePosePosition`
+/// reads the same table (frame table slot 7 at record +0x13c) for the
+/// scalp vertices its guides grow from.
+pub fn neutral_table(inp: &Inputs) -> Vec<(u32, [f32; 3])> {
+    let c = |off: u64| dw(inp.b7, off);
+    let stream = |desc: u32, v: u32| u64::from(desc >> 8) + u64::from(desc & 0xff) * u64::from(v);
+    let (bias, swizzle, scale) = ([fl(inp.vb, 0x60), fl(inp.vb, 0x64), fl(inp.vb, 0x68)], dw(inp.vb, 0x6c), [fl(inp.vb, 0x70), fl(inp.vb, 0x74), fl(inp.vb, 0x78)]);
+    let idesc = c(0xc);
+    let mut out = Vec::new();
+    for v in 0..c(0x38) {
+        let ib = if idesc & 0xff == 16 {
+            let at = u64::from(idesc >> 8) + 16 * u64::from(v);
+            [dw(inp.vb, at), dw(inp.vb, at + 4), dw(inp.vb, at + 8), dw(inp.vb, at + 12)]
+        } else {
+            let w = dw(inp.vb, stream(idesc, v));
+            [w & 0xff, w >> 8 & 0xff, w >> 16 & 0xff, w >> 24]
+        };
+        if ib[3] & 0xff00_0000 != 0xb600_0000 || ib[1] == 0xffff {
+            continue;
+        }
+        let at = stream(c(0), v);
+        out.push(((ib[1] >> 16).wrapping_sub(1), unpack_pos(dw(inp.vb, at), dw(inp.vb, at + 4), bias, scale, swizzle)));
+    }
+    out
+}
+
+/// A position table at byte `base` of `t` (grown as needed) holding
+/// `entries`: the header (bias, axis order 2 = as is, scale; 28 B) and the
+/// 24:24:16 entries [`table_pos`] reads, over +-3 m.
+pub fn put_table(t: &mut Vec<u8>, base: u32, entries: &[(u32, [f32; 3])]) {
+    let (b, top) = (base as usize, entries.iter().map(|e| e.0 + 1).max().unwrap_or(0) as usize);
+    if t.len() < b + 28 + 8 * top {
+        t.resize(b + 28 + 8 * top, 0);
+    }
+    let scale = [6.0 / 16_777_215.0, 6.0 / 16_777_215.0, 6.0 / 65_535.0f32];
+    for (k, w) in [(-3.0f32).to_bits(), (-3.0f32).to_bits(), (-3.0f32).to_bits(), 2, scale[0].to_bits(), scale[1].to_bits(), scale[2].to_bits()].iter().enumerate() {
+        t[b + 4 * k..b + 4 * k + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    for &(e, p) in entries {
+        let q = |v: f32, k: usize, max: f32| ((v + 3.0) / scale[k]).round().clamp(0.0, max) as u32;
+        let (x, y, z) = (q(p[0], 0, 16_777_215.0), q(p[1], 1, 16_777_215.0), q(p[2], 2, 65_535.0));
+        let at = b + 28 + 8 * e as usize;
+        t[at..at + 4].copy_from_slice(&(x << 8 | y & 0xff).to_le_bytes());
+        t[at + 4..at + 8].copy_from_slice(&(y >> 8 & 0xffff | z << 16).to_le_bytes());
+    }
 }
 
 /// t76's delta on a position (variant 11 0x12c4-0x1ec4, variant 2
@@ -808,6 +859,11 @@ pub struct Dispatch<'a> {
     pub groups: [u32; 3],
     pub tables: Vec<(u32, Vec<(u32, View<'a>)>)>,
     pub heap: Vec<(u32, View<'a>)>,
+    /// Root constants by root parameter (HAIR2: the strand programs' root 1).
+    pub constants: Vec<(u32, Vec<u32>)>,
+    /// HAIR3: heap indices that hold a 1x1 RGBA8 texture of this texel: a
+    /// stand-in for a texture whose texels the capture lacks.
+    pub texels: Vec<(u32, u32)>,
 }
 
 /// Root arguments and the view heap for one dispatch: what [`run`] binds.
@@ -825,6 +881,8 @@ pub struct Binding<'a> {
     pub strides: Vec<[u32; 2]>,
     /// The heap bounds (b0 space 7).
     pub bounds: [u32; 8],
+    /// [`Dispatch::texels`].
+    pub texels: Vec<(u32, u32)>,
 }
 
 /// Bytes per element of a typed view's format (formats the pre-skin
@@ -851,9 +909,18 @@ pub fn bind<'a>(shader: &HostShader, d: &Dispatch<'a>) -> Result<Binding<'a>, St
         return Err("a program with root views, an address map or descriptor words".into());
     }
     let mut b = Binding { constants: vec![0; shader.user_data_dwords().max(1) as usize], ..Binding::default() };
-    let mut next = d.heap.iter().map(|&(s, _)| s + 1).max().unwrap_or(0);
+    let mut next = d.heap.iter().map(|&(s, _)| s + 1).chain(d.texels.iter().map(|t| t.0 + 1)).max().unwrap_or(0);
+    if d.texels.iter().any(|t| d.heap.iter().any(|h| h.0 == t.0)) {
+        return Err("a texel stand-in at a view's heap index".into());
+    }
+    b.texels = d.texels.clone();
     b.slots.extend(d.heap.iter().copied());
     for u in &shader.user_data {
+        if u.root == xnw_shader::RootType::Constants {
+            let words = d.constants.iter().find(|(r, _)| *r == u32::from(u.slot)).ok_or_else(|| format!("the record has no constants at root {}", u.slot))?;
+            b.constants[u.index as usize] = *words.1.get(u.dword as usize).ok_or_else(|| format!("root {} has {} constants, user data {} wants dword {}", u.slot, words.1.len(), u.index, u.dword))?;
+            continue;
+        }
         if u.root != xnw_shader::RootType::Table {
             return Err(format!("user data {} is a {:?}, not a table", u.index, u.root));
         }
@@ -971,6 +1038,17 @@ pub fn run(host: &xnw_gpu::host::Host, shader: &HostShader, wave: u32, b: &Bindi
         dev.CreateConstantBufferView(Some(&D3D12_CONSTANT_BUFFER_VIEW_DESC::default()), at(g[5]));
         let mut keep = Vec::new();
         let mut outs = Vec::new();
+        let mut seeds: Vec<(ID3D12Resource, ID3D12Resource, u64)> = Vec::new();
+        // HAIR3: 1x1 RGBA8 textures, copied from an upload row before the dispatch.
+        let mut texels: Vec<(ID3D12Resource, ID3D12Resource)> = Vec::new();
+        for &(s, texel) in &b.texels {
+            let desc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 1, Height: 1, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8G8B8A8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() };
+            let mut r: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut r).map_err(e)?;
+            let r = r.ok_or("no texture")?;
+            dev.CreateShaderResourceView(&r, Some(&tex), at(s));
+            texels.push((r, upload(&texel.to_le_bytes(), 256)?));
+        }
         for &(s, v) in &b.slots {
             let len = match v.kind {
                 Kind::RawUav { len } => u64::from(len),
@@ -1000,7 +1078,14 @@ pub fn run(host: &xnw_gpu::host::Host, shader: &HostShader, wave: u32, b: &Bindi
                     keep.push(r);
                 }
                 Kind::RawUav { .. } => {
-                    let r = buffer(size, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON)?;
+                    // Bytes given: the output starts as them (HAIR2: the strand pool
+                    // carried from one dispatch of the chain to the next).
+                    let first = if v.bytes.is_empty() { D3D12_RESOURCE_STATE_COMMON } else { D3D12_RESOURCE_STATE_COPY_DEST };
+                    let r = buffer(size, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, first)?;
+                    if !v.bytes.is_empty() {
+                        let up = upload(v.bytes, size)?;
+                        seeds.push((r.clone(), up, size));
+                    }
                     dev.CreateUnorderedAccessView(&r, None, Some(&raw_uav(n)), at(s));
                     let rb = buffer(size, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST)?;
                     outs.push((r, rb, size, len));
@@ -1017,6 +1102,18 @@ pub fn run(host: &xnw_gpu::host::Host, shader: &HostShader, wave: u32, b: &Bindi
             h.ok_or("no query heap")?
         };
         let times = buffer(16, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST)?;
+        for (r, up, size) in &seeds {
+            list.CopyBufferRegion(r, 0, up, 0, *size);
+            list.ResourceBarrier(&[transition(r, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+        }
+        for (r, up) in &texels {
+            let footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: 0, Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: DXGI_FORMAT_R8G8B8A8_UNORM, Width: 1, Height: 1, Depth: 1, RowPitch: 256 } };
+            // SAFETY: borrowed pointers the copy locations never release.
+            let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+            let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(up), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint } };
+            list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+            list.ResourceBarrier(&[transition(r, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)]);
+        }
         list.SetDescriptorHeaps(&[Some(views.clone()), Some(samplers.clone())]);
         list.SetComputeRootSignature(&root);
         list.SetComputeRoot32BitConstants(0, b.constants.len() as u32, b.constants.as_ptr().cast(), 0);
@@ -1035,30 +1132,20 @@ pub fn run(host: &xnw_gpu::host::Host, shader: &HostShader, wave: u32, b: &Bindi
         list.EndQuery(&stamps, D3D12_QUERY_TYPE_TIMESTAMP, 1);
         list.ResolveQueryData(&stamps, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &times, 0);
         for (r, rb, size, _) in &outs {
-            let barrier = D3D12_RESOURCE_BARRIER {
-                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                    Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
-                        pResource: std::mem::transmute_copy(r),
-                        Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                        StateBefore: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                        StateAfter: D3D12_RESOURCE_STATE_COPY_SOURCE,
-                    }),
-                },
-            };
-            list.ResourceBarrier(&[barrier]);
+            list.ResourceBarrier(&[transition(r, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
             list.CopyBufferRegion(rb, 0, r, 0, *size);
         }
         list.Close().map_err(e)?;
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).map_err(e)?;
         queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).map_err(e)?)]);
+        let sent = xnw_gpu::gpuwatch::begin("preskin");
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
         queue.Signal(&fence, 1).map_err(e)?;
         while fence.GetCompletedValue() < 1 {
             dev.GetDeviceRemovedReason().map_err(|x| format!("device removed: {}", e(x)))?;
             std::thread::yield_now();
         }
+        xnw_gpu::gpuwatch::end("preskin", sent, None);
         let read = |r: &ID3D12Resource, n: usize| -> Result<Vec<u8>, String> {
             let mut p = std::ptr::null_mut();
             r.Map(0, None, Some(&mut p)).map_err(e)?;
@@ -1076,7 +1163,22 @@ pub fn run(host: &xnw_gpu::host::Host, shader: &HostShader, wave: u32, b: &Bindi
             bytes.push(out);
         }
         drop(keep);
+        drop(seeds);
+        drop(texels);
         Ok((bytes, seconds))
+    }
+}
+
+/// A transition barrier of all of `r`'s subresources.
+fn transition(r: &windows::Win32::Graphics::Direct3D12::ID3D12Resource, from: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES, to: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES) -> windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER {
+    use windows::Win32::Graphics::Direct3D12::*;
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            // SAFETY: a borrowed pointer the barrier never releases.
+            Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER { pResource: unsafe { std::mem::transmute_copy(r) }, Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, StateBefore: from, StateAfter: to }),
+        },
     }
 }
 
@@ -1516,6 +1618,8 @@ pub(crate) mod tests {
                 (5, vec![(8, v(Kind::Cbv, b7))]),
             ],
             heap: vec![(3, v(Kind::Raw, &c.vb)), (4, v(Kind::Typed { format: 42, bytes: 4 }, remap))],
+            constants: Vec::new(),
+            texels: Vec::new(),
         }
     }
 
@@ -1617,5 +1721,20 @@ pub(crate) mod tests {
         if let Ok(dir) = std::env::var("PRESKIN_DUMP") {
             std::fs::write(Path::new(&dir).join("cs0.dxil"), &t.dxil).unwrap();
         }
+    }
+
+    /// HAIR3: a table `put_table` writes reads back through `table_pos`
+    /// (the decode both variant 11 and the strand chain use) within its step.
+    #[test]
+    fn put_table_reads_back() {
+        let mut t = vec![0u8; 8];
+        let entries = [(0u32, [0.1f32, -0.25, 1.7]), (3, [-2.9, 2.9, 0.0])];
+        put_table(&mut t, 0x40, &entries);
+        assert_eq!(t.len(), 0x40 + 28 + 8 * 4);
+        for (e, p) in entries {
+            let got = table_pos(&t, 0x40, e);
+            assert!((0..3).all(|k| (got[k] - p[k]).abs() < 1e-4), "{e}: {got:?} against {p:?}");
+        }
+        assert_eq!(table_pos(&t, 0x40, 1), [-3.0; 3], "an entry not written is the bias");
     }
 }

@@ -760,8 +760,17 @@ impl<'a> Lower<'a> {
         };
         let c = self.cur;
         let table = self.s.stride_table_handle();
+        // HANG1, after VIctory-Belobug-AMD 71652a2 (`slot_dword`,
+        // GPL-3.0-or-later): the table is a root view, which has no bounds
+        // on the card, so a slot past the heap (a wild index from title
+        // data) reads entry 0, not past the table; the handle below is
+        // bounded as every heap handle is.
+        let limit = self.s.heap_limit_words()[0];
+        let inside = self.s.m.cmp(c, pred::IULT, slot, limit);
+        let zero = self.s.m.i32(0);
+        let read_at = self.s.m.select(c, inside, slot, zero);
         let bytes = self.s.m.i32(super::super::StrideEntry::BYTES);
-        let addr = self.s.m.bin(c, Bin::Mul, slot, bytes);
+        let addr = self.s.m.bin(c, Bin::Mul, read_at, bytes);
         let iu = self.s.m.undef(self.s.t.i32);
         let mask = self.s.m.i8(3);
         let align = self.s.m.i32(4);

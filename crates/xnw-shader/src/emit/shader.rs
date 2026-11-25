@@ -120,6 +120,9 @@ thread_local! {
     /// XNW: the last module this thread finished: its instruction count
     /// (after any clean-up pass), for the shader gate ([`super::last_insts`]).
     pub(crate) static INSTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// XNW: of the last module this thread finished, what
+    /// [`super::bitcode::Module::mark_nonuniform`] returned ([`super::last_nonuniform`]).
+    pub(crate) static NONUNIFORM_MARKED: std::cell::Cell<(usize, usize, usize)> = const { std::cell::Cell::new((0, 0, 0)) };
 }
 
 #[cfg(test)]
@@ -162,6 +165,8 @@ pub(crate) mod flags {
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const INT64: u64 = 1 << 20;
+    /// victory-fork 578d459: `SV_Barycentrics` or `attributeAtVertex`.
+    pub const BARYCENTRICS: u64 = 1 << 22;
     /// XNW: 64-bit atomics on a typed resource, and on one reached
     /// through the descriptor heap.
     pub const ATOMIC_INT64_TYPED: u64 = 1 << 27;
@@ -635,16 +640,10 @@ impl Shader {
         )
     }
 
-    /// XNW: after VIctory 05c681c, GPL-3.0-or-later; words of
-    /// spec section 7): `index` if it lies in its heap, else the heap's
-    /// permanent null of the kind `props` names: a select on the index
-    /// itself, before any access (an index past the heap hung the RX 5700 XT
-    /// even on a path whose result is discarded). The eight words, `b0` in
-    /// [`HEAP_BOUNDS_SPACE`]: view slots, null 2D texture SRV, null raw
-    /// buffer SRV, null raw buffer UAV, null 2D texture UAV, null CBV,
-    /// sampler slots, null sampler.
-    fn bounded(&mut self, block: usize, index: V, sampler: bool, props: (u32, u32)) -> V {
-        let w = match self.heap_limits {
+    /// The eight heap-bound words (`b0` in [`HEAP_BOUNDS_SPACE`], see
+    /// [`Shader::bounded`]), loaded once in the entry block.
+    pub fn heap_limit_words(&mut self) -> [V; 8] {
+        match self.heap_limits {
             Some(w) => w,
             None => {
                 let z = self.m.i32(0);
@@ -664,7 +663,19 @@ impl Shader {
                 self.heap_limits = Some(w);
                 w
             }
-        };
+        }
+    }
+
+    /// XNW: after VIctory 05c681c, GPL-3.0-or-later; words of
+    /// spec section 7): `index` if it lies in its heap, else the heap's
+    /// permanent null of the kind `props` names: a select on the index
+    /// itself, before any access (an index past the heap hung the RX 5700 XT
+    /// even on a path whose result is discarded). The eight words, `b0` in
+    /// [`HEAP_BOUNDS_SPACE`]: view slots, null 2D texture SRV, null raw
+    /// buffer SRV, null raw buffer UAV, null 2D texture UAV, null CBV,
+    /// sampler slots, null sampler.
+    fn bounded(&mut self, block: usize, index: V, sampler: bool, props: (u32, u32)) -> V {
+        let w = self.heap_limit_words();
         let uav = props.0 & 0x1000 != 0;
         let (limit, null) = match (sampler, props.0 & 0xFF, uav) {
             (true, _, _) => (w[6], w[7]),
@@ -693,6 +704,7 @@ impl Shader {
             flags::RESOURCE_HEAP
         };
         let index = self.bounded(block, index, sampler, props);
+        let nonuniform = nonuniform || super::NONUNIFORM_HEAP.with(std::cell::Cell::get);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,
@@ -778,6 +790,11 @@ impl Shader {
                 }
             }
         }
+        // XNW: every heap index that may differ between lanes
+        // is declared non-uniform, after the passes (they move reads).
+        let (keep, masked) = super::HEAP_UNIFORMITY.with(std::cell::Cell::get);
+        let marked = if keep { (0, 0, 0) } else { self.m.mark_nonuniform(masked) };
+        NONUNIFORM_MARKED.with(|c| c.set(marked));
         let insts = self.m.inst_count();
         INSTS.with(|c| c.set(insts));
         #[cfg(test)]
@@ -1211,6 +1228,9 @@ impl Shader {
         }
         if self.flags & flags::INT64 != 0 {
             features |= 0x8000;
+        }
+        if self.flags & flags::BARYCENTRICS != 0 {
+            features |= 0x2_0000;
         }
         if self.flags & flags::RESOURCE_HEAP != 0 {
             features |= 0x200_0000;

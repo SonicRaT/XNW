@@ -69,7 +69,20 @@ pub struct Provided {
     /// Bytes of one row and the number of rows in `rows`.
     pub row_bytes: u32,
     pub row_count: u32,
+    /// The draw bridge's view of it: [`TEX_2D`], [`TEX_1D`] or
+    /// [`TEX_3D`] or [`TEX_2D_ARRAY`] (`depth` slices, `row_count` = height x depth). The
+    /// pass takes 2D only.
+    pub dim: u8,
+    pub depth: u32,
 }
+
+/// [`Provided::dim`] (D3D12 resource dimensions).
+pub const TEX_1D: u8 = 2;
+pub const TEX_2D: u8 = 3;
+pub const TEX_3D: u8 = 4;
+/// A 2D array (LIT5): `depth` slices, `row_count` = height x depth, the
+/// slices' rows in order (D3D12 has no array dimension; past the three).
+pub const TEX_2D_ARRAY: u8 = 5;
 
 /// What gives a slot's texels in [`TexMode::Provided`].
 pub type Provider = Box<dyn FnMut(u64) -> Option<Provided> + Send>;

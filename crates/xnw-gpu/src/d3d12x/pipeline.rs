@@ -6,7 +6,7 @@
 //! Layouts: slots 10/11/86 as on PC (VIctory `crates/victory-gpu/src/
 //! pipeline.rs` at xnw/base 5d0516e, GPL-3.0-or-later: `GraphicsHead`,
 //! `ComputeHead`, `StreamDesc`, `subobject` sizes 465-491); slots 55, 57,
-//! 62, 67 from five-star-recomp `docs/d3d12x-pipelines.md` (GPL-3.0):
+//! 62, 67 from five-star-recomp (GPL-3.0):
 //! 57 takes a 0x108-byte description of the title's pipeline cache (root
 //! signature, state metadata, outputs-and-inputs metadata, seven shader
 //! slots of `{code, size, metadata, size}`: 0 pixel, 1 vertex, 2 mesh, 6
@@ -851,7 +851,11 @@ pub(crate) fn options_for(stage: &str, hash: u128) -> Options {
     // XNW: `XNW_LOOP_COUNTS=1`: the program's slot
     // (`loopcount::slot_of`: first 8 hex digits of its hash mod 1024).
     let loop_counts = if super::loopcount::on() { super::loopcount::slot_of(&format!("{hash:032x}")) } else { None };
-    xnw_shader::emit::runtime_options(stage, hash, probe, loop_counts)
+    let mut opts = xnw_shader::emit::runtime_options(stage, hash, probe, loop_counts);
+    // Computed barycentrics only where the device has them (OPTIONS3;
+    // the RX 5700 XT has not, WARP 1.0.22 has); none before a device.
+    opts.barycentrics = xnw_device::host_barycentrics().unwrap_or(false);
+    opts
 }
 
 static SHADERS_LOGGED: AtomicU64 = AtomicU64::new(0);

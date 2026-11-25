@@ -30,7 +30,7 @@ use xnw_world::bridge::{self, Draw, Root, Slot};
 use xnw_world::preskin::{Kind, View};
 use xnw_world::textures::{Provided, Provider};
 use xnw_world::{DECAL_STAGES, DrawRecord, FrameList, GeomKey, HostGeometry, NO_PALETTE, Pass, RAW_SHADER, TexMode};
-use xnw_shader::emit::{self, Options};
+use xnw_shader::emit;
 
 use crate::le32;
 use crate::load::load_list;
@@ -74,6 +74,19 @@ pub struct Loaded {
     pub lacks: Vec<String>,
     /// Captured sampler heap entries at their indices (v2.4).
     pub samplers: Vec<(u32, bridge::SamplerDesc)>,
+    /// The title address of each captured table buffer view (root, slot,
+    /// address; ZC2).
+    addrs: Vec<(u16, u32, u64)>,
+    /// Slots whose bytes `load` wrote over or past the record's copy, by
+    /// (root, slot): the copy's length and the ranges written (the row's own
+    /// words; [`bridge::TitleView`], ZC3).
+    own: HashMap<(u16, u32), (usize, Vec<(usize, usize)>)>,
+}
+
+/// Range `r` of slot `key`'s bytes written by `load` over a copy of
+/// `before` bytes (the first write of the slot fixes the copy's length).
+fn own(marks: &mut HashMap<(u16, u32), (usize, Vec<(usize, usize)>)>, key: (u16, u32), before: usize, r: (usize, usize)) {
+    marks.entry(key).or_insert((before, Vec::new())).1.push(r);
 }
 
 /// Bit of a mesh program's first root constant: set, group k draws the
@@ -81,6 +94,39 @@ pub struct Loaded {
 const VISIBLE_LIST: u32 = 1 << 28;
 
 impl Loaded {
+    /// The title address of the binding's table buffer views, by the
+    /// address of their bytes here (`bridge_ms::Batch::add`, ZC2); the GPU
+    /// view of the paired reservation folded onto the CPU view.
+    /// Each view's copied length and the ranges `load` wrote as the row's
+    /// own words go with it (ZC3): the rest of its bytes is padding.
+    pub fn addrs(&self) -> Vec<(usize, bridge::TitleView)> {
+        let fold = |a: u64| if (0x5_0000_0000..0x9_0000_0000).contains(&a) { a - GPU_ALIAS } else { a };
+        self.addrs
+            .iter()
+            .filter_map(|&(root, slot, addr)| match self.roots.get(usize::from(root)) {
+                Some(LRoot::Table(v)) => v.iter().find(|s| s.0 == slot).and_then(|s| {
+                    let LSlot::Buffer(_, b) = &s.1 else { return None };
+                    let (captured, overlays) = self.own.get(&(root, slot)).cloned().unwrap_or((b.len(), Vec::new()));
+                    Some((b.as_ptr() as usize, bridge::TitleView { addr: fold(addr), captured, overlays }))
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The title ranges (address, bytes, unit) of the binding's table buffer
+    /// views of at least `min` bytes, as [`Loaded::addrs`] folds them.
+    pub fn ranges(&self, min: usize) -> Vec<(u64, u64, u64)> {
+        let fold = |a: u64| if (0x5_0000_0000..0x9_0000_0000).contains(&a) { a - GPU_ALIAS } else { a };
+        self.addrs
+            .iter()
+            .filter_map(|&(root, slot, addr)| match self.roots.get(usize::from(root)) {
+                Some(LRoot::Table(v)) => v.iter().find(|s| s.0 == slot).and_then(|s| if let LSlot::Buffer(k, b) = &s.1 { (b.len() >= min && *k != Kind::Cbv).then_some((fold(addr), b.len() as u64, bridge::unit(*k))) } else { None }),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Every meshlet in order instead of the title's visible-meshlet list
     /// (an output of its GPU culling, which no capture holds).
     pub fn direct_meshlets(&mut self) {
@@ -100,6 +146,43 @@ impl Loaded {
         match self.roots.get_mut(usize::from(root))? {
             LRoot::Table(v) => v.iter_mut().find(|s| s.0 == slot).and_then(|s| if let LSlot::Buffer(_, b) = &mut s.1 { Some(b) } else { None }),
             _ => None,
+        }
+    }
+
+    /// Puts texture `t` at table slot `slot` of root `root` in place of what
+    /// the record gave there (LIT2: our G-buffer under the title's lighting).
+    pub fn set_texture(&mut self, root: u16, slot: u32, t: Provided) {
+        if self.roots.len() <= usize::from(root) {
+            self.roots.resize_with(usize::from(root) + 1, LRoot::default);
+        }
+        if !matches!(self.roots[usize::from(root)], LRoot::Table(_)) {
+            self.roots[usize::from(root)] = LRoot::Table(Vec::new());
+        }
+        if let LRoot::Table(v) = &mut self.roots[usize::from(root)] {
+            v.retain(|s| s.0 != slot);
+            v.push((slot, LSlot::Texture(t)));
+            v.sort_by_key(|s| s.0);
+        }
+    }
+
+    /// Puts buffer bytes at table slot `slot` of root `root` in place of
+    /// what the record gave there (LIT2: a GPU output the capture holds as zero).
+    pub fn set_buffer(&mut self, root: u16, slot: u32, kind: Kind, bytes: Vec<u8>) {
+        if let Some(LRoot::Table(v)) = self.roots.get_mut(usize::from(root)) {
+            v.retain(|s| s.0 != slot);
+            v.push((slot, LSlot::Buffer(kind, bytes)));
+            v.sort_by_key(|s| s.0);
+        }
+    }
+
+    /// What table slot `slot` of root `root` holds for the binding, as a
+    /// short text ("-" when nothing: the slot reads through the guard).
+    pub fn describe(&self, root: u16, slot: u32) -> String {
+        let Some(LRoot::Table(v)) = self.roots.get(usize::from(root)) else { return "-".into() };
+        match v.iter().find(|s| s.0 == slot).map(|s| &s.1) {
+            None => "-".into(),
+            Some(LSlot::Buffer(k, b)) => format!("buffer {k:?} {} B{}", b.len(), if b.iter().all(|x| *x == 0) { " (all zero)" } else { "" }),
+            Some(LSlot::Texture(t)) => format!("texture {}x{} format {}{}", t.width, t.height, t.format, if t.rows.iter().all(|x| *x == 0) { " (all zero)" } else { "" }),
         }
     }
 
@@ -160,6 +243,10 @@ impl Row {
 /// (`T8+0x80`) instead: a small whole copy there (f887: 6800 B), not this.
 const PALETTE: (u16, u32) = (0, 5);
 
+/// The made-up address of a bindless stand-in the record has no view for
+/// (far above any title address): such stand-ins share one span.
+const STAND_IN_AT: u64 = 0xF000_0000_0000;
+
 /// The record of sink `sink` as a binding input. `used` says which table
 /// slots the two programs name, with the stride they read them at; `vb` is
 /// the list's copy of the row's vertex buffer; `texels` gives a texture by
@@ -198,7 +285,21 @@ pub fn load(pack: &Pack, sink: u32, row: &Row, vb: Option<&[u8]>, used: &HashMap
             match v.kind {
                 view::CONSTANT | view::BUFFER | view::PLACED_BUFFER => {
                     let got = pack.slot_bytes(sink, root, v.slot).ok().map(|(_, b)| b);
-                    let got = if (root, v.slot) == PALETTE { windows(pack.palette_windows(sink), palette(row, &v, got, &mut out.lacks), &mut out.lacks) } else { got };
+                    let got = if (root, v.slot) == PALETTE {
+                        let (before, mut placed) = (got.as_ref().map_or(0, Vec::len), Vec::new());
+                        let b = windows(pack.palette_windows(sink), palette(row, &v, got, &mut out.lacks, &mut placed), &mut out.lacks, &mut placed);
+                        for r in placed {
+                            own(&mut out.own, PALETTE, before, r);
+                        }
+                        b
+                    } else {
+                        got
+                    };
+                    // Every view's address, bytes or not: a stand-in `load`
+                    // puts at the slot later is bound at it (ZC3).
+                    if v.addr != 0 {
+                        out.addrs.push((root, v.slot, v.addr));
+                    }
                     let Some(b) = got else {
                         if wanted == Some(&NAMED_CBV) {
                             // A program that loads a constant buffer where the heap holds another kind of view removes the device.
@@ -263,7 +364,7 @@ pub fn load(pack: &Pack, sink: u32, row: &Row, vb: Option<&[u8]>, used: &HashMap
 /// the copy lacks them (it is cut at 16 MB): first the list's palette
 /// window past the copy's end, then the hook's span of the draw's own
 /// bones over it unless the copy holds them whole. A line in `lacks` says which.
-fn palette(row: &Row, v: &fp::SlotView, got: Option<Vec<u8>>, lacks: &mut Vec<String>) -> Option<Vec<u8>> {
+fn palette(row: &Row, v: &fp::SlotView, got: Option<Vec<u8>>, lacks: &mut Vec<String>, placed: &mut Vec<(usize, usize)>) -> Option<Vec<u8>> {
     let Some((at, bones)) = row.palette.as_ref().filter(|p| !p.1.is_empty()) else { return got };
     let place = |at: u64, len: usize| {
         let off = (at % GPU_ALIAS).wrapping_sub(v.addr % GPU_ALIAS);
@@ -289,6 +390,7 @@ fn palette(row: &Row, v: &fp::SlotView, got: Option<Vec<u8>>, lacks: &mut Vec<St
             b.resize(woff + w.len(), 0);
         }
         b[from..woff + w.len()].copy_from_slice(&w[from - woff..]);
+        placed.push((from, woff + w.len()));
         window = (woff + w.len() - from) / 48;
     }
     if held == n && zero == 0 {
@@ -302,13 +404,14 @@ fn palette(row: &Row, v: &fp::SlotView, got: Option<Vec<u8>>, lacks: &mut Vec<St
         b.resize(end, 0);
     }
     b[off..end].copy_from_slice(bones);
+    placed.push((off, end));
     Some(b)
 }
 
 /// An instanced draw's palette windows (wheels: bones at the per-instance
 /// bases of `T9+0x120`), each at its place in the palette view's
 /// bytes when the copy lacks them there (the copy is cut at 16 MB).
-fn windows(w: Vec<(u32, Result<Vec<u8>, u32>)>, got: Option<Vec<u8>>, lacks: &mut Vec<String>) -> Option<Vec<u8>> {
+fn windows(w: Vec<(u32, Result<Vec<u8>, u32>)>, got: Option<Vec<u8>>, lacks: &mut Vec<String>, placed_at: &mut Vec<(usize, usize)>) -> Option<Vec<u8>> {
     if w.is_empty() {
         return got;
     }
@@ -328,6 +431,7 @@ fn windows(w: Vec<(u32, Result<Vec<u8>, u32>)>, got: Option<Vec<u8>>, lacks: &mu
             b.resize(end, 0);
         }
         b[off..end].copy_from_slice(bytes);
+        placed_at.push((off, end));
         placed += 1;
     }
     lacks.push(format!("the palette windows: {} records, {held} held by the copy, {placed} placed from their records", w.len()));
@@ -356,6 +460,7 @@ fn arena(pack: &Pack, sink: u32, out: &mut Loaded) {
         Some((_, LSlot::Buffer(_, b))) if b.get(at..end) == Some(&words[..]) => return,
         Some((_, LSlot::Buffer(_, b))) => {
             out.lacks.push(format!("the bone mask words at slot {BINDLESS_SLOT} + {at:#x} (the copy holds {} B): the arena record's {} B stand in", b.len(), words.len()));
+            own(&mut out.own, (0, BINDLESS_SLOT), b.len(), (at, end));
             if b.len() < end {
                 b.resize(end, 0);
             }
@@ -428,7 +533,7 @@ fn bindless(pack: &Pack, sink: u32, row: &Row, texels: &mut Provider, out: &mut 
     out.heap.sort_by_key(|h| h.0);
     out.heap.dedup_by_key(|h| h.0);
     let end = at as usize + 4 * BINDLESS_WORDS;
-    for r in &mut out.roots {
+    for (ri, r) in out.roots.iter_mut().enumerate() {
         let LRoot::Table(slots) = r else { continue };
         let held = slots.iter().position(|s| s.0 == BINDLESS_SLOT);
         let whole = held.is_some_and(|i| matches!(&slots[i].1, LSlot::Buffer(_, b) if b.len() >= end));
@@ -447,8 +552,16 @@ fn bindless(pack: &Pack, sink: u32, row: &Row, texels: &mut Provider, out: &mut 
         out.lacks.push(format!("the bindless words at slot {BINDLESS_SLOT} + {at:#x} (the capture cuts that buffer): the albedo's heap index {index} at {BINDLESS_WORDS} words"));
         match held {
             Some(i) => slots[i].1 = LSlot::Buffer(Kind::Raw, words),
-            None => slots.push((BINDLESS_SLOT, LSlot::Buffer(Kind::Raw, words))),
+            None => {
+                slots.push((BINDLESS_SLOT, LSlot::Buffer(Kind::Raw, words)));
+                // No view in the record: the stand-in still shares one buffer
+                // with every other row's (ZC3: 64 rows of pk3 f1241, 52 MB of
+                // zeros each for 64 B of words).
+                out.addrs.push((ri as u16, BINDLESS_SLOT, STAND_IN_AT));
+            }
         }
+        // The stand-in replaces the copy: only its words are the row's.
+        out.own.insert((ri as u16, BINDLESS_SLOT), (0, vec![(at as usize, end)]));
         return;
     }
 }
@@ -468,6 +581,7 @@ fn draw_words(pack: &Pack, sink: u32, at: u32, out: &mut Loaded) -> bool {
     let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     match slots.iter_mut().find(|s| s.0 == BINDLESS_SLOT) {
         Some((_, LSlot::Buffer(_, b))) => {
+            own(&mut out.own, (0, BINDLESS_SLOT), b.len(), (from, end));
             if b.len() < end {
                 b.resize(end, 0);
             }
@@ -498,7 +612,7 @@ fn draw_words(pack: &Pack, sink: u32, at: u32, out: &mut Loaded) -> bool {
                 Err(why) => {
                     // A texture the program samples must be a texture view:
                     // a 1x1 grey (0.5) stands in.
-                    out.heap.push((v.slot, LSlot::Texture(Provided { width: 1, height: 1, format: 28, rows: vec![128, 128, 128, 255], row_bytes: 4, row_count: 1 })));
+                    out.heap.push((v.slot, LSlot::Texture(Provided { width: 1, height: 1, format: 28, rows: vec![128, 128, 128, 255], row_bytes: 4, row_count: 1, dim: xnw_world::textures::TEX_2D, depth: 1 })));
                     missing.push(format!("{} ({why})", v.slot));
                 }
             },
@@ -548,8 +662,8 @@ pub fn programs(pack: &Pack, sink: u32) -> Result<(bridge::Programs, HashMap<(u1
     let (msr, psr) = (stage("mesh")?, stage("pixel")?);
     let code = |h: u128| pack.blob(h).ok_or_else(|| format!("no container bytes for {h:032x}"));
     let (msc, psc) = (code(msr.container)?, code(psr.container)?);
-    let (ms, layout) = emit::mesh::translate_fallback(&msc, Options::default()).map_err(|e| format!("mesh program {:032x}: {e}", msr.container))?;
-    let ps = emit::translate_with(&psc, Options::default()).map_err(|e| format!("pixel program {:032x}: {e}", psr.container))?;
+    let (ms, layout) = emit::mesh::translate_fallback(&msc, bridge::options()).map_err(|e| format!("mesh program {:032x}: {e}", msr.container))?;
+    let ps = emit::translate_with(&psc, bridge::options()).map_err(|e| format!("pixel program {:032x}: {e}", psr.container))?;
     let vs = emit::mesh::passthrough_vs(&layout, Some(&ps.dxil)).map_err(|e| format!("pass-through vertex shader: {e}"))?;
     let mut used = HashMap::new();
     let mut wave = 32;
@@ -562,7 +676,7 @@ pub fn programs(pack: &Pack, sink: u32) -> Result<(bridge::Programs, HashMap<(u1
 /// The table slots a console container's programs name, with the widest
 /// stride each is read at, into `used`; `wave` becomes 64 for a mesh
 /// program of 64-lane waves.
-fn named(container: &[u8], used: &mut HashMap<(u16, u32), u32>, wave: &mut u32) -> Result<(), String> {
+pub(crate) fn named(container: &[u8], used: &mut HashMap<(u16, u32), u32>, wave: &mut u32) -> Result<(), String> {
     let parsed = xnw_shader::Container::parse(container).map_err(|e| e.to_string())?;
     let part = parsed.part(xnw_shader::FourCC::DXIL).ok_or("no DXIL part")?;
     for p in xnw_shader::native_programs(part.data).map_err(|e| e.to_string())? {
@@ -582,7 +696,7 @@ fn named(container: &[u8], used: &mut HashMap<(u16, u32), u32>, wave: &mut u32) 
 /// and clip distances, and no pixel program.
 pub fn mesh_program(pack: &Pack, container: u128) -> Result<(bridge::Programs, HashMap<(u16, u32), u32>), String> {
     let msc = pack.blob(container).ok_or_else(|| format!("no container bytes for {container:032x}"))?;
-    let (ms, layout) = emit::mesh::translate_fallback(&msc, Options::default()).map_err(|e| format!("mesh program {container:032x}: {e}"))?;
+    let (ms, layout) = emit::mesh::translate_fallback(&msc, bridge::options()).map_err(|e| format!("mesh program {container:032x}: {e}"))?;
     let vs = emit::mesh::passthrough_vs(&layout, None).map_err(|e| format!("pass-through vertex shader: {e}"))?;
     let (mut used, mut wave) = (HashMap::new(), 32);
     named(&msc, &mut used, &mut wave)?;
@@ -598,7 +712,7 @@ pub fn vertex_program(pack: &Pack, sink: u32, vertices: u32, instances: u32, str
     let pipeline = pack.data.sinks.iter().find(|s| s.index == sink).ok_or("no such sink")?.pipeline;
     let container = pack.data.programs.iter().find(|p| p.pipeline == pipeline && p.stage == "vertex").ok_or_else(|| format!("sink {sink}: the pipeline has no vertex program"))?.container;
     let vsc = pack.blob(container).ok_or_else(|| format!("no container bytes for {container:032x}"))?;
-    let ms = emit::translate_with(&vsc, Options::default()).map_err(|e| format!("vertex program {container:032x}: {e}"))?;
+    let ms = emit::translate_with(&vsc, bridge::options()).map_err(|e| format!("vertex program {container:032x}: {e}"))?;
     let (mut used, mut wave) = (HashMap::new(), 32);
     named(&vsc, &mut used, &mut wave)?;
     let none = || emit::HostShader { stage: xnw_shader::HwStage::Ps, dxil: Vec::new(), user_data: Vec::new(), samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: Vec::new(), root_srvs: Vec::new(), root_uavs: Vec::new(), address_map: false, descriptor_words: false };
@@ -773,7 +887,7 @@ fn audit_ours(args: &[String], dir: &Path, out: &Path, pass: &mut Pass) -> Resul
     xnw_world::keep_jitter(!args.iter().any(|a| a == "--no-jitter"));
     pass.set_raw_shader(&depth_shader()?)?;
     (pass.sky, pass.water, pass.terrain.opts.on) = (false, false, false);
-    let mut decode = |key: &GeomKey| geoms.get(key).map(|(vb, idx)| HostGeometry { vertices: Vec::new(), indices: idx.clone(), raw_vb: Some(vb.clone()) });
+    let mut decode = |key: &GeomKey| geoms.get(key).map(|(vb, idx)| HostGeometry { vertices: Vec::new(), indices: idx.clone(), raw_vb: Some(vb.clone()), vb_place: 0 });
     let all = std::mem::take(&mut list.draws);
     let (mut sides, mut lines) = (Vec::new(), vec!["row\tclass\tstage\tdrawn\ttriangles\tinstances\tskinned\tpixels".to_string()]);
     let t0 = std::time::Instant::now();
@@ -1025,7 +1139,7 @@ pub fn cli(args: &[String], dir: &Path, index: &str, host: &xnw_gpu::host::Host,
     (pass.sky, pass.water, pass.terrain.opts.on) = (false, false, false);
     pass.tex.opts.mode = TexMode::Provided;
     pass.tex.set_provider(Some(pack.texel_provider(counts)));
-    let mut decode = |key: &GeomKey| geoms.get(key).map(|(vb, idx)| HostGeometry { vertices: Vec::new(), indices: idx.clone(), raw_vb: Some(vb.clone()) });
+    let mut decode = |key: &GeomKey| geoms.get(key).map(|(vb, idx)| HostGeometry { vertices: Vec::new(), indices: idx.clone(), raw_vb: Some(vb.clone()), vb_place: 0 });
     list.frame = 1;
     pass.draw(&list, &mut decode, true)?;
     ours = pass.read_rgba()?;
@@ -1139,7 +1253,7 @@ mod tests {
         let pack = Pack::open(&dir).unwrap().unwrap();
         let row = Row { mesh_at: 0x5000, vb_at: 0x8000, handles: vec![0x4_0000 + 32 * 300, 0], palette: None, window: None };
         let used: HashMap<(u16, u32), u32> = [((1, 2), 0), ((1, 0), 0), ((0, BINDLESS_SLOT), 0)].into();
-        let mut texels: Provider = Box::new(|h| (h == 0x4_0000 + 32 * 300).then(|| Provided { width: 1, height: 1, format: 28, rows: vec![0; 4], row_bytes: 4, row_count: 1 }));
+        let mut texels: Provider = Box::new(|h| (h == 0x4_0000 + 32 * 300).then(|| Provided { width: 1, height: 1, format: 28, rows: vec![0; 4], row_bytes: 4, row_count: 1, dim: xnw_world::textures::TEX_2D, depth: 1 }));
         let l = load(&pack, 0, &row, Some(&[5; 24]), &used, &mut texels);
         let d = l.draw();
         assert_eq!(d.groups, 3);

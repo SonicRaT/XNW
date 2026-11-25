@@ -8,7 +8,7 @@
 //!
 //! Sources:
 //! - five-star-recomp (GPL-3.0-or-later, commit 0bc9cd731e363041637504dac75e22f53ce34c58):
-//!   `docs/d3d12x-pipelines.md` 11-17, 184-243; `docs/pipeline-cache.md`
+//!    11-17, 184-243;
 //!   60-139; ported from `src/FiveStar.Shaders/Cache/GraphicsStateParser.cs`,
 //!   `FixedFunctionDecoder.cs`, `PipelineTargetsParser.cs`,
 //!   `InputLayoutParser.cs`, `ComputeStateParser.cs` and

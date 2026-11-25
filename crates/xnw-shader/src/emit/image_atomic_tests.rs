@@ -132,6 +132,7 @@ fn build(op: u8, pair: bool) -> HostShader {
         probe: false,
         loop_counts: None,
         pagetable: false,
+        barycentrics: false,
     })
     .expect("lower");
     let shader = HostShader {

@@ -93,6 +93,7 @@ pub fn run(args: &[String]) -> Res<()> {
     wheel_line(&pack);
     bridge_line(dir);
     strand_lines(dir);
+    pk8_lines(dir, &names);
     let unnamed: Vec<String> = pack.programs.iter().filter(|p| !named(p.container)).take(5).map(|p| format!("{} {:032x}", p.stage, p.container)).collect();
     if !unnamed.is_empty() {
         println!("unnamed    first {}: {}", unnamed.len(), unnamed.join(", "));
@@ -214,7 +215,7 @@ fn wheel_line(pack: &xnw_formats::framepack::FramePack) {
 fn bridge_line(dir: &Path) {
     use xnw_formats::framepack::{self as fp, kind, reason};
     let Ok(Some(pack)) = xnw_frame::pack::Pack::open(dir) else { return };
-    let draws: Vec<u32> = pack.data.sinks.iter().filter(|s| s.op != fp::op::DISPATCH).map(|s| s.index).collect();
+    let draws: Vec<u32> = pack.data.sinks.iter().filter(|s| !fp::op::is_dispatch(s.op)).map(|s| s.index).collect();
     let (mut with, mut views, mut textures, mut held) = (0u32, 0usize, 0u32, 0u32);
     let mut why: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
     let mut recorded = 0u32;
@@ -343,6 +344,15 @@ fn strand_lines(dir: &Path) {
         views.iter().filter(|r| r.reason == reason::OK).count(),
         if why.is_empty() { "none".into() } else { why.join(", ") },
         bytes as f64 / 1e6
+    );    // v2.7: the CPU scene lights and the pipelines' target formats.
+    let lights = refs.iter().find(|r| r.kind == kind::LIGHTS && r.slot == 1).and_then(|r| pack.blob(r.hash)).filter(|b| b.len() >= 8);
+    let array = refs.iter().find(|r| r.kind == kind::LIGHTS && r.slot == 0);
+    let targets = refs.iter().filter(|r| r.kind == kind::TARGETS).count();
+    println!(
+        "lights     scene-light array {} (buffer {}, count {}); pipelines with target formats {targets}",
+        array.map_or("not recorded".into(), |r| if reason::has_bytes(r.reason) { format!("{} B at {:#x}", r.len, r.addr) } else { format!("reason {}", r.reason) }),
+        lights.as_ref().map_or("-".into(), |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]).to_string()),
+        lights.as_ref().map_or("-".into(), |b| u32::from_le_bytes([b[4], b[5], b[6], b[7]]).to_string()),
     );
 }
 
@@ -413,4 +423,116 @@ fn preskin_lines(dir: &Path, is_preskin: &dyn Fn(u128) -> bool) {
         view(views[0]),
         view(views[1])
     );
+}
+
+/// v2.9: sky and ambient dispatch sinks and indirect dispatch sinks
+/// (tables by root, views), dispatch group counts, and the strand records'
+/// palette windows, collision spans, remap format word and texture texels.
+fn pk8_lines(dir: &Path, names: &HashMap<u128, Option<String>>) {
+    use std::collections::BTreeMap;
+    use xnw_formats::framepack::{self as fp, kind, reason, view};
+    let Ok(Some(pack)) = xnw_frame::pack::Pack::open(dir) else { return };
+    let refs = &pack.data.refs;
+    let compute_name = |pipe: u64| {
+        pack.data.programs.iter().filter(|p| p.pipeline == pipe && p.stage == "compute").find_map(|p| names.get(&p.container).cloned().flatten()).map(|n| n.trim_end_matches("_Wrapped").to_string())
+    };
+    // Tables of a sink: root -> views (count).
+    let tables = |sink: u32| -> BTreeMap<u16, usize> { pack.data.refs_of(sink).filter(|r| r.kind == kind::TABLE && reason::has_bytes(r.reason)).map(|r| (r.slot, pack.blob(r.hash).map_or(0, |b| fp::decode_slots(&b).len()))).collect() };
+    let sky = |n: &str| n.starts_with("sky_") || n.starts_with("ambient_map:") || n.starts_with("scattering_transmittance_system:CS_SkyAtmosphereLUT");
+    let mut by: BTreeMap<String, (u32, String)> = BTreeMap::new();
+    for s in pack.data.sinks.iter().filter(|s| fp::op::is_dispatch(s.op)) {
+        let Some(n) = compute_name(s.pipeline).filter(|n| sky(n) || s.op == fp::op::INDIRECT_DISPATCH) else { continue };
+        let e = by.entry(format!("{} {n}", fp::op::name(s.op))).or_default();
+        e.0 += 1;
+        if e.1.is_empty() {
+            let t: Vec<String> = tables(s.index).iter().map(|(r, v)| format!("root {r} {v} views")).collect();
+            e.1 = format!("sink {}: {}", s.index, if t.is_empty() { "no table".into() } else { t.join(", ") });
+        }
+    }
+    let parts: Vec<String> = by.iter().map(|(n, (k, first))| format!("{n} {k} ({first})")).collect();
+    println!("sky        sky/ambient and indirect dispatch sinks: {}", if parts.is_empty() { "none".into() } else { parts.join("; ") });
+    let groups: Vec<[u32; 3]> = refs.iter().filter(|r| r.kind == kind::GROUPS).filter_map(|r| pack.blob(r.hash)).filter(|b| b.len() >= 12).map(|b| std::array::from_fn(|i| u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]))).collect();
+    let mut yz: BTreeMap<(u32, u32), u32> = BTreeMap::new();
+    for g in &groups {
+        *yz.entry((g[1], g[2])).or_default() += 1;
+    }
+    let yz: Vec<String> = yz.iter().map(|((y, z), n)| format!("{y}x{z}: {n}")).collect();
+    println!("groups     dispatch sinks with group counts {}; by y x z: {}", groups.len(), yz.join(", "));
+    // Strand records: palette windows, collision spans.
+    let (mut pal, mut pal_cut, mut pal_bytes, mut pal_why) = (0u32, 0u32, 0u64, BTreeMap::<u32, u32>::new());
+    for r in refs.iter().filter(|r| r.kind == kind::STRAND_PALETTE) {
+        if reason::has_bytes(r.reason) {
+            pal += 1;
+            pal_cut += u32::from(r.reason == reason::CUT);
+            pal_bytes += u64::from(r.len);
+        } else {
+            *pal_why.entry(r.reason).or_default() += 1;
+        }
+    }
+    let (mut spans, mut shapes, mut nonzero, mut span_why) = (0u32, 0u64, 0u32, BTreeMap::<u32, u32>::new());
+    for r in refs.iter().filter(|r| r.kind == kind::STRAND_SPAN) {
+        if reason::has_bytes(r.reason) {
+            spans += 1;
+            shapes += u64::from(r.len) / fp::STRAND_SHAPE as u64;
+            nonzero += u32::from(pack.blob(r.hash).is_some_and(|b| b.iter().any(|x| *x != 0)));
+        } else {
+            *span_why.entry(r.reason).or_default() += 1;
+        }
+    }
+    let why = |m: &BTreeMap<u32, u32>| if m.is_empty() { "none".to_string() } else { m.iter().map(|(r, n)| format!("reason {r}: {n}")).collect::<Vec<_>>().join(", ") };
+    println!(
+        "strandx    palette windows {pal} with bytes ({pal_cut} cut, {} bones), without: {}; collision spans {spans} with bytes ({shapes} shapes, {nonzero} non-zero), without: {}",
+        pal_bytes / fp::BONE_BYTES as u64,
+        why(&pal_why),
+        why(&span_why)
+    );
+    // The views the records name: remap (+0xe0) format word, the textures' texels (cut map +0x128).
+    let texel_of = |at: u64| pack.data.textures.iter().find(|t| t.at == at);
+    let mut words: BTreeMap<String, u32> = BTreeMap::new();
+    for r in refs.iter().filter(|r| r.kind == kind::STRAND_VIEW && reason::has_bytes(r.reason)) {
+        let Some(v) = pack.blob(r.hash).and_then(|b| fp::decode_slots(&b).into_iter().next()) else { continue };
+        let word = fp::STRAND_WORDS[usize::from(r.slot % 8)];
+        let what = match v.kind {
+            view::PLACED_BUFFER | view::BUFFER => format!("+{word:#x} buffer, view format word {} ({} B)", v.words[14], v.bytes),
+            view::TEXTURE | view::PLACED => match texel_of(v.addr) {
+                Some(t) if t.texels != 0 => {
+                    let first = pack.blob(t.texels).map(|b| b.iter().take(4).map(|x| format!("{x:02x}")).collect::<String>()).unwrap_or_default();
+                    format!("+{word:#x} texture {}x{} fmt {}, texels {} B (first {first}, {})", v.width, v.height, v.format, t.texel_bytes, fill_text(&t.fill))
+                }
+                Some(t) => format!("+{word:#x} texture {}x{} fmt {}, no texels (reason {}, {})", v.width, v.height, v.format, t.reason, fill_text(&t.fill)),
+                None => format!("+{word:#x} texture {}x{} fmt {}, no row", v.width, v.height, v.format),
+            },
+            k => format!("+{word:#x} kind {k}"),
+        };
+        *words.entry(what).or_default() += 1;
+    }
+    for (w, n) in &words {
+        println!("strandv    {n} x {w}");
+    }
+    // The hair input sinks' root 0 slot 29 (width profile) texture.
+    let mut seen = std::collections::HashSet::new();
+    for r in refs.iter().filter(|r| r.kind == kind::TABLE && r.slot == 0 && reason::has_bytes(r.reason)) {
+        let Some(n) = pack.data.sinks.get(r.owner as usize).filter(|s| s.op == fp::op::DISPATCH).and_then(|s| compute_name(s.pipeline)) else { continue };
+        if !n.starts_with("smh_") {
+            continue;
+        }
+        let Some(v) = pack.blob(r.hash).and_then(|b| fp::decode_slots(&b).into_iter().find(|v| v.slot == 29)) else { continue };
+        if !seen.insert(v.addr) {
+            continue;
+        }
+        let t = texel_of(v.addr);
+        println!(
+            "strandw    slot 29 {}x{} fmt {} at {:#x}: {}",
+            v.width,
+            v.height,
+            v.format,
+            v.addr,
+            t.map_or("no row".into(), |t| if t.texels != 0 { format!("texels {} B ({})", t.texel_bytes, fill_text(&t.fill)) } else { format!("no texels, reason {} ({})", t.reason, fill_text(&t.fill)) })
+        );
+    }
+}
+
+/// A texture row's fill as textures.tsv writes it (`z<permille zero>`).
+fn fill_text(f: &xnw_formats::framepack::Fill) -> String {
+    format!("z{}", f.zero_permille)
 }

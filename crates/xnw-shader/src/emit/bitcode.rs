@@ -7,6 +7,8 @@
 //! instructions of `main` in block order.
 
 pub mod opt;
+// XNW: heap indices that differ between lanes.
+pub mod uniform;
 
 use std::collections::HashMap;
 

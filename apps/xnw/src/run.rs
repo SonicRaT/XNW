@@ -235,6 +235,7 @@ pub fn run(args: &[String]) -> Res<()> {
     xnw_loader::crash::install();
     xnw_loader::crash::report_exceptions();
     xnw_loader::crash::on_report(xnw_gpu::d3d12x::log_memory);
+    xnw_loader::crash::on_fault(xnw_gpu::d3d12x::descriptor::slotwatch::on_fault);
     // Every thread's stack once when no frame is presented for 10 s
     // (with the frame statistics, or XNW_STALL_DUMP=1).
     if std::env::var("XNW_FRAME_STATS").is_ok_and(|v| v == "1") || std::env::var("XNW_STALL_DUMP").is_ok_and(|v| v == "1") {

@@ -85,3 +85,25 @@ pub fn run(args: &[String]) -> Res<()> {
     }
     Ok(())
 }
+
+/// `xnw shader-warm [--drawn|--all] [--jobs N] [--pack <shaders.rpf>]`: the
+/// shader half of the prebuild, to run before a card run after a translator
+/// change, on either PC, no card. It
+/// translates into the DXIL cache of the current translator generation the
+/// shaders of the pipeline list (every program a run drew with); `--drawn`
+/// (default) keeps those whose program hash is in shader-gate's drawn list
+/// (`XNW_SHADER_DRAWN`, `out\shader-gate\drawn.txt`), `--all` the whole
+/// list. Restartable. The driver's pipelines are not built (`xnw prebuild`
+/// does that on the card's PC).
+pub fn warm(args: &[String]) -> Res<()> {
+    let mut rest: Vec<String> = args.iter().filter(|a| !matches!(a.as_str(), "--drawn" | "--all")).cloned().collect();
+    rest.push("--shaders-only".into());
+    if !args.iter().any(|a| a == "--all") {
+        let found = std::env::var_os("XNW_SHADER_DRAWN").map(std::path::PathBuf::from).into_iter().chain([r"out\shader-gate\drawn.txt", r"out\shader-gate\drawn.txt"].map(std::path::PathBuf::from)).find(|p| p.is_file());
+        let list = found.ok_or("shader-warm --drawn: no list (XNW_SHADER_DRAWN, out/shader-gate/drawn.txt); --all takes every listed pipeline")?;
+        eprintln!("shader-warm: drawn list {}", list.display());
+        rest.push("--only".into());
+        rest.push(format!("@{}", list.display()));
+    }
+    run(&rest)
+}

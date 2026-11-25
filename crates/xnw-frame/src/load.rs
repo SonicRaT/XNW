@@ -485,6 +485,12 @@ pub fn rstate_parse(v: &str) -> Option<xnw_world::RenderState> {
 }
 
 pub fn load_list(fdir: &std::path::Path) -> Result<(FrameList, HashMap<GeomKey, (Vec<u8>, Vec<u32>)>), String> {
+    load_list_with(fdir, &|_| false)
+}
+
+/// [`load_list`] without reading the blobs of the keys `have` already holds
+/// (`xnw burst` loads a sequence's geometries once).
+pub fn load_list_with(fdir: &std::path::Path, have: &dyn Fn(&GeomKey) -> bool) -> Result<(FrameList, HashMap<GeomKey, (Vec<u8>, Vec<u32>)>), String> {
     let text = std::fs::read_to_string(fdir.join("list.tsv")).map_err(|e| e.to_string())?;
     let shared = fdir.parent().ok_or("no parent")?.join("blobs");
     let hex = |s: &str| u64::from_str_radix(s.trim_start_matches("0x"), 16).unwrap_or(0);
@@ -498,7 +504,9 @@ pub fn load_list(fdir: &std::path::Path) -> Result<(FrameList, HashMap<GeomKey, 
         let geom = GeomKey { mesh_at: hex(f[0]), mesh_len: f[1].parse().unwrap_or(0), vb_at: hex(f[2]), vb_len: f[3].parse().unwrap_or(0), ib: f[4].parse().unwrap_or(0), hash: hex(f[5]) };
         let w: Vec<f32> = f[12].replace('|', " ").split_whitespace().filter_map(|x| x.parse().ok()).collect();
         let Ok(world) = <[f32; 16]>::try_from(w.as_slice()) else { continue };
-        if let std::collections::hash_map::Entry::Vacant(v) = geoms.entry(geom) {
+        if !have(&geom)
+            && let std::collections::hash_map::Entry::Vacant(v) = geoms.entry(geom)
+        {
             let stem = shared.join(format!("k-{:x}-{:x}", geom.mesh_at, geom.hash));
             if let (Ok(vb), Ok(idx)) = (std::fs::read(stem.with_extension("vb")), std::fs::read(stem.with_extension("idx"))) {
                 v.insert((vb, idx.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect()));

@@ -122,7 +122,7 @@ pub(super) fn draw_want(pipeline: usize) -> bool {
 static SINK_N: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// The range word of a draw's own record: +0x54 of the 128-B record at
-/// slot 0 of one of its tables (T9; the frame pack's `range_word`).
+/// slot 0 of one of its tables (the frame pack's `range_word`).
 fn own_word(src: &dyn Source, roots: usize) -> Option<u32> {
     let v = (0..roots).find_map(|r| src.table(r, 0).filter(|v| v.bytes == 128 && v.addr != 0))?;
     let b = src.read(v.addr + 0x54, 4)?;
@@ -371,7 +371,7 @@ pub fn item_of(src: &dyn Source, frame: u64, variant: u32, bits: u32, new: &mut 
     } else {
         Vec::new()
     };
-    Ok(Item { b7, vb, remap, palette, mask, rule, neutral, unmapped, vb_key, remap_key, delta })
+    Ok(Item { b7, vb, remap, palette, mask, rule, neutral, unmapped, vb_key, remap_key, delta, table: Vec::new(), table_normals: 0 })
 }
 
 /// The pre-skin of `list` (frame `frame`): its items, and the rows whose
@@ -542,7 +542,7 @@ mod tests {
         let it = |word: u32| {
             let mut b7 = vec![0u8; 96];
             put(&mut b7, 0x34, word);
-            Item { b7, vb: Arc::new(Vec::new()), remap: Arc::new(Vec::new()), palette: Vec::new(), mask: None, rule: Bones::Four, neutral: false, unmapped: false, vb_key: 1, remap_key: 1, delta: Vec::new() }
+            Item { b7, vb: Arc::new(Vec::new()), remap: Arc::new(Vec::new()), palette: Vec::new(), mask: None, rule: Bones::Four, neutral: false, unmapped: false, vb_key: 1, remap_key: 1, delta: Vec::new(), table: Vec::new(), table_normals: 0 }
         };
         // Below the first sweep (frame 600): the other test's kept streams stay.
         let frame = 500;

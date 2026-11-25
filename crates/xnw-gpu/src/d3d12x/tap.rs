@@ -5,8 +5,16 @@
 //! mode, before the host pipeline check) with the title's pipeline, heaps
 //! and root arguments, and resolves descriptor slots to the views the
 //! title made. Off (no tap registered): one relaxed load per draw.
+//!
+//! A burst replay (`xnw burst`, BURST2) drives the same consumers without
+//! the title: [`serve`] puts a captured frame's objects (pipelines' stages,
+//! heaps, resolved slots) in place of our device's, and [`replay`] hands a
+//! sink rebuilt from the capture to the registered consumers as the list
+//! sink does. Off: one relaxed load per query.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::HashMap;
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::descriptor::{self, View};
 use super::object::This;
@@ -112,8 +120,58 @@ pub(crate) fn draw_tap() -> Option<(DispatchWant, Tap)> {
     (t != 0).then(|| unsafe { (std::mem::transmute::<usize, DispatchWant>(w), std::mem::transmute::<usize, Tap>(t)) })
 }
 
-/// Slots a table root reaches at most (T8 is 0xB40 bytes = 90 slots).
-pub const TABLE_SLOTS: u32 = 96;
+/// The list sink's second consumers for a sink rebuilt from a capture
+/// (draw.rs `tap` / `tap_dispatch` without the pack's tap): a dispatch to
+/// the dispatch tap, a draw to the draw tap, each when it wants the
+/// pipeline.
+pub fn replay(d: &TapDraw) {
+    let tap = if d.op == xnw_formats::framepack::op::DISPATCH { dispatch_tap() } else { draw_tap() };
+    if let Some((want, f)) = tap
+        && want(d.pipeline)
+    {
+        f(d);
+    }
+}
+
+/// A captured frame's objects, served in place of our device's while a
+/// burst runs: pipelines by their object number (the capture's), each
+/// stage with its bytes; view and sampler heaps by number (first slot,
+/// slot count); resolved slots by handle; title buffers (start, bytes)
+/// for root views.
+#[derive(Default)]
+pub struct Served {
+    pub pipelines: HashMap<usize, Vec<(TapStage, Vec<u8>)>>,
+    pub targets: HashMap<usize, (Vec<u32>, u32)>,
+    pub view_heaps: HashMap<usize, (u64, u32)>,
+    pub sampler_heaps: HashMap<usize, (u64, u32)>,
+    pub views: HashMap<u64, TapView>,
+    pub buffers: std::collections::BTreeMap<u64, u64>,
+}
+
+static SERVING: AtomicBool = AtomicBool::new(false);
+static SERVED: RwLock<Option<Served>> = RwLock::new(None);
+
+/// Serves `s` (None: our device's objects again).
+pub fn serve(s: Option<Served>) {
+    let on = s.is_some();
+    if let Ok(mut g) = SERVED.write() {
+        *g = s;
+    }
+    SERVING.store(on, Ordering::Release);
+}
+
+/// `f` over the served objects while a burst serves them (None: not serving).
+fn served<T>(f: impl FnOnce(&Served) -> T) -> Option<T> {
+    if !SERVING.load(Ordering::Relaxed) {
+        return None;
+    }
+    let g = SERVED.read().ok()?;
+    g.as_ref().map(f)
+}
+
+/// Slots a table root reaches at most (the lighting programs read the
+/// frame table up to slot 181; the pack keeps 96 of other tables).
+pub const TABLE_SLOTS: u32 = 192;
 /// A view heap's slot size (bl[k] << 5).
 pub const SLOT: u64 = 32;
 
@@ -128,6 +186,9 @@ pub fn heap_slot(view_heap: usize, index: u32) -> Option<(u64, u64)> {
     if view_heap == 0 {
         return None;
     }
+    if let Some(got) = served(|s| s.view_heaps.get(&view_heap).and_then(|&(start, count)| (index < count).then(|| (start, start + SLOT * u64::from(index))))) {
+        return got;
+    }
     let h = descriptor::heap(view_heap as This);
     let handle = h.start.checked_add(SLOT * u64::from(index))?;
     (h.index(handle) == Some(index)).then_some((h.start, handle))
@@ -141,6 +202,9 @@ pub const SAMPLER_SLOT: u64 = 16;
 pub fn sampler_heap(heap: usize) -> Option<(u64, u32)> {
     if heap == 0 {
         return None;
+    }
+    if let Some(got) = served(|s| s.sampler_heaps.get(&heap).copied()) {
+        return got;
     }
     let h = descriptor::heap(heap as This);
     h.samplers().then(|| (h.start, (h.end().saturating_sub(h.start) / SAMPLER_SLOT).min(u64::from(u32::MAX)) as u32))
@@ -177,6 +241,9 @@ pub struct TapStage {
 
 /// The stages of the title's pipeline object `p` (ours).
 pub fn stages(p: usize) -> Vec<TapStage> {
+    if let Some(got) = served(|s| s.pipelines.get(&p).map(|v| v.iter().map(|x| x.0.clone()).collect()).unwrap_or_default()) {
+        return got;
+    }
     let Some(d) = pipeline::desc(p as This) else { return Vec::new() };
     d.stages
         .iter()
@@ -191,8 +258,19 @@ pub fn stages(p: usize) -> Vec<TapStage> {
         .collect()
 }
 
+/// A pipeline's render-target formats and depth format (DXGI), if known.
+pub fn targets(p: usize) -> Option<(Vec<u32>, u32)> {
+    if let Some(got) = served(|s| s.targets.get(&p).cloned()) {
+        return got;
+    }
+    pipeline::desc(p as This).map(|d| (d.targets.clone(), d.depth))
+}
+
 /// Stage `i`'s bytes as the title passed them.
 pub fn stage_bytes(p: usize, i: usize) -> Option<Vec<u8>> {
+    if let Some(got) = served(|s| s.pipelines.get(&p).and_then(|v| v.get(i)).map(|x| x.1.clone())) {
+        return got;
+    }
     pipeline::desc(p as This)?.stages.get(i).map(|s| s.bytes().to_vec())
 }
 
@@ -237,6 +315,9 @@ pub fn view(handle: u64) -> TapView {
         unordered: false,
         words: [0; 30],
     };
+    if let Some(got) = served(|s| s.views.get(&handle).copied().unwrap_or_default()) {
+        return got;
+    }
     match descriptor::view(handle) {
         None => TapView::default(),
         Some(View::Constant(addr, size)) => TapView { kind: k::CONSTANT, addr, bytes: u64::from(size), ..TapView::default() },
@@ -286,5 +367,58 @@ pub fn view(handle: u64) -> TapView {
 /// Bytes from `address` to the end of the title buffer holding it (the
 /// root view rule of draw.rs `user_value`), if a buffer does.
 pub fn buffer_left(address: u64) -> Option<u64> {
+    if let Some(got) = served(|s| s.buffers.range(..=address).next_back().and_then(|(&at, &n)| (address < at + n).then(|| at + n - address))) {
+        return got;
+    }
     super::shadow::buffer_left(address)
+}
+
+/// A burst's served objects answer the queries, and the replayed sink
+/// reaches the draw tap only for a pipeline it wants.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicU32;
+
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+
+    fn want(p: usize) -> bool {
+        p == 7
+    }
+
+    fn got(d: &TapDraw) {
+        if let Some(TapRoot::Table { handle, .. }) = d.roots.first() {
+            SEEN.fetch_add(view(*handle + SLOT).kind, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn served_objects_and_replay() {
+        let mut s = Served::default();
+        let st = TapStage { name: "pixel", container: true, hash: 5, size: 3, prefix: [0; 24] };
+        s.pipelines.insert(7, vec![(st, vec![1, 2, 3])]);
+        s.view_heaps.insert(9, (0x1000, 4));
+        s.views.insert(0x1020, TapView { kind: 3, addr: 0x5000, bytes: 64, ..TapView::default() });
+        s.buffers.insert(0x8000, 0x100);
+        s.sampler_heaps.insert(11, (0x3000, 2));
+        serve(Some(s));
+        assert_eq!(stages(7).len(), 1);
+        assert_eq!(stage_bytes(7, 0), Some(vec![1, 2, 3]));
+        assert!(stages(8).is_empty(), "a pipeline the capture does not name has no stages");
+        assert_eq!(heap_slot(9, 1), Some((0x1000, 0x1020)));
+        assert_eq!(heap_slot(9, 4), None, "past the heap");
+        assert_eq!(view(0x1020).addr, 0x5000);
+        assert_eq!(view(0x1040).kind, 0, "a slot the capture did not resolve is empty");
+        assert_eq!(buffer_left(0x8010), Some(0xF0));
+        assert_eq!(buffer_left(0x8100), None);
+        assert_eq!(sampler_heap(11), Some((0x3000, 2)));
+        set_draw_tap(Some((want, got)));
+        let roots = [TapRoot::Table { handle: 0x1000, heap_start: 0x1000, slots: 4 }];
+        let d = |pipeline| TapDraw { op: xnw_formats::framepack::op::MESH, count: 1, yz: [0; 2], args: [0; 4], pipeline, view_heap: 9, sampler_heap: 0, roots: &roots };
+        replay(&d(7));
+        replay(&d(8));
+        set_draw_tap(None);
+        serve(None);
+        assert_eq!(SEEN.load(Ordering::Relaxed), 3, "the wanted pipeline's sink only, its slot 1 served");
+    }
 }

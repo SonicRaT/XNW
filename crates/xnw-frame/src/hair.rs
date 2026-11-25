@@ -21,8 +21,9 @@ pub struct StrandDraw {
     pub group: Group,
 }
 
-/// The frame's strand draws and the census.
-pub fn strands(p: &Pack) -> (Vec<StrandDraw>, Census) {
+/// The frame's strand draws and the census (`chain`: the pool the strand
+/// chain wrote, at its address, in place of the captured one).
+pub fn strands(p: &Pack, chain: Option<(u64, &[u8])>) -> (Vec<StrandDraw>, Census) {
     let vs: HashMap<u64, u128> = p.data.programs.iter().filter(|g| g.stage == "vertex").map(|g| (g.pipeline, g.container)).collect();
     let mut c = Census::default();
     let mut out = Vec::new();
@@ -54,7 +55,7 @@ pub fn strands(p: &Pack) -> (Vec<StrandDraw>, Census) {
                 let draw = Draw::new(&roots, s.count, wb);
                 // The pool is one view for every draw (the frame table's slot): read once.
                 let at = p.slot_bytes(s.index, 0, hair::POINTS_SLOT).ok().map(|(v, b)| {
-                    pools.entry(v.addr).or_insert(b);
+                    pools.entry(v.addr).or_insert_with(|| chain.filter(|c| c.0 == v.addr).map_or(b, |c| c.1.to_vec()));
                     v.addr
                 });
                 let pool = at.and_then(|a| pools.get(&a));
@@ -81,14 +82,20 @@ pub fn hair_cmd(args: &[String]) -> Result<(), String> {
     // Frame directories (the lab appends `--adapter hw`: its value is no directory).
     let dirs: Vec<&String> = args.iter().filter(|a| !a.starts_with("--") && Path::new(a).is_dir()).collect();
     if dirs.is_empty() {
-        return Err("usage: xnw-lab hair <frame dirs...> [--draws]".into());
+        return Err("usage: xnw-lab hair <frame dirs...> [--draws] [--chain-refs]".into());
+    }
+    if args.iter().any(|a| a == "--chain") {
+        return dirs.iter().try_for_each(|d| crate::hair_chain::chain_cmd(Path::new(d)).map(|_| ()));
+    }
+    if args.iter().any(|a| a == "--chain-refs") {
+        return dirs.iter().try_for_each(|d| chain_refs(Path::new(d)));
     }
     for d in dirs {
         let Some(p) = Pack::open(Path::new(d))? else {
             println!("{d}: no pack");
             continue;
         };
-        let (draws, c) = strands(&p);
+        let (draws, c) = strands(&p, None);
         println!("{d}: {}", c.line());
         for s in draws.iter().filter(|_| list) {
             let (g, w) = (&s.group, &s.draw.world);
@@ -119,23 +126,42 @@ pub fn hair_cmd(args: &[String]) -> Result<(), String> {
 /// captured pool's (zero until the smh chain runs: every strand is culled
 /// by the program's own length test, 0 pixels); `--hair-probe` puts
 /// made-up strands there first ([`probe_points`]).
-pub fn bridge_cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, size: (u32, u32)) -> Result<(), String> {
+pub fn bridge_cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, size: (u32, u32)) -> Result<Strands, String> {
     let p = Pack::open(dir)?.ok_or("--hair-bridge needs a v2 capture")?;
     // `--hair-probe`: made-up points in the pool (a placement probe of the instrument, never hair).
     let probe = args.iter().any(|a| a == "--hair-probe");
     if probe {
         println!("hair bridge: --hair-probe: the pool holds made-up straight strands (placement probe, not hair)");
     }
-    let (draws, c) = strands(&p);
+    // `--hair-chain`: the title's strand chain first, its pool in place of the captured one.
+    let chain = if args.iter().any(|a| a == "--hair-chain") {
+        let c = crate::hair_chain::run(&p, host)?;
+        for s in c.steps.iter().filter(|s| s.error.is_some()) {
+            println!("  chain sink {} {}: {}", s.sink, s.name, s.error.as_deref().unwrap_or(""));
+        }
+        println!("{}", c.line());
+        if c.steps.iter().any(|s| s.error.is_some()) {
+            return Err("hair bridge: the strand chain did not run whole: nothing drawn".into());
+        }
+        Some(c)
+    } else {
+        None
+    };
+    let (draws, c) = strands(&p, chain.as_ref().map(|c| (c.pool_at, &c.pool[..])));
     println!("{}: {}", dir.display(), c.line());
     let counts = std::sync::Arc::new([const { std::sync::atomic::AtomicU64::new(0) }; 3]);
     let mut texels = p.texel_provider(counts);
-    let mut union = vec![false; (size.0 * size.1) as usize];
+    let mut union = Strands { depth: vec![0.0; (size.0 * size.1) as usize], far: 0.0 };
     for s in &draws {
         let (prog, used, vs) = crate::bridge::vertex_program(&p, s.sink, s.draw.vertices, s.group.strands, true)?;
         let mut loaded = crate::bridge::load(&p, s.sink, &crate::bridge::Row::default(), None, &used, &mut texels);
         if probe && let Some(pool) = loaded.slot_bytes_mut(0, hair::POINTS_SLOT) {
             probe_points(s, pool);
+        }
+        if let Some(c) = &chain
+            && let Some(pool) = loaded.slot_bytes_mut(0, hair::POINTS_SLOT)
+        {
+            pool.clone_from(&c.pool);
         }
         let lacks: Vec<&String> = loaded.lacks.iter().filter(|l| !l.starts_with("the group count") && !l.starts_with("sampler heap") && !l.starts_with("the targets")).collect();
         let d = loaded.draw();
@@ -151,10 +177,12 @@ pub fn bridge_cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, size:
         crate::replay::watchdog_disarm();
         let f = f?;
         let mut n = 0;
+        union.far = f.far;
         for (i, z) in f.depth.iter().enumerate() {
             if *z != f.far {
                 n += 1;
-                union[i] = true;
+                // Reverse depth: the nearest strand is the greatest.
+                union.depth[i] = if union.depth[i] == f.far { *z } else { union.depth[i].max(*z) };
             }
         }
         println!(
@@ -172,11 +200,63 @@ pub fn bridge_cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, size:
         );
     }
     if let Some(out) = args.iter().position(|a| a == "--out").and_then(|i| args.get(i + 1)) {
-        let rgba: Vec<u8> = union.iter().flat_map(|&m| if m { [255, 140, 20, 255] } else { [0, 0, 0, 255] }).collect();
+        let rgba: Vec<u8> = union.depth.iter().flat_map(|&z| if z != union.far { [255, 140, 20, 255] } else { [0, 0, 0, 255] }).collect();
         crate::replay::write_png(Path::new(out), size.0, size.1, &rgba).map_err(|e| e.to_string())?;
     }
-    println!("hair bridge: {} strand draws run, {} pixels covered in all", draws.len(), union.iter().filter(|m| **m).count());
-    Ok(())
+    println!("hair bridge: {} strand draws run, {} pixels covered in all", draws.len(), union.covered());
+    Ok(union)
+}
+
+/// The strand draws' pixels: per pixel the nearest strand's depth (reverse
+/// depth, as the pass: the greatest), `far` where no strand drew.
+#[derive(Clone, Debug, Default)]
+pub struct Strands {
+    pub depth: Vec<f32>,
+    pub far: f32,
+}
+
+impl Strands {
+    pub fn covered(&self) -> usize {
+        self.depth.iter().filter(|z| **z != self.far).count()
+    }
+
+    /// Whether pixel `i` shows a strand over `scene` (our pass's depth): the
+    /// strand passes the title's own strand depth test, greater-equal
+    /// (HAIR4: without it, pk8a f1027's group 7, body hair under the hoodie,
+    /// lay over the man's upper arm). No scene: every strand pixel.
+    pub fn shows(&self, i: usize, scene: Option<&[f32]>) -> bool {
+        let z = self.depth.get(i).copied().unwrap_or(self.far);
+        z != self.far && scene.and_then(|s| s.get(i)).is_none_or(|s| z >= *s)
+    }
+}
+
+/// The strand pixels `hair=on` paints over the pass's picture (set before the pass draws).
+static OVERLAY: std::sync::Mutex<Option<Strands>> = std::sync::Mutex::new(None);
+
+pub fn set_overlay(s: Strands) {
+    *OVERLAY.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
+}
+
+/// Whether strand pixels wait to be painted (the caller reads the pass's depth for [`overlay`]).
+pub fn overlay_pending() -> bool {
+    OVERLAY.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+}
+
+/// Paints the strand pixels (a flat hair brown: our simple pixel stage) over
+/// `rgba` where they pass the depth test against `scene` (our pass's depth
+/// rows; `XNW_HAIR_DEPTH=off`: none, every strand pixel as before HAIR4).
+/// Prints the pixels painted and hidden.
+pub fn overlay(rgba: &mut [u8], scene: Option<&[f32]>) {
+    let Some(s) = OVERLAY.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+    let scene = scene.filter(|_| std::env::var("XNW_HAIR_DEPTH").map_or(true, |v| v != "off"));
+    let mut shown = 0;
+    for (i, px) in rgba.chunks_exact_mut(4).enumerate() {
+        if s.shows(i, scene) {
+            px.copy_from_slice(&[96, 64, 40, 255]);
+            shown += 1;
+        }
+    }
+    println!("hair overlay: {shown} of {} strand pixels painted ({} behind our pass's depth{})", s.covered(), s.covered() - shown, if scene.is_none() { "; no depth test" } else { "" });
 }
 
 /// Placement probe: straight strands hanging from the top of the group's box
@@ -221,4 +301,45 @@ mod tests {
         }
         assert_eq!(super::half(0.0), 0);
     }
+
+    /// HAIR4: a strand pixel shows where it is nearer than (reverse depth:
+    /// greater than) or as near as the pass's depth; none drawn never shows.
+    #[test]
+    fn strand_pixels_pass_the_reverse_depth_test() {
+        let s = super::Strands { depth: vec![0.0, 0.2, 0.2, 0.1], far: 0.0 };
+        let scene = [0.5, 0.1, 0.2, 0.3];
+        let shown: Vec<bool> = (0..4).map(|i| s.shows(i, Some(&scene))).collect();
+        assert_eq!(shown, [false, true, true, false]);
+        assert_eq!((0..4).filter(|i| s.shows(*i, None)).count(), 3);
+        assert_eq!(s.covered(), 3);
+    }
+}
+
+/// `xnw-lab hair <frame> --chain-refs`: every strand-input dispatch sink
+/// (`smh_*` by name) with its records: roots, table slots, bytes, strand views.
+pub fn chain_refs(dir: &Path) -> Result<(), String> {
+    let p = Pack::open(dir)?.ok_or("no pack")?;
+    let names = crate::audit::program_names(dir).ok_or("no shader-names.tsv above the frame")?;
+    let prog: HashMap<u64, u128> = p.data.programs.iter().filter(|g| g.stage == "compute").map(|g| (g.pipeline, g.container)).collect();
+    for s in p.data.sinks.iter().filter(|s| s.op == fp::op::DISPATCH) {
+        let Some(h) = prog.get(&s.pipeline) else { continue };
+        let Some(n) = names.get(h).filter(|n| n.starts_with("smh_")) else { continue };
+        println!("sink {} count {} {:08x} {n}", s.index, s.count, (h >> 96) as u32);
+        if let Ok((_, recs)) = p.slot_bytes(s.index, 0, hair::GROUPS_SLOT) {
+            for (r, rec) in recs.chunks_exact(GROUP_BYTES).enumerate() {
+                let w: Vec<String> = rec.chunks_exact(4).enumerate().map(|(i, b)| format!("{:x}:{:x}", i * 4, u32::from_le_bytes([b[0], b[1], b[2], b[3]]))).collect();
+                println!("  record {r}: {}", w.join(" "));
+            }
+        }
+        for r in p.data.refs_of(s.index) {
+            let b = p.bytes_of(r);
+            let extra = match r.kind {
+                kind::ROOTS => b.as_ref().map(|b| format!("{:x?}", b.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect::<Vec<_>>())).unwrap_or_default(),
+                kind::TABLE | kind::STRAND_VIEW => b.as_ref().map(|b| fp::decode_slots(b).iter().map(|v| format!("[{} k{} lay{} {:#x} +{} fmt{} w{} {:x?}]", v.slot, v.kind, v.layout, v.addr, v.bytes, v.format, v.width, &v.words[..8])).collect::<Vec<_>>().join(" ")).unwrap_or_default(),
+                _ => b.as_ref().map(|b| format!("{} B, nonzero {}", b.len(), b.iter().filter(|x| **x != 0).count())).unwrap_or_default(),
+            };
+            println!("  {} slot {} addr {:#x} len {} reason {} {extra}", kind::name(r.kind), r.slot, r.addr, r.len, r.reason);
+        }
+    }
+    Ok(())
 }

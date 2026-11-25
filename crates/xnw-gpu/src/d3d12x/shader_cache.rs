@@ -13,6 +13,17 @@
 //! executable (which changed on every rebuild); no `anyhow`, no `blake3`,
 //! no `victory-pipeline`.
 //!
+//! One cache per translator generation (D-cache rule from VIctory,
+//! `crates/victory-gpu/src/pipeline/library.rs` at upstream, GPL-3.0-or-later:
+//! the pipeline library keyed by the translator's hash, the newest two kept,
+//! the older deleted, after a translator edit overwrote a 926 MB library).
+//! Here the generation is `VERSION_BREAKING`: entries live under
+//! `<cache>/shaders/g<N>/hh/rest`; [`evict`] keeps the two highest `g<N>`
+//! and deletes the rest, so a bisect back one generation still finds its
+//! cache. Folders of two hex digits straight under `shaders/` are the cache
+//! from before generations: left alone (the format-1 lookup in
+//! [`first_version`] reads them); delete them by hand once no run needs them.
+//!
 //! The policy is the multiply-add mode (`fast` by default,
 //! `XNW_FMA=exact` for all, `XNW_FMA_EXACT=<hash>,...` for listed shaders)
 //! and the loop limit.
@@ -47,12 +58,47 @@ pub(crate) static FAILED_KEPT: AtomicU64 = AtomicU64::new(0);
 /// The cache folder: `XNW_CACHE`, else `out/cache` under the current
 /// folder; `XNW_CACHE=off` keeps nothing.
 pub(crate) fn dir() -> Option<&'static Path> {
-    DIR.get_or_init(|| match std::env::var_os("XNW_CACHE") {
-        Some(v) if v == "off" => None,
-        Some(v) => Some(PathBuf::from(v)),
-        None => Some(PathBuf::from("out").join("cache")),
+    DIR.get_or_init(|| {
+        let dir = match std::env::var_os("XNW_CACHE") {
+            Some(v) if v == "off" => None,
+            Some(v) => Some(PathBuf::from(v)),
+            None => Some(PathBuf::from("out").join("cache")),
+        };
+        if let Some(d) = &dir {
+            let gone = evict(d);
+            if !gone.is_empty() {
+                xnw_core::info!("shader cache: generations {gone:?} deleted (newest {KEEP} kept)");
+            }
+        }
+        dir
     })
     .as_deref()
+}
+
+/// Generations kept on disk: the current and the one before.
+const KEEP: usize = 2;
+
+/// Deletes all but the newest [`KEEP`] generation folders of `dir` (the
+/// current one counts as the newest even if no entry is in it yet); returns
+/// the generations deleted.
+pub(crate) fn evict(dir: &Path) -> Vec<u32> {
+    evict_at(dir, xnw_shader::emit::VERSION_BREAKING)
+}
+
+fn evict_at(dir: &Path, current: u32) -> Vec<u32> {
+    let root = dir.join("shaders");
+    let mut gens: Vec<u32> = std::fs::read_dir(&root)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok()?.file_name().to_str()?.strip_prefix('g')?.parse().ok())
+        .filter(|&g| g != current)
+        .collect();
+    gens.sort_unstable_by(|a, b| b.cmp(a));
+    let old = gens.split_off(gens.len().min(KEEP - 1));
+    for g in &old {
+        let _ = std::fs::remove_dir_all(root.join(format!("g{g}")));
+    }
+    old
 }
 
 /// The cache key of a translation of the console container whose bytes
@@ -80,8 +126,9 @@ fn key_parts(version: u32, format: u32, opts: Options) -> (u8, Vec<u8>, u8) {
     // XNW: the loop limits count only when a switch changes them.
     let fixed = [&format.to_le_bytes()[..], &version.to_le_bytes(), &xnw_shader::emit::DEFAULT_LOOP_LIMIT.to_le_bytes(), &xnw_shader::emit::loop_limit_key(), &xnw_shader::emit::shader_opt_key()].concat();
     // XNW: the descriptor mode is part of the key; so is the probe.
-    // So are the loop counts.
-    let desc = u8::from(opts.descriptors == xnw_shader::emit::Descriptors::Gpu) | u8::from(opts.probe) << 1 | u8::from(opts.loop_counts.is_some()) << 2 | u8::from(opts.pagetable) << 3;
+    // So are the loop counts, and the host's barycentrics: a key
+    // without them is the key from before.
+    let desc = u8::from(opts.descriptors == xnw_shader::emit::Descriptors::Gpu) | u8::from(opts.probe) << 1 | u8::from(opts.loop_counts.is_some()) << 2 | u8::from(opts.pagetable) << 3 | u8::from(opts.barycentrics) << 4 | u8::from(opts.nonuniform_heap) << 5 | u8::from(opts.keep_uniform_heap) << 6 | u8::from(opts.masked_lanes) << 7;
     (fma, fixed, desc)
 }
 
@@ -107,7 +154,7 @@ pub(crate) fn first_version(dir: &Path, form: u8, container: u128, console: &[u8
     if let Some(v) = std::fs::read(&side).ok().and_then(|b| Some(u32::from_le_bytes(b.get(..4)?.try_into().ok()?))) {
         return Some(v);
     }
-    let v = (1..=xnw_shader::emit::VERSION).find(|&v| path(dir, legacy_key(v, form, console, opts)).exists())?;
+    let v = (1..=xnw_shader::emit::VERSION).find(|&v| flat_path(dir, legacy_key(v, form, console, opts)).exists())?;
     let _ = write_atomically(&side, &v.to_le_bytes());
     Some(v)
 }
@@ -126,6 +173,12 @@ fn first_path(dir: &Path, form: u8, container: u128, opts: Options) -> PathBuf {
 }
 
 fn path(dir: &Path, key: u128) -> PathBuf {
+    let hex = format!("{key:032x}");
+    dir.join("shaders").join(format!("g{}", xnw_shader::emit::VERSION_BREAKING)).join(&hex[..2]).join(&hex[2..])
+}
+
+/// Where a format-1 entry lay (before generations).
+fn flat_path(dir: &Path, key: u128) -> PathBuf {
     let hex = format!("{key:032x}");
     dir.join("shaders").join(&hex[..2]).join(&hex[2..])
 }
@@ -376,6 +429,21 @@ mod tests {
         d
     }
 
+    /// The newest two generations stay; the legacy flat folders are left alone.
+    #[test]
+    fn eviction_keeps_the_newest_two_generations() {
+        let dir = scratch("evict");
+        for g in ["g3", "g5", "g6", "g9", "ab"] {
+            std::fs::create_dir_all(dir.join("shaders").join(g)).unwrap();
+        }
+        let mut gone = evict_at(&dir, 7);
+        gone.sort_unstable();
+        assert_eq!(gone, [3, 5, 6], "the current 7 and the newest other, 9, stay");
+        let left: Vec<_> = ["g3", "g5", "g6", "g9", "ab"].iter().filter(|g| dir.join("shaders").join(g).is_dir()).collect();
+        assert_eq!(left, [&"g9", &"ab"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// XNW: the first translating version, for `XNW_REFUSE_NEW`.
     #[test]
     fn the_first_translating_version_is_kept() {
@@ -385,7 +453,7 @@ mod tests {
         note_first(&dir, 0, 1, b"new", o);
         assert_eq!(first_version(&dir, 0, 1, b"new", o), Some(xnw_shader::emit::VERSION));
         // An older version's format-1 entry on disk, no side file: that version.
-        let old = path(&dir, legacy_key(11, 0, b"old", o));
+        let old = flat_path(&dir, legacy_key(11, 0, b"old", o));
         write_atomically(&old, &encode(&shader())).unwrap();
         note_first(&dir, 0, 2, b"old", o);
         assert_eq!(first_version(&dir, 0, 2, b"old", o), Some(11));

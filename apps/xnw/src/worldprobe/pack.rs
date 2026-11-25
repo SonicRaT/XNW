@@ -24,6 +24,9 @@ use xnw_gpu::d3d12x::tap::{self, TapDraw, TapRoot, TapView};
 const CBV_CAP: u64 = 64 << 10;
 /// Texel bytes of one texture, at most (larger ones: fill and origin only).
 const TEX_CAP: u64 = 4 << 20;
+/// Textures up to this size whose sampled windows read zero are read whole
+/// before they are called zero-filled.
+const ZERO_CHECK: u64 = 256 << 10;
 /// New texel bytes per frame, at most.
 const FRAME_TEX_CAP: u64 = 256 << 20;
 /// Heap slots one bindless index buffer resolves, at most.
@@ -35,6 +38,16 @@ const BUF_CAP: u64 = 16 << 20;
 /// New buffer bytes per frame, at most (ranges over 64 KB only: small
 /// views such as the ped remap range are never cut by it).
 const FRAME_BUF_CAP: u64 = 256 << 20;
+/// A head graph dispatch's plain unordered buffer views are read (head1
+/// #926: the CPU writes the rig's weights and controls there; one is
+/// 25,165,824 B, so its own cap).
+const HEAD_UAV_CAP: u64 = 32 << 20;
+/// How a sink's tables are read: a draw's, a dispatch's (no unordered
+/// bytes, no bindless or record), a head graph dispatch's (as a dispatch,
+/// with its plain unordered buffers read).
+const TB_DRAW: u8 = 0;
+const TB_DISPATCH: u8 = 1;
+const TB_HEAD: u8 = 2;
 /// Frames being recorded (not yet sent to the writer), at most; past it
 /// the oldest is skipped and counted. A sent frame's data moves into its
 /// capture (`take`), so a slow writer never costs a frame: an earlier fault was
@@ -107,12 +120,73 @@ const HAIR_ORDER: [u128; 17] = [
     0x4b347011e0f5a254be472bafd0db04e8, 0xdcfc8670a5f01ddf6276cb11caad1922, 0x1886a183ed726df1bb42ab1799d778bb, 0x829cb2574c8b01861abecf0ad27e5a7b,
     0x0c41534fa266b658e793684fd19ee9a0,
 ];
+/// Container hashes of the lighting compute programs whose direct
+/// dispatches are sinks (tiled_lighting:CS_*, deferred_tiled:
+/// CS_DepthProcessingHBO, shadowmask:CS_GenerateShadowMasks*,
+/// deferred_lighting:LightMix*, cascadeshadows_classify:CS_*; 37) [V
+/// shader_index.py --sql over those names].
+const LIGHT_PROGRAMS: [u128; 37] = [
+    0xc00fa2557d58746b534656c88d7d9785, 0x4e8ed645147aae8799a8ec167d494032, 0x9842030d45bdb4bf8e319cead44feb35, 0x5ecc2838d44e490cbff64d18e5f92270,
+    0xc84e6b41a9c8a05eee7a02ce04e947bc, 0x68f897e057538c772cfd753355475d5d, 0xdcc4ead61fe7a2c53545c1a9abba4cf6, 0x3a237fdcfbc729580a4b05d125682cd1,
+    0x57d4d97691c8cf3bffaa3e28dc55522e, 0xc366d334fa2053647518e4cda50433ec, 0xc4b7599307477e90a7642eb3f3b6f125, 0x44bbf9cf6a140a48223e950cc66dbbc6,
+    0xb81a6353023964a9200aec831a1ad1d4, 0xaccf00849ee4e7fdf2cb1d41f6cf3beb, 0x4ba45354ba99fe030e3d099c665fe562, 0x470a7f7e7d42318daeea2a617194cfb8,
+    0xb8d6d00fcabe063bbd0463690c30b05e, 0x6b7ed85e6c8498f93591c172950234e2, 0xb8441dc954c40af02b931382802be151, 0x435922e10a429005de408add8a09d91f,
+    0x47dd89d3bda95101c7ab5c358dc2d2ad, 0x69d79920225215375ce740a10bd0dbb4, 0xe7c7dce7e36c72e9705677bb45f10f5e, 0x02a8bcb8465f679b034f42fe3af13b28,
+    0x0574e3dbddca772962c10ca83440041c, 0x59fb3a2411fcbf3f4bd9f812d10ee07e, 0x934a052e29f9e6a2ceb3fa7042654471, 0xbb5a60f92686f4586ab377a7706a4f92,
+    0x9d1a95d8fa8a56cc38afe012bbe4c1d9, 0xc0492072c633349e6b6c3a32138604e1, 0xc9274a319595fa91a8fbf29d82837c83, 0x0b7b2bb725d0d3d01065bb5c85c01b96,
+    0xca502cf7d0fa3b6a79e2ea138f1a02dc, 0x66db7fad04bdbc6a0703d44606f72b11, 0x77f0da87dcd6c9748b8af8f8e5a974fe, 0xabd4e9cef24dc129c7dad88d91e9b257,
+    0x54f0245c4de701ba5560e7e7bfed0e11,
+];
+/// Container hashes of the sky and ambient producers (lit4 #914), sinks
+/// as LIGHT_PROGRAMS: sky_scattering CS_Transmittance, CS_MultipleScattering,
+/// CS_SkyView, CS_AerialPerspectiveVolumes; sky_system
+/// CS_DirectionalLightTransmittanceLUT, CS_AmbientCubeIBR_Paraboloid,
+/// _CubeMap, CS_AmbientCubeIBRLightning; sky_dome CS_SkyMain; ambient_map
+/// CS_AmbientMapClassifyClear, CS_AmbientMapClassify16_32, CS_AmbientMap,
+/// CS_LightMap, CS_LightMap_NoAmbient, CS_LightMapPropagate;
+/// scattering_transmittance_system CS_SkyAtmosphereLUT (16) [V
+/// shader_index.py --sql over the hash prefixes].
+const SKY_PROGRAMS: [u128; 16] = [
+    0xe6d7475ab43f1fb9f8582daad4f5ec6b, 0x8c5f5cfdaeebe66ebbad6fb4a3d511d8, 0x767996c1ce51eace99da7699f9e81c52, 0x956244a7319fa673f9ce39465cf97b68,
+    0x834488728ebd10f67b1c05206400c6fe, 0x9ae7b3a323b1ab2aeb8bba7ee722c413, 0x4a5362fec5c3ac24f992e9da651e0e4d, 0x40e25e2154e4a3db040ba207f8a6c8bb,
+    0x560ac0aae322671d71d20f0b5cdf45de, 0x2649828536e40445ba307e6b0ac488b4, 0xd470f982b9cca53a406198907d5cf904, 0x0e3d7b2c8405da358abc92fe2a616aaf,
+    0xe1034c21b824e1dcf3f27414123918ef, 0x5ce5d87ea2576dc3a9cf4de7bc1e8a4b, 0xd0c9606baabbbd6528c4f0f2faace6ac, 0xfe2a19b40be2b479b2c2306be64d1a98,
+];
+/// Container hashes of the head compute graph (`ped_standard_head_cs:*`,
+/// `compute_graph_ops:*`; 73) [V shader_index.py --sql]: it fills the
+/// head position table (frame-table slot 7) and the face table on the GPU;
+/// their direct dispatches are sinks with roots and tables (as the hair inputs).
+const HEAD_PROGRAMS: [u128; 73] = [
+    0x8a152901b7b1726392a584e82f136fd0, 0x13d513909a2f1a72186e75c6c7bf3f0a, 0x12252386bfe8f96e5e18167baea05dda, 0x51fbf6c90507ff9fdc840c85ac4049e5,
+    0x4cf89afaf51ad48071155dec3637414a, 0x41fce774344b3cb36865d1832e3748ec, 0xd3585b1a359d6798a11e2a38595f4246, 0xa122cdedf4db8a1e038878ab49142304,
+    0xa459fee2b760bf7979af7bf4beaea159, 0x916ca9c2f439ebbe97e113129e8f3e06, 0xee19277b8ec6ec33cbff6e04173f25f3, 0x92acb70da48b7ee80c73dbf5b804f48c,
+    0xb086e6844125481b73669012189819a7, 0x3f6b978c193c3a36ac2e6b2e1632e329, 0xc31c5129ea3cc14c38a3ec8e684cba42, 0xfa91d49abe491a30d44e9d45a94aef75,
+    0xf38a016a1d4963531db4c828b5aade01, 0x307c3ab71cd9c3933f891fb9cdb6443a, 0x30f8542f55d5b72d8e94611bd0fbabd2, 0x879d8283f03652451ca3b41549149fb0,
+    0xfc3a97fd4cd872c094789f8ebbeb8711, 0xd6158724033dc2291145c256655be76a, 0xbbb34d1b79288e28dc4a8441bb3fb0a2, 0x871fc8cfdd6ae317f5d1d0e1a06858e8,
+    0x21b86188ae6c19fd00f950ac1b376d28, 0x0c4914bf1bca8ad8dc9a15b41e1aab2e, 0xb9dbdca5b78dfd246929e453ff1d659f, 0x9e37c27e7f6e368e4e9cee402798d5aa,
+    0x60c1dd7eff24fc8f87fc2f0211375c65, 0xd4d5e450bdabc175d37c2c34389d4a69, 0xe423bbae8c60cb6d6aafbcf0c773433f, 0xe06062bf687a2e8ac4e83ad238c97361,
+    0x80cb6b3ba3ce13b23e119f2fbe7d8413, 0xe223e9166fed62bbd66872a624231037, 0x1a230ea6b4b18a893f06e6e57bc85dbd, 0x66e3445e2760c97260d1b48e26b7f6ac,
+    0xa9e9903aa7fd91eeee4966d143eaf410, 0xbd8c2726d131199595bc3f01dacdb85f, 0x868a86a1956b50ae0d94a43a09459398, 0x0d7e975c62732b9af9068dac95a8df58,
+    0x83bd0fcc205995e840685806122de4d3, 0xb04ed27cbe6728dc67deb2896230eef4, 0xd38a37b01030e442baee3b3507170668, 0x52e7c4fcedd8efc6e2d06ed9cc1fa6b0,
+    0x4c8614d257f7a013e3684ce127eed791, 0x5e96b26dc803a3c270c44ee9cc5aee8c, 0x5a23f6063b93cc448b7474c8cb1d09ec, 0x70267aac6d3d57ea75d5106194b76d02,
+    0xe941d98bb231e10f467b692a9e82d190, 0xd4cca9c3b0f252d64c1cd9224d4b51d2, 0xc0013d2a2d27ec5ff2c46a1bea35ceaf, 0x89532824626840dbb9f55b4e71554140,
+    0x51c6ce4a28883d4442c01a21c07d67db, 0xf3d10c4c70ee18fcf424f36210c6a924, 0x96ad89b92b918914ff3fc93f6ceeb63c, 0x4ec54b2292375af29ff0d076d4376662,
+    0xffa5558edc63b5881a70819aeff3c8ee, 0xe768619bedc51843048b506cf8a1dda4, 0xbc3b634edf40718240dcd6fba9131af9, 0x815c8827de54ea96eb481ebe52dace4e,
+    0x168936d7fea333aa8d041c7e2f231315, 0x1edc98abdc3f0db0ea1eb18835d2ffc4, 0x140f77ac62b70f8608bb8f40eef84203, 0xe1db80d026380023495c7ab6e583e73e,
+    0x073fb412a4fd84e3bbdaec4429c79b1c, 0x59e8bcb7549175ae42b143d4598446d3, 0xca779b55e3bfe2058d50bee5583141f7, 0xfadf8deffbb8e7a87213f6db99ee7efb,
+    0x220c0303b3f1ccdf930f33abbb4eaa3d, 0x818485c2df101acc425f1b1a53f6fe17, 0x0a66bfdbce258f90e78db4915848f171, 0x7f8fa0391982e6c7e7eb36d4843faed3,
+    0x0b542c4f4837d965b09fada63177f82c,
+];
 /// A direct dispatch's pipeline: not a sink, a pre-skin program, a
 /// strand-hair input program, a strand-hair program kept for order only.
 const PIPE_NONE: u8 = 0;
 const PIPE_PED: u8 = 1;
 const PIPE_HAIR: u8 = 2;
 const PIPE_HAIR_ORDER: u8 = 3;
+const PIPE_LIGHT: u8 = 4;
+const PIPE_HEAD: u8 = 5;
+/// A sky or ambient producer (SKY_PROGRAMS): recorded as PIPE_LIGHT.
+const PIPE_SKY: u8 = 6;
 /// Slots a hair input program's table root is resolved to (root 0 slot
 /// 36 = the strand pool).
 const HAIR_SLOTS: u32 = 40;
@@ -127,6 +201,12 @@ fn pipe_class(hash: u128) -> u8 {
         PIPE_HAIR
     } else if HAIR_ORDER.contains(&hash) {
         PIPE_HAIR_ORDER
+    } else if LIGHT_PROGRAMS.contains(&hash) {
+        PIPE_LIGHT
+    } else if HEAD_PROGRAMS.contains(&hash) {
+        PIPE_HEAD
+    } else if SKY_PROGRAMS.contains(&hash) {
+        PIPE_SKY
     } else {
         PIPE_NONE
     }
@@ -579,6 +659,26 @@ struct Acc {
     hair: [u32; 5],
     /// Strand record buffers met this frame (address and content).
     strand_seen: HashSet<u128>,
+    /// Lighting dispatch sinks; the scene lights copied (their count; MAX unread).
+    light_sinks: u32,
+    /// Head compute graph dispatch sinks.
+    head_sinks: u32,
+    /// Of the lighting dispatch sinks, sky and ambient producers; indirect
+    /// dispatch sinks (with the compute roots).
+    sky_sinks: u32,
+    indirect_dispatches: u32,
+    /// Head graph plain unordered buffer views read, not read (per sink view).
+    head_uavs: [u32; 2],
+    /// Strand palette windows with bytes, without; collision spans with
+    /// bytes, without (count 0 included).
+    strand_extra: [u32; 4],
+    lights_done: bool,
+    lights_copied: u32,
+    /// HOOKIN records this frame (seq, geometry, blob: refs made by the
+    /// writer); HOOK_GLOBALS written.
+    hookin: u32,
+    hookin_raw: Vec<(u32, u64, Vec<u8>)>,
+    hook_globals_done: bool,
     /// Displacement map records: with a view, without.
     disp_maps: [u32; 2],
 }
@@ -660,8 +760,12 @@ fn on_sink(d: &TapDraw) {
 }
 
 fn sink_at(frame: u64, d: &TapDraw) {
-    let compute = d.op == fp::op::DISPATCH;
-    let class = if compute { class_of(d.pipeline) } else { PIPE_NONE };
+    // An indirect dispatch carries the compute roots (draw.rs `tap`); it
+    // is recorded as a lighting dispatch is (frame table to 192 slots).
+    let indirect = d.op == fp::op::INDIRECT_DISPATCH;
+    let compute = d.op == fp::op::DISPATCH || indirect;
+    let class = if d.op == fp::op::DISPATCH { class_of(d.pipeline) } else { PIPE_NONE };
+    let lit = matches!(class, PIPE_LIGHT | PIPE_SKY) || indirect;
     let t0 = compute.then(std::time::Instant::now);
     let (hf, hs) = HOOK.with(|h| h.get());
     // A dispatch is not a draw: never paired with this thread's hook draw.
@@ -699,8 +803,21 @@ fn sink_at(frame: u64, d: &TapDraw) {
             // A hair program kept for its order: its roots, not its tables.
             TapRoot::Table { .. } if class == PIPE_HAIR_ORDER => {}
             TapRoot::Table { handle, slots, .. } => {
-                let cap = if class == PIPE_HAIR { HAIR_SLOTS } else { DISPATCH_SLOTS };
-                table(acc, run, owner, slot, handle, if compute { slots.min(cap) } else { slots }, d.view_heap, compute)
+                // The frame table (root 0) to tap::TABLE_SLOTS for draws and
+                // lighting dispatches (the lighting reads its slots up to 181);
+                // other tables to one row.
+                let cap = match (compute && !lit, class, i) {
+                    (false, _, 0) => tap::TABLE_SLOTS,
+                    (false, _, _) => fp::TABLE_ROW,
+                    (true, PIPE_HAIR | PIPE_HEAD, _) => HAIR_SLOTS,
+                    _ => DISPATCH_SLOTS,
+                };
+                let mode = match (compute, class) {
+                    (false, _) => TB_DRAW,
+                    (true, PIPE_HEAD) => TB_HEAD,
+                    _ => TB_DISPATCH,
+                };
+                table(acc, run, owner, slot, handle, slots.min(cap), d.view_heap, mode)
             }
         }
     }
@@ -734,16 +851,32 @@ fn sink_at(frame: u64, d: &TapDraw) {
         acc.refs.push(reference(owner, kind::DRAW_ARGS, 0, 0, fp::DRAW_ARGS_BYTES as u64, Ok(h)));
         acc.draw_args += 1;
     }
+    acc.head_sinks += u32::from(class == PIPE_HEAD);
+    acc.sky_sinks += u32::from(class == PIPE_SKY);
+    acc.indirect_dispatches += u32::from(indirect);
+    if d.op == fp::op::DISPATCH {
+        let bytes: Vec<u8> = [d.count, d.yz[0], d.yz[1]].iter().flat_map(|w| w.to_le_bytes()).collect();
+        let h = keep(acc, run, kind::GROUPS, bytes);
+        acc.refs.push(reference(owner, kind::GROUPS, 0, 0, 12, Ok(h)));
+    }
+    if matches!(class, PIPE_LIGHT | PIPE_SKY) {
+        acc.light_sinks += 1;
+        if !acc.lights_done {
+            acc.lights_done = true;
+            scene_lights(acc, run);
+        }
+    }
     if class == PIPE_HAIR || class == PIPE_HAIR_ORDER {
         acc.hair[usize::from(class == PIPE_HAIR_ORDER)] += 1;
     }
     if class == PIPE_HAIR {
-        let records = match d.roots.first() {
-            Some(TapRoot::Table { handle, slots, .. }) if STRAND_SLOT < *slots => Some(slot_view(STRAND_SLOT, &tap::view(handle + tap::SLOT * u64::from(STRAND_SLOT)))),
+        let at = |slot: u32| match d.roots.first() {
+            Some(TapRoot::Table { handle, slots, .. }) if slot < *slots => Some(slot_view(slot, &tap::view(handle + tap::SLOT * u64::from(slot)))),
             _ => None,
         };
         let heap = d.view_heap;
-        strand_groups(acc, run, owner, records, &|i| tap::heap_slot(heap, i).and_then(|(_, h)| read(h, tap::SLOT).ok().map(|_| (h, slot_view(i, &tap::view(h))))));
+        let inputs = StrandInputs { records: at(STRAND_SLOT), palette: at(PALETTE_SLOT), shapes: at(SHAPES_SLOT) };
+        strand_groups(acc, run, owner, inputs, &|i| tap::heap_slot(heap, i).and_then(|(_, h)| read(h, tap::SLOT).ok().map(|_| (h, slot_view(i, &tap::view(h))))));
     }
     if let Some(t0) = t0 {
         if class == PIPE_PED {
@@ -753,8 +886,192 @@ fn sink_at(frame: u64, d: &TapDraw) {
     }
 }
 
-/// The strand group records of the hair programs: root 0 slot 21.
+/// The scene-light array (real addresses: array base, buffer index
+/// dword, count dword; 0x1487BAF40, dword_148FDC4D0, dword_1488CD81C [V ]).
+static LIGHTS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+pub(super) fn set_lights(array: u64, index: u64, count: u64) {
+    for (a, v) in LIGHTS.iter().zip([array, index, count]) {
+        a.store(v, Ordering::Relaxed);
+    }
+}
+
+/// The frame's LIGHTS records: the current buffer of the CPU scene-light
+/// array (before the GPU's copy reads it) and its index and count.
+fn scene_lights(acc: &mut Acc, run: &mut Run) {
+    let [array, index, count] = LIGHTS.each_ref().map(|a| a.load(Ordering::Relaxed));
+    let word = |at: u64| read(at, 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let (i, n) = (word(index), word(count));
+    let head = match (i, n) {
+        (Ok(i), Ok(n)) => Ok(keep(acc, run, kind::LIGHTS, [i.to_le_bytes(), n.to_le_bytes()].concat())),
+        (Err(e), _) | (_, Err(e)) => Err(e),
+    };
+    acc.refs.push(reference(fp::FRAME_SCOPE, kind::LIGHTS, 1, count, 8, head));
+    let len = fp::LIGHT_ARRAY_BYTES as u64;
+    let at = match i {
+        Ok(i) if i < 4 && array != 0 => Ok(array + len * u64::from(i)),
+        Ok(_) => Err(reason::IMPLAUSIBLE),
+        Err(e) => Err(e),
+    };
+    let got = at.and_then(|a| read(a, len)).map(|b| keep(acc, run, kind::LIGHTS, b));
+    acc.refs.push(reference(fp::FRAME_SCOPE, kind::LIGHTS, 0, *at.as_ref().unwrap_or(&0), len, got));
+    acc.lights_copied = n.unwrap_or(u32::MAX);
+}
+
+/// `hookin=1`: the hook's inputs per hook draw (HOOKIN), and the globals
+/// they need (real addresses: matrix slot word, matrix cache, palette base).
+static HOOKIN: AtomicBool = AtomicBool::new(false);
+static HOOK_GLOBALS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+/// Hook-in records made and the nanoseconds they took on the title's threads.
+static HOOKIN_COST: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+pub(super) fn set_hookin(on: bool, matrix_slot: u64, matrix_cache: u64, pal_base: u64) {
+    for (a, v) in HOOK_GLOBALS.iter().zip([matrix_slot, matrix_cache, pal_base]) {
+        a.store(v, Ordering::Relaxed);
+    }
+    HOOKIN.store(on, Ordering::Relaxed);
+}
+
+/// The HOOKIN blob of one hook draw (layout: `fp::HOOKIN_PARTS`), read in
+/// place with the fault-fixed copy into one buffer.
+fn hookin_blob(tls: u64, geom: u64, globals: [u64; 3]) -> Vec<u8> {
+    // 4 + 16 * 19 header bytes + 1,025 part bytes.
+    let mut b = vec![0u8; 4 + 16 * fp::HOOKIN_PARTS + 1025];
+    b[..4].copy_from_slice(&(fp::HOOKIN_PARTS as u32).to_le_bytes());
+    let mut at = 4 + 16 * fp::HOOKIN_PARTS;
+    let mut k = 0;
+    let mut part = |b: &mut Vec<u8>, addr: u64, len: usize| -> Option<Vec<u8>> {
+        if b.len() < at + len {
+            b.resize(at + len, 0);
+        }
+        // SAFETY: into our buffer; the source read is fault-fixed.
+        let ok = addr >= 0x1_0000 && unsafe { super::fcopy(b.as_mut_ptr().add(at), addr as *const u8, len) };
+        let h = 4 + 16 * k;
+        b[h..h + 8].copy_from_slice(&addr.to_le_bytes());
+        b[h + 8..h + 12].copy_from_slice(&(len as u32).to_le_bytes());
+        b[h + 12..h + 16].copy_from_slice(&u32::from(ok).to_le_bytes());
+        let got = ok.then(|| b[at..at + len].to_vec());
+        at += len;
+        k += 1;
+        got
+    };
+    let q = |v: &Option<Vec<u8>>, o: usize| v.as_ref().and_then(|v| v.get(o..o + 8)).map_or(0, |w| u64::from_le_bytes(w.try_into().unwrap_or([0; 8])));
+    for (o, len) in [(0x950u64, 4usize), (0x1110, 4), (0x1294, 1)] {
+        part(&mut b, tls + o, len);
+    }
+    let t = part(&mut b, tls + 0x11D8, 0xF0);
+    let tq = |o: u64| q(&t, (o - 0x11D8) as usize);
+    let g = part(&mut b, geom, 0x48);
+    part(&mut b, q(&g, 8), 0x20);
+    part(&mut b, q(&g, 0x10), 0x20);
+    let m = q(&g, 0x40);
+    let mut mp = [0u8; 8];
+    // SAFETY: into our 8 bytes, fault-fixed.
+    let m = if m >= 0x1_0000 && unsafe { super::fcopy(mp.as_mut_ptr(), m as *const u8, 8) } { u64::from_le_bytes(mp) } else { 0 };
+    part(&mut b, m, 0x20);
+    let ctx = tq(0x12A8);
+    let mut sw = [0u8; 2];
+    // SAFETY: as above.
+    let slot = if globals[0] != 0 && unsafe { super::fcopy(sw.as_mut_ptr(), globals[0] as *const u8, 2) } { u64::from(u16::from_le_bytes(sw) >> 2) } else { 0 };
+    let bound = part(&mut b, ctx + 0x40 + 8 * slot, 8);
+    part(&mut b, ctx + 0x6200 + 2 * slot, 2);
+    let index = part(&mut b, ctx + 0x1_2190, 4).map_or(0, |v| i32::from_le_bytes([v[0], v[1], v[2], v[3]]));
+    part(&mut b, ctx + 0x1_2328, 8);
+    part(&mut b, ctx + 0x1_2360, 0x1A);
+    part(&mut b, q(&bound, 0), 0x80);
+    part(&mut b, globals[1].wrapping_add((i64::from(index) * 128) as u64), 0x80);
+    let vp = tq(0x12B8);
+    part(&mut b, vp, 0xC0);
+    part(&mut b, vp + 0x708, 8);
+    let model = part(&mut b, tq(0x1208), 0x38);
+    let mh = model.as_ref().map_or(0, |v| u64::from(v[0x33]));
+    part(&mut b, tq(0x11E8).wrapping_add(48 * mh), 48);
+    b.truncate(at);
+    b
+}
+
+/// At the hook (`hookin=1`): hook draw `seq`'s HOOKIN record, and once per
+/// frame the HOOK_GLOBALS record. Its cost on the title's thread is counted.
+pub(super) fn hook_inputs(frame: u64, seq: u32, tls: u64, geom: u64) {
+    if !on() || seq == 0 || tls == 0 || !HOOKIN.load(Ordering::Relaxed) {
+        return;
+    }
+    let t0 = std::time::Instant::now();
+    // Only frames the writer will write (the reads cost the title's thread).
+    if !wanted(frame) {
+        return;
+    }
+    let globals = HOOK_GLOBALS.each_ref().map(|a| a.load(Ordering::Relaxed));
+    let blob = hookin_blob(tls, geom, globals);
+    let mut accs = lock(&ACCS);
+    if let Some(acc) = acc_of(&mut accs, frame) {
+        let mut run_g = lock(&RUN);
+        let run = run_g.get_or_insert_with(Run::default);
+        if !acc.hook_globals_done {
+            acc.hook_globals_done = true;
+            let mut g = vec![0u8; 10];
+            // SAFETY: into our buffer, fault-fixed.
+            let ok = globals[0] != 0 && globals[2] != 0 && unsafe { super::fcopy(g.as_mut_ptr(), globals[0] as *const u8, 2) && super::fcopy(g.as_mut_ptr().add(2), globals[2] as *const u8, 8) };
+            let got = if ok { Ok(keep(acc, run, kind::HOOK_GLOBALS, g)) } else { Err(reason::UNREADABLE) };
+            acc.refs.push(reference(fp::FRAME_SCOPE, kind::HOOK_GLOBALS, 0, globals[0], 10, got));
+        }
+        // Hashed and kept by the writer, off the title's thread.
+        acc.hookin_raw.push((seq, geom, blob));
+        acc.hookin += 1;
+    }
+    drop(accs);
+    HOOKIN_COST[0].fetch_add(1, Ordering::Relaxed);
+    HOOKIN_COST[1].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
+/// The strand group records of the hair programs: root 0 slot 21; the
+/// bone palette slot 1; the collision shapes slot 22 (bc6245e7: T+0x20,
+/// T+0x2a0, T+0x2c0) [V read].
 const STRAND_SLOT: u32 = 21;
+const PALETTE_SLOT: u32 = 1;
+const SHAPES_SLOT: u32 = 22;
+/// Group record words: the remap offset (elements), the palette bases
+/// (current, previous), the collision span (count in the top byte of
+/// +0xa8, byte offset +0xf8; bc6245e7 0x8b0-0x9a0) [V read].
+const REC_REMAP_AT: usize = 0xe4;
+const REC_BASES: [usize; 2] = [0xe8, 0xec];
+const REC_SHAPE_COUNT: usize = 0xa8;
+const REC_SHAPE_AT: usize = 0xf8;
+/// Remap entries a record can reach (the bone bytes index it).
+const REMAP_REACH: u64 = 256;
+
+/// A hair input sink's root 0 views the strand records use.
+struct StrandInputs {
+    records: Option<SlotView>,
+    palette: Option<SlotView>,
+    shapes: Option<SlotView>,
+}
+
+fn le32(b: &[u8], o: usize) -> u32 {
+    b.get(o..o + 4).map_or(0, |w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+}
+
+/// `len` bytes at byte `off` of view `v` (cut at its end): (address,
+/// length, cut) or a reason (NULL: no buffer view; IMPLAUSIBLE: past it).
+fn view_range(v: Option<&SlotView>, off: u64, len: u64) -> Result<(u64, u64, bool), u32> {
+    let v = v.filter(|v| matches!(v.kind, view::BUFFER | view::PLACED_BUFFER) && v.addr != 0).ok_or(reason::NULL)?;
+    if off >= v.bytes {
+        return Err(reason::IMPLAUSIBLE);
+    }
+    let n = len.min(v.bytes - off);
+    Ok((v.addr + off, n, n < len))
+}
+
+/// Bones a record reaches past its palette base: the largest of the 256
+/// remap entries from rec+0xe4 (16-bit, & 0xfff) + 1; 256 when the remap
+/// is not readable.
+fn bones_reached(remap: Option<&SlotView>, at: u32) -> u64 {
+    let got = view_range(remap, 2 * u64::from(at), 2 * REMAP_REACH).and_then(|(a, n, _)| read(a, n));
+    match got {
+        Ok(b) => b.chunks_exact(2).map(|w| u64::from(u16::from_le_bytes([w[0], w[1]]) & 0xfff)).max().map_or(REMAP_REACH, |m| m + 1),
+        Err(_) => REMAP_REACH,
+    }
+}
 
 /// A hair input dispatch's STRAND_VIEW / STRAND_BYTES records: for each
 /// strand group record of `records` (`fp::STRAND_RECORD` bytes each, at
@@ -763,8 +1080,8 @@ const STRAND_SLOT: u32 = 21;
 /// bytes; once per frame per record buffer content (later sinks naming
 /// the same records add nothing). Counts: records, views with bytes,
 /// without.
-fn strand_groups(acc: &mut Acc, run: &mut Run, owner: u32, records: Option<SlotView>, resolve: &dyn Fn(u32) -> Option<(u64, SlotView)>) {
-    let Some(v) = records.filter(|v| matches!(v.kind, view::BUFFER | view::PLACED_BUFFER)) else {
+fn strand_groups(acc: &mut Acc, run: &mut Run, owner: u32, inputs: StrandInputs, resolve: &dyn Fn(u32) -> Option<(u64, SlotView)>) {
+    let Some(v) = inputs.records.filter(|v| matches!(v.kind, view::BUFFER | view::PLACED_BUFFER)) else {
         acc.refs.push(reference(owner, kind::STRAND_VIEW, 0, 0, 0, Err(reason::NULL)));
         return;
     };
@@ -790,7 +1107,36 @@ fn strand_groups(acc: &mut Acc, run: &mut Run, owner: u32, records: Option<SlotV
             let ok = acc.refs[before..].iter().all(|r| reason::has_bytes(r.reason));
             acc.hair[if ok { 3 } else { 4 }] += 1;
         }
+        strand_extras(acc, run, owner, r as u16, rec, &inputs, resolve);
     }
+}
+
+/// One group record's STRAND_PALETTE windows (the bones at its two
+/// palette bases) and its STRAND_SPAN (the collision shapes it names).
+fn strand_extras(acc: &mut Acc, run: &mut Run, owner: u32, r: u16, rec: &[u8], inputs: &StrandInputs, resolve: &dyn Fn(u32) -> Option<(u64, SlotView)>) {
+    let remap = resolve(le32(rec, fp::STRAND_WORDS[0])).map(|(_, v)| v);
+    let bones = bones_reached(remap.as_ref(), le32(rec, REC_REMAP_AT));
+    let bone = fp::BONE_BYTES as u64;
+    for (j, &o) in REC_BASES.iter().enumerate() {
+        let base = u64::from(le32(rec, o));
+        let slot = 2 * r + j as u16;
+        let r = match view_range(inputs.palette.as_ref(), base * bone, bones * bone) {
+            Ok((at, n, cut)) => reference_cut(owner, kind::STRAND_PALETTE, slot, at, n, read(at, n).map(|b| keep(acc, run, kind::STRAND_PALETTE, b)), cut),
+            Err(why) => reference(owner, kind::STRAND_PALETTE, slot, base, bones * bone, Err(why)),
+        };
+        acc.strand_extra[if reason::has_bytes(r.reason) { 0 } else { 1 }] += 1;
+        acc.refs.push(r);
+    }
+    let count = u64::from(le32(rec, REC_SHAPE_COUNT) >> 24);
+    let off = u64::from(le32(rec, REC_SHAPE_AT));
+    let len = count * fp::STRAND_SHAPE as u64;
+    let span = if count == 0 { Err(reason::NULL) } else { view_range(inputs.shapes.as_ref(), off, len) };
+    let r = match span {
+        Ok((at, n, cut)) => reference_cut(owner, kind::STRAND_SPAN, r, at, n, read(at, n).map(|b| keep(acc, run, kind::STRAND_SPAN, b)), cut),
+        Err(why) => reference(owner, kind::STRAND_SPAN, r, off, len, Err(why)),
+    };
+    acc.strand_extra[if reason::has_bytes(r.reason) { 2 } else { 3 }] += 1;
+    acc.refs.push(r);
 }
 
 /// The offset between a buffer's GPU address and its CPU address.
@@ -1045,7 +1391,7 @@ fn dispatch_record(acc: &mut Acc, run: &mut Run, owner: u32, groups: [u32; 3], v
     let mut item_at = 0;
     if let Some((slot, b7, at, item)) = found {
         (d.flags, d.b7_slot, d.b7, d.item, item_at) = (fp::B7_FOUND | fp::ITEM_FOUND, slot, b7, item, at);
-    } else if let Some((slot, b7)) = cands.iter().find(|(slot, _)| *slot != u32::MAX && *slot % tap::TABLE_SLOTS == 8) {
+    } else if let Some((slot, b7)) = cands.iter().find(|(slot, _)| *slot != u32::MAX && fp::table_slot_of(*slot as u16).1 == 8) {
         (d.flags, d.b7_slot, d.b7) = (fp::B7_FOUND, *slot, b7.clone());
     }
     let word = |b: &[u8], o: usize| b.get(o..o + 4).map_or(0, |w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]));
@@ -1123,6 +1469,14 @@ fn programs(acc: &mut Acc, run: &mut Run, pipeline: usize) {
         }
         acc.programs.push(row);
     }
+    if let Some((targets, depth)) = tap::targets(pipeline) {
+        let mut words = vec![targets.len() as u32];
+        words.extend((0..8).map(|i| targets.get(i).copied().unwrap_or(0)));
+        words.push(depth);
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let h = keep(acc, run, kind::TARGETS, bytes);
+        acc.refs.push(reference(fp::FRAME_SCOPE, kind::TARGETS, 0, pipeline as u64, fp::TARGETS_BYTES as u64, Ok(h)));
+    }
 }
 
 /// Instanced vehicle programs (wheels, tyres; mesh container hash): the
@@ -1187,7 +1541,7 @@ fn wheel_windows(acc: &mut Acc, run: &mut Run, owner: u32, groups: u32, views: [
 
 /// A table root: its resolved slots (by raw content, run-wide), the bytes
 /// behind its constant buffers and its textures (once per content per frame).
-fn table(acc: &mut Acc, run: &mut Run, owner: u32, root: u16, handle: u64, slots: u32, view_heap: usize, compute: bool) {
+fn table(acc: &mut Acc, run: &mut Run, owner: u32, root: u16, handle: u64, slots: u32, view_heap: usize, mode: u8) {
     let raw_len = u64::from(slots) * tap::SLOT;
     let raw = match read(handle, raw_len) {
         Ok(r) => r,
@@ -1198,9 +1552,9 @@ fn table(acc: &mut Acc, run: &mut Run, owner: u32, root: u16, handle: u64, slots
     };
     let raw_hash = xnw_core::hash128(&[&raw]);
     // A dispatch's table keeps other bytes than a draw's (`view_bytes`).
-    let seen = raw_hash ^ u128::from(compute);
+    let seen = raw_hash ^ u128::from(mode);
     if let Some(refs) = acc.tables.get(&seen) {
-        let slot = |r: &Ref| if r.kind == kind::TABLE { root } else { (u32::from(root) * tap::TABLE_SLOTS + u32::from(r.slot) % tap::TABLE_SLOTS) as u16 };
+        let slot = |r: &Ref| if r.kind == kind::TABLE { root } else { fp::table_slot(u32::from(root), fp::table_slot_of(r.slot).1) };
         // Frame-scope records met inside the table (bindless, arena base) stay once.
         let again: Vec<Ref> = refs.iter().filter(|r| r.owner != fp::FRAME_SCOPE).map(|r| Ref { owner, slot: slot(r), ..*r }).collect();
         acc.refs.extend(again);
@@ -1225,7 +1579,7 @@ fn table(acc: &mut Acc, run: &mut Run, owner: u32, root: u16, handle: u64, slots
     let first = acc.refs.len();
     acc.refs.push(reference(owner, kind::TABLE, root, handle, (views.len() * fp::SLOT_BYTES) as u64, Ok(hash)));
     for v in &views {
-        view_bytes(acc, run, owner, root, v, view_heap, compute);
+        view_bytes(acc, run, owner, root, v, view_heap, mode);
     }
     let refs = acc.refs[first..].to_vec();
     acc.tables.insert(seen, refs);
@@ -1235,8 +1589,10 @@ fn table(acc: &mut Acc, run: &mut Run, owner: u32, root: u16, handle: u64, slots
 /// reads no unordered access view (the GPU writes those; under the
 /// null GPU nothing does) and no view over the buffer cap, and has neither
 /// bindless table nor per-draw record.
-fn view_bytes(acc: &mut Acc, run: &mut Run, owner: u32, root: u16, v: &SlotView, view_heap: usize, compute: bool) {
-    let slot = (u32::from(root) * tap::TABLE_SLOTS + v.slot) as u16;
+fn view_bytes(acc: &mut Acc, run: &mut Run, owner: u32, root: u16, v: &SlotView, view_heap: usize, mode: u8) {
+    let compute = mode != TB_DRAW;
+    let slot = fp::table_slot(u32::from(root), v.slot);
+    let plain_uav = v.kind == view::BUFFER && v.layout == view::UNORDERED;
     match v.kind {
         view::CONSTANT => {
             let len = v.bytes.min(CBV_CAP);
@@ -1251,8 +1607,14 @@ fn view_bytes(acc: &mut Acc, run: &mut Run, owner: u32, root: u16, v: &SlotView,
             acc.refs.push(reference_cut(owner, kind::CBV, slot, v.addr, len, got, v.bytes > len));
         }
         view::TEXTURE | view::PLACED => texture(acc, run, v),
-        view::BUFFER | view::PLACED_BUFFER if compute && (v.bytes > BUF_CAP || (v.kind == view::BUFFER && v.layout == view::UNORDERED)) => {
-            let why = if v.layout == view::UNORDERED && v.kind == view::BUFFER { reason::GPU_OUTPUT } else { reason::BUDGET };
+        view::BUFFER if mode == TB_HEAD && plain_uav => {
+            let len = v.bytes.min(HEAD_UAV_CAP);
+            let got = buffer(acc, run, v.addr, len);
+            acc.head_uavs[usize::from(got.is_err())] += 1;
+            acc.refs.push(reference_cut(owner, kind::BUFFER, slot, v.addr, len, got, v.bytes > len));
+        }
+        view::BUFFER | view::PLACED_BUFFER if compute && (v.bytes > BUF_CAP || plain_uav) => {
+            let why = if plain_uav { reason::GPU_OUTPUT } else { reason::BUDGET };
             acc.refs.push(reference(owner, kind::BUFFER, slot, v.addr, v.bytes.min(u64::from(u32::MAX)), Err(why)));
         }
         view::BUFFER | view::PLACED_BUFFER => {
@@ -1373,8 +1735,14 @@ fn texture(acc: &mut Acc, run: &mut Run, v: &SlotView) {
                 let name = xnw_formats::origin::file(o.file).and_then(|f| f.path.file_name().map(|n| n.to_string_lossy().into_owned()));
                 format!("{}#{}", name.unwrap_or_else(|| format!("file{}", o.file)), o.texture)
             });
-            if t.fill.empty() {
+            // Zero in the sampled windows: a small texture is read whole
+            // before it is called zero-filled (a 64x320 hair width profile).
+            let whole = if t.fill.empty() && v.bytes <= ZERO_CHECK { read(v.addr, v.bytes).ok().filter(|b| b.iter().any(|x| *x != 0)) } else { None };
+            if t.fill.empty() && whole.is_none() {
                 t.reason = reason::ZERO_FILLED;
+            } else if let Some(b) = whole.filter(|_| t.origin.is_none() && acc.texel_bytes + v.bytes <= FRAME_TEX_CAP) {
+                acc.texel_bytes += v.bytes;
+                (t.texels, t.texel_bytes) = (keep(acc, run, u16::MAX, b), v.bytes);
             } else if t.origin.is_none() {
                 let k = (v.addr, v.bytes, t.fill.hash);
                 if let Some(h) = run.texels.get(&k).copied().filter(|h| held(acc, run, *h)) {
@@ -1440,10 +1808,16 @@ pub(super) fn take(frame: u64, keep: bool) -> Option<Taken> {
 /// directory); `seqs[i]` is v1 draw i's hook sequence number.
 pub(super) fn write(dir: &Path, frame: u64, seqs: &[u32], taken: Option<Taken>) -> std::io::Result<()> {
     let t0 = std::time::Instant::now();
-    let Some(Taken(acc)) = taken else {
+    let Some(Taken(mut acc)) = taken else {
         xnw_core::warn!("world probe: pack frame {frame}: not written: no pack data reached the writer (frame not recorded: see the 'world probe: pack:' warnings)");
         return Ok(());
     };
+    // The hook-in records the hook left raw (hashing there cost its thread).
+    for (seq, geom, blob) in std::mem::take(&mut acc.hookin_raw) {
+        let (h, len) = (xnw_core::hash128(&[&blob]), blob.len() as u64);
+        acc.blobs.entry(h).or_insert((kind::HOOKIN, blob));
+        acc.refs.push(reference(fp::HOOK | seq, kind::HOOKIN, 0, geom, len, Ok(h)));
+    }
     // v2.1: the frame's new blobs in one bundle file (one file per blob
     // cost ~1.3 ms each, 23,252 files = 29 s for frame 1002).
     let mut by_kind: HashMap<u16, (u64, u64)> = HashMap::new();
@@ -1474,7 +1848,7 @@ pub(super) fn write(dir: &Path, frame: u64, seqs: &[u32], taken: Option<Taken>) 
             let hook_draw = index.get(&s.hook).copied();
             match hook_draw {
                 Some(d) => per_draw[d as usize] += 1,
-                None if s.op == fp::op::DISPATCH => {}
+                None if fp::op::is_dispatch(s.op) => {}
                 None => unpaired += 1,
             }
             fp::Sink { index: i as u32, thread: s.thread, hook_draw, op: s.op, count: s.count, pipeline: s.pipeline }
@@ -1483,11 +1857,17 @@ pub(super) fn write(dir: &Path, frame: u64, seqs: &[u32], taken: Option<Taken>) 
     let pairs = [per_draw.iter().filter(|n| **n == 0).count() as u32, per_draw.iter().filter(|n| **n == 1).count() as u32, per_draw.iter().filter(|n| **n > 1).count() as u32];
     // Dispatch sinks, those with their item and all inputs' bytes.
     let dispatches = sinks.iter().filter(|s| s.op == fp::op::DISPATCH).count();
+    let (sky_sinks, indirect_dispatches, strand_extra, head_uavs) = (acc.sky_sinks, acc.indirect_dispatches, acc.strand_extra, acc.head_uavs);
     let with_item = acc.refs.iter().filter(|r| r.kind == kind::DISPATCH && r.addr != 0).count();
     let dispatch_ms = acc.dispatch_ns as f64 / 1e6;
     let seen = acc.dispatches_seen;
     let (imposters, imp_parts, wheel_windows) = (acc.imposters, acc.imposter_parts, acc.wheel_windows);
     let (words, sampler_counts, sampler_heaps, alias, disp_maps, draw_args, hair) = (acc.draw_words, acc.sampler_counts, acc.sampler_heaps.len(), acc.alias, acc.disp_maps, acc.draw_args, acc.hair);
+    let hookin = acc.hookin;
+    let (n, ns) = (HOOKIN_COST[0].swap(0, Ordering::Relaxed), HOOKIN_COST[1].swap(0, Ordering::Relaxed));
+    let hookin_line = if HOOKIN.load(Ordering::Relaxed) { format!("; hook inputs {hookin} (cost {:.2} us a hook draw over {n})", ns as f64 / 1e3 / n.max(1) as f64) } else { String::new() };
+    let head_sinks = acc.head_sinks;
+    let (light_sinks, lights) = (acc.light_sinks, if acc.lights_done { acc.lights_copied.to_string() } else { "not read".into() });
     let mut reasons: HashMap<(u16, u32), u64> = HashMap::new();
     for r in acc.refs.iter().filter(|r| r.reason != reason::OK) {
         *reasons.entry((r.kind, r.reason)).or_default() += 1;
@@ -1506,7 +1886,7 @@ pub(super) fn write(dir: &Path, frame: u64, seqs: &[u32], taken: Option<Taken>) 
         frame,
         commit: option_env!("XNW_COMMIT").unwrap_or("-").to_string(),
         hook_draws: seqs.len() as u32,
-        sink_draws: (sinks.len() - dispatches) as u32,
+        sink_draws: (sinks.len() - dispatches - indirect_dispatches as usize) as u32,
         pairs,
         unpaired_sinks: unpaired,
         dispatches: [dispatches as u32, acc.dispatches_seen],
@@ -1542,12 +1922,18 @@ pub(super) fn write(dir: &Path, frame: u64, seqs: &[u32], taken: Option<Taken>) 
         disp_maps[1]
     );
     xnw_core::info!(
-        "world probe: pack frame {frame}: draw args on {draw_args} Draw/DrawIndexed sinks; hair: {} input dispatch sinks, {} order-only, strand group records {} (heap views {} with bytes, {} without)",
+        "world probe: pack frame {frame}: draw args on {draw_args} Draw/DrawIndexed sinks; hair: {} input dispatch sinks, {} order-only, strand group records {} (heap views {} with bytes, {} without; palette windows {} with bytes, {} without; collision spans {} with bytes, {} without); lighting: {light_sinks} dispatch sinks ({sky_sinks} sky/ambient), {indirect_dispatches} indirect dispatch sinks, scene lights {lights}; head graph: {head_sinks} dispatch sinks (unordered buffer views {} read, {} not){hookin_line}",
         hair[0],
         hair[1],
         hair[2],
         hair[3],
-        hair[4]
+        hair[4],
+        strand_extra[0],
+        strand_extra[1],
+        strand_extra[2],
+        strand_extra[3],
+        head_uavs[0],
+        head_uavs[1]
     );
     xnw_core::info!("world probe: pack frame {frame}: {imposters} imposter calls ({} with instance records, {} with their type record); wheel palette windows {} ({} without bytes)", imp_parts[0], imp_parts[1], wheel_windows[0], wheel_windows[1]);
     xnw_core::info!(
@@ -1698,10 +2084,10 @@ pub(super) mod tests {
             let run = run.get_or_insert_with(Run::default);
             acc.sinks.push(SinkRaw { thread: 0, hook: 0, op: fp::op::DISPATCH, count: 32, pipeline: 0 });
             let view = |slot: u32, kind: u32, b: &[u8]| SlotView { slot, kind, addr: b.as_ptr() as u64, bytes: b.len() as u64, ..SlotView::default() };
-            view_bytes(acc, run, 1, 5, &view(8, view::CONSTANT, &b7), 0, true);
-            view_bytes(acc, run, 1, 4, &view(1, view::BUFFER, &palette), 0, true);
-            view_bytes(acc, run, 1, 4, &SlotView { layout: view::UNORDERED, bytes: 26_214_400, ..view(24, view::BUFFER, &stream) }, 0, true);
-            view_bytes(acc, run, 1, 4, &SlotView { bytes: BUF_CAP + 1, ..view(2, view::BUFFER, &stream) }, 0, true);
+            view_bytes(acc, run, 1, 5, &view(8, view::CONSTANT, &b7), 0, TB_DISPATCH);
+            view_bytes(acc, run, 1, 4, &view(1, view::BUFFER, &palette), 0, TB_DISPATCH);
+            view_bytes(acc, run, 1, 4, &SlotView { layout: view::UNORDERED, bytes: 26_214_400, ..view(24, view::BUFFER, &stream) }, 0, TB_DISPATCH);
+            view_bytes(acc, run, 1, 4, &SlotView { bytes: BUF_CAP + 1, ..view(2, view::BUFFER, &stream) }, 0, TB_DISPATCH);
             dispatch_record(acc, run, 1, [32, 1, 1], 0);
             assert_eq!(acc.item_walks, 1);
             // Heap index 2 as the heap resolved it (no heap object in a test: 0 and 1 stay unresolved).
@@ -2136,9 +2522,9 @@ pub(super) mod tests {
             let run = run.get_or_insert_with(Run::default);
             for owner in [2u32, 3] {
                 acc.sinks.push(SinkRaw { thread: 0, hook: 0, op: fp::op::DISPATCH, count: 1, pipeline: 0x30 });
-                strand_groups(acc, run, owner, Some(buf), &resolve);
+                strand_groups(acc, run, owner, StrandInputs { records: Some(buf), palette: None, shapes: None }, &resolve);
             }
-            strand_groups(acc, run, 3, None, &resolve);
+            strand_groups(acc, run, 3, StrandInputs { records: None, palette: None, shapes: None }, &resolve);
             // 2 records x 7 words: record 0 words 0 (buffer) and 1 (constants) resolve, record 1 word 1.
             assert_eq!((acc.draw_args, acc.hair), (1, [0, 1, 2, 3, 11]));
             assert!(!acc.refs.iter().any(|r| r.kind == kind::DISPATCH), "a hair sink is not a pre-skin record");
@@ -2148,7 +2534,7 @@ pub(super) mod tests {
         write(&dir, frame, &[seq], take(frame, true)).unwrap();
         let p = FramePack::open(&dir).unwrap().unwrap();
         // The order-only sink: its constants, no table.
-        assert_eq!(p.refs_of(0).map(|r| (r.kind, r.slot)).collect::<Vec<_>>(), [(kind::ROOTS, 1), (kind::SAMPLERS, 0)]);
+        assert_eq!(p.refs_of(0).map(|r| (r.kind, r.slot)).collect::<Vec<_>>(), [(kind::ROOTS, 1), (kind::SAMPLERS, 0), (kind::GROUPS, 0)]);
         let a = p.refs_of(1).find(|r| r.kind == kind::DRAW_ARGS).unwrap();
         let words: Vec<u32> = FramePack::blob(&dir, a.hash).unwrap().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
         assert_eq!(words, [9724, 0, 0, 12]);
@@ -2159,6 +2545,218 @@ pub(super) mod tests {
         // The second sink naming the same records adds none; no records buffer: one NULL record.
         assert_eq!(p.refs_of(3).map(|r| (r.kind, r.reason)).collect::<Vec<_>>(), [(kind::STRAND_VIEW, reason::NULL)]);
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    /// Strand hair (hair3 #892 c, e): per group record the palette bones
+    /// at both bases (as many as the remap reaches) and the collision
+    /// shapes it names, cut at the views' ends; count 0 names none.
+    #[test]
+    fn strand_records_keep_palette_bones_and_collision_spans() {
+        let _one = fresh();
+        let frame = 9_850_000u64;
+        let mut recs = vec![0u8; 2 * fp::STRAND_RECORD];
+        let put = |r: &mut Vec<u8>, at: usize, v: u32| r[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        // Record 0: remap at heap 5 from element 2, bases 1 and 3, 2 shapes at byte 0x50.
+        put(&mut recs, 0xe0, 5);
+        put(&mut recs, REC_REMAP_AT, 2);
+        put(&mut recs, 0xe8, 1);
+        put(&mut recs, 0xec, 3);
+        put(&mut recs, REC_SHAPE_COUNT, 2 << 24 | 0x1234);
+        put(&mut recs, REC_SHAPE_AT, 0x50);
+        // Record 1: no remap (256 bones from base 0: cut), 9 shapes from 0xa0 (cut), base 99 past the palette.
+        let r1 = fp::STRAND_RECORD;
+        put(&mut recs, r1 + 0xe0, 77);
+        put(&mut recs, r1 + 0xec, 99);
+        put(&mut recs, r1 + REC_SHAPE_COUNT, 9 << 24);
+        put(&mut recs, r1 + REC_SHAPE_AT, 0xa0);
+        let remap: Vec<u8> = [9u16, 9, 0, 1, 0xf002, 0].iter().flat_map(|w| w.to_le_bytes()).collect();
+        let palette: Vec<u8> = (0..8 * fp::BONE_BYTES).map(|i| (i / fp::BONE_BYTES) as u8).collect();
+        let shapes: Vec<u8> = (0..4 * fp::STRAND_SHAPE).map(|i| (i / fp::STRAND_SHAPE) as u8 + 1).collect();
+        let resolve = |i: u32| (i == 5).then(|| (0x9_0000, SlotView { kind: view::PLACED_BUFFER, addr: remap.as_ptr() as u64, bytes: remap.len() as u64, ..SlotView::default() }));
+        let view_of = |b: &Vec<u8>| Some(SlotView { kind: view::PLACED_BUFFER, addr: b.as_ptr() as u64, bytes: b.len() as u64, ..SlotView::default() });
+        let mut accs = lock(&ACCS);
+        let acc = acc_of(&mut accs, frame).unwrap();
+        let mut run = lock(&RUN);
+        let run = run.get_or_insert_with(Run::default);
+        let inputs = StrandInputs { records: view_of(&recs), palette: view_of(&palette), shapes: view_of(&shapes) };
+        strand_groups(acc, run, 4, inputs, &resolve);
+        let got: Vec<(u16, u16, u32, u32)> = acc.refs.iter().filter(|r| matches!(r.kind, kind::STRAND_PALETTE | kind::STRAND_SPAN)).map(|r| (r.kind, r.slot, r.len, r.reason)).collect();
+        let b = fp::BONE_BYTES as u32;
+        // Remap entries 2.. read 0, 1, 0xf002 & 0xfff = 2, 0: 3 bones.
+        assert_eq!(
+            got,
+            [
+                (kind::STRAND_PALETTE, 0, 3 * b, reason::OK),
+                (kind::STRAND_PALETTE, 1, 3 * b, reason::OK),
+                (kind::STRAND_SPAN, 0, 2 * fp::STRAND_SHAPE as u32, reason::OK),
+                (kind::STRAND_PALETTE, 2, 8 * b, reason::CUT),
+                (kind::STRAND_PALETTE, 3, 256 * b, reason::IMPLAUSIBLE),
+                (kind::STRAND_SPAN, 1, 2 * fp::STRAND_SHAPE as u32, reason::CUT),
+            ]
+        );
+        let bytes = |slot: u16, k: u16| acc.blobs[&acc.refs.iter().find(|r| r.kind == k && r.slot == slot).unwrap().hash].1.clone();
+        assert_eq!(bytes(1, kind::STRAND_PALETTE), palette[3 * fp::BONE_BYTES..6 * fp::BONE_BYTES]);
+        assert_eq!(bytes(0, kind::STRAND_SPAN), shapes[fp::STRAND_SHAPE..3 * fp::STRAND_SHAPE]);
+        assert_eq!(acc.strand_extra, [3, 1, 2, 0]);
+    }
+
+    /// Head graph (head1 #926): a head dispatch reads its plain unordered
+    /// buffer views (the CPU's rig weights and controls), once per address
+    /// in a frame, cut at HEAD_UAV_CAP; another dispatch does not.
+    #[test]
+    fn head_graph_reads_its_unordered_buffers() {
+        let _one = fresh();
+        let frame = 9_880_000u64;
+        let weights: Vec<u8> = (0..300u32).map(|i| i as u8).collect();
+        let mut accs = lock(&ACCS);
+        let acc = acc_of(&mut accs, frame).unwrap();
+        let mut run = lock(&RUN);
+        let run = run.get_or_insert_with(Run::default);
+        let v = SlotView { slot: 3, kind: view::BUFFER, layout: view::UNORDERED, addr: weights.as_ptr() as u64, bytes: weights.len() as u64, ..SlotView::default() };
+        view_bytes(acc, run, 1, 0, &v, 0, TB_HEAD);
+        view_bytes(acc, run, 2, 0, &v, 0, TB_HEAD);
+        view_bytes(acc, run, 3, 0, &v, 0, TB_DISPATCH);
+        let got: Vec<(u32, u32)> = acc.refs.iter().map(|r| (r.owner, r.reason)).collect();
+        assert_eq!(got, [(1, reason::OK), (2, reason::OK), (3, reason::GPU_OUTPUT)]);
+        assert_eq!(acc.blobs[&acc.refs[0].hash].1, weights);
+        assert_eq!((acc.head_uavs, acc.buffer_bytes), ([2, 0], 300));
+    }
+
+    /// An indirect dispatch (lit4 #914, ambient sinks 54/58) is no draw:
+    /// unpaired, its tables resolved as a lighting dispatch's (frame table
+    /// past one row, other tables one row, no unordered bytes); a direct
+    /// dispatch keeps its group counts; sky programs are lighting sinks.
+    #[test]
+    fn indirect_dispatch_keeps_its_tables_and_direct_its_groups() {
+        let _one = fresh();
+        let frame = 9_870_000u64;
+        let seq = hook_entry(frame);
+        let table = vec![0u8; 4 * 32];
+        let roots = [TapRoot::Table { handle: table.as_ptr() as u64, heap_start: table.as_ptr() as u64, slots: 4 }, TapRoot::Table { handle: table.as_ptr() as u64, heap_start: table.as_ptr() as u64, slots: 4 }];
+        // Pipeline 0 (no stages to read) for both.
+        sink_at(frame, &TapDraw { op: fp::op::INDIRECT_DISPATCH, count: 1, yz: [0; 2], args: [0; 4], pipeline: 0, view_heap: 0, sampler_heap: 0, roots: &roots });
+        assert!(want_dispatch_at(frame, 0, |_| PIPE_SKY));
+        sink_at(frame, &TapDraw { op: fp::op::DISPATCH, count: 8, yz: [4, 2], args: [0; 4], pipeline: 0, view_heap: 0, sampler_heap: 0, roots: &[] });
+        let dir = std::env::temp_dir().join(format!("xnw-pk8i-{}", std::process::id())).join(format!("frame-{frame}"));
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+        write(&dir, frame, &[seq], take(frame, true)).unwrap();
+        let p = FramePack::open(&dir).unwrap().unwrap();
+        assert_eq!(p.sinks.iter().map(|s| (s.op, s.hook_draw)).collect::<Vec<_>>(), [(fp::op::INDIRECT_DISPATCH, None), (fp::op::DISPATCH, None)]);
+        assert_eq!((p.manifest.sink_draws, p.manifest.unpaired_sinks), (0, 0));
+        assert_eq!(p.refs_of(0).filter(|r| r.kind == kind::TABLE).map(|r| r.slot).collect::<Vec<_>>(), [0, 1]);
+        let g = p.refs_of(1).find(|r| r.kind == kind::GROUPS).unwrap();
+        assert_eq!(FramePack::blob(&dir, g.hash).unwrap(), [8u32, 4, 2].iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>());
+        assert!(p.refs_of(0).all(|r| r.kind != kind::GROUPS));
+        assert_eq!((pipe_class(SKY_PROGRAMS[0]), pipe_class(SKY_PROGRAMS[15]), pipe_class(LIGHT_PROGRAMS[0])), (PIPE_SKY, PIPE_SKY, PIPE_LIGHT));
+        assert!(SKY_PROGRAMS.iter().all(|h| !LIGHT_PROGRAMS.contains(h) && !HEAD_PROGRAMS.contains(h)));
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    /// Lighting (lit1): a lighting dispatch sink copies the CPU scene-light
+    /// array's current buffer once per frame, with its index and count, and
+    /// is no pre-skin record; a pipeline's targets are one frame record.
+    #[test]
+    fn lighting_dispatch_copies_the_scene_lights() {
+        let _one = fresh();
+        let frame = 9_900_000u64;
+        let lights: Vec<u8> = (0..2 * fp::LIGHT_ARRAY_BYTES).map(|i| (i / fp::LIGHT_ARRAY_BYTES) as u8 + 1).collect();
+        let (index, count) = (1u32.to_le_bytes(), 44u32.to_le_bytes());
+        set_lights(lights.as_ptr() as u64, index.as_ptr() as u64, count.as_ptr() as u64);
+        let seq = hook_entry(frame);
+        assert!(want_dispatch_at(frame, 0, |_| PIPE_LIGHT));
+        assert_eq!((pipe_class(LIGHT_PROGRAMS[0]), pipe_class(HEAD_PROGRAMS[0])), (PIPE_LIGHT, PIPE_HEAD));
+        let consts = [1u32];
+        for _ in 0..2 {
+            sink_at(frame, &TapDraw { op: fp::op::DISPATCH, count: 8, yz: [1, 1], args: [0; 4], pipeline: 0, view_heap: 0, sampler_heap: 0, roots: &[TapRoot::Constants(&consts)] });
+        }
+        {
+            let mut accs = lock(&ACCS);
+            let acc = acc_of(&mut accs, frame).unwrap();
+            assert_eq!((acc.light_sinks, acc.lights_copied), (2, 44));
+            assert!(!acc.refs.iter().any(|r| r.kind == kind::DISPATCH));
+        }
+        let dir = std::env::temp_dir().join(format!("xnw-pk7l-{}", std::process::id())).join(format!("frame-{frame}"));
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+        write(&dir, frame, &[seq], take(frame, true)).unwrap();
+        let p = FramePack::open(&dir).unwrap().unwrap();
+        let l: Vec<&Ref> = p.refs.iter().filter(|r| r.kind == kind::LIGHTS).collect();
+        assert_eq!(l.iter().map(|r| (r.owner, r.slot, r.reason)).collect::<Vec<_>>(), [(fp::FRAME_SCOPE, 0, 0), (fp::FRAME_SCOPE, 1, 0)]);
+        assert_eq!(l[0].addr, lights.as_ptr() as u64 + fp::LIGHT_ARRAY_BYTES as u64);
+        assert_eq!(FramePack::blob(&dir, l[0].hash).unwrap(), lights[fp::LIGHT_ARRAY_BYTES..].to_vec());
+        assert_eq!(FramePack::blob(&dir, l[1].hash).unwrap(), [1, 0, 0, 0, 44, 0, 0, 0]);
+        set_lights(0, 0, 0);
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    /// `hookin=1` on made-up memory: the TLS words, geometry, context,
+    /// world, viewport, model and rigid-bone parts land where the format
+    /// says; unreadable pointers give zeroed parts; the cost per hook draw is
+    /// printed (`XNW_TEST_TIMING=1` makes it a limit of 0.5 us).
+    #[test]
+    fn hook_inputs_follow_the_hook() {
+        let _one = fresh();
+        let frame = 9_950_000u64;
+        let mut tls = vec![0u8; 0x1400];
+        let mut ctx = vec![0u8; 0x1_2400];
+        let world: Vec<u8> = (0..0x80u32).map(|i| i as u8).collect();
+        let cache: Vec<u8> = (0..256u32).map(|i| (i ^ 0x5A) as u8).collect();
+        let vp = vec![0x11u8; 0x710];
+        let mut model = vec![0u8; 0x38];
+        model[0x33] = 2;
+        let pal: Vec<u8> = (0..48 * 4u32).map(|i| (i / 48) as u8 + 0x40).collect();
+        let vb = vec![0x22u8; 0x20];
+        let mut geom = vec![0u8; 0x48];
+        geom[8..16].copy_from_slice(&(vb.as_ptr() as u64).to_le_bytes());
+        let slot_word = 3u16 << 2;
+        let put = |b: &mut Vec<u8>, o: usize, v: u64| b[o..o + 8].copy_from_slice(&v.to_le_bytes());
+        tls[0x950..0x954].copy_from_slice(&69u32.to_le_bytes());
+        put(&mut tls, 0x12A8, ctx.as_ptr() as u64);
+        put(&mut tls, 0x12B8, vp.as_ptr() as u64);
+        put(&mut tls, 0x1208, model.as_ptr() as u64);
+        put(&mut tls, 0x11E8, pal.as_ptr() as u64);
+        put(&mut ctx, 0x40 + 8 * 3, world.as_ptr() as u64);
+        ctx[0x1_2190..0x1_2194].copy_from_slice(&1i32.to_le_bytes());
+        let pal_base = 0x1234_5678_u64;
+        set_hookin(true, &slot_word as *const u16 as u64, cache.as_ptr() as u64, &pal_base as *const u64 as u64);
+        let seq = hook_entry(frame);
+        hook_inputs(frame, seq, tls.as_ptr() as u64, geom.as_ptr() as u64);
+        let b = hookin_blob(tls.as_ptr() as u64, geom.as_ptr() as u64, HOOK_GLOBALS.each_ref().map(|a| a.load(Ordering::Relaxed)));
+        let parts = fp::decode_hookin(&b).unwrap();
+        assert_eq!(parts.len(), fp::HOOKIN_PARTS);
+        let p = |k: usize| parts[k].clone();
+        assert_eq!((p(0).3, p(0).2), (69u32.to_le_bytes().to_vec(), true));
+        assert_eq!((p(5).0, p(5).3), (vb.as_ptr() as u64, vb.clone()));
+        assert!(!p(6).2 && p(6).3 == vec![0; 0x20], "a null ib pointer reads nothing");
+        assert_eq!((p(8).0, p(13).3), (ctx.as_ptr() as u64 + 0x40 + 24, world.clone()));
+        assert_eq!(p(14).3, cache[128..].to_vec());
+        assert_eq!((p(15).3.len(), p(16).3), (0xC0, vec![0x11; 8]));
+        assert_eq!(p(18).3, vec![0x42; 48]);
+        {
+            let mut accs = lock(&ACCS);
+            let acc = acc_of(&mut accs, frame).unwrap();
+            assert_eq!(acc.hookin, 1);
+            let g = acc.refs.iter().find(|r| r.kind == kind::HOOK_GLOBALS).unwrap();
+            let gb = acc.blobs[&g.hash].1.clone();
+            assert_eq!((u16::from_le_bytes([gb[0], gb[1]]), u64::from_le_bytes(gb[2..10].try_into().unwrap())), (slot_word, pal_base));
+        }
+        // The best of 20 batches of 1,000 (a loaded machine stretches some).
+        let best = |f: &dyn Fn()| {
+            (0..20)
+                .map(|_| {
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..1000 {
+                        f();
+                    }
+                    t0.elapsed().as_secs_f64() * 1e3
+                })
+                .fold(f64::MAX, f64::min)
+        };
+        let g = HOOK_GLOBALS.each_ref().map(|a| a.load(Ordering::Relaxed));
+        let blob_us = best(&|| drop(std::hint::black_box(hookin_blob(tls.as_ptr() as u64, geom.as_ptr() as u64, g))));
+        let us = best(&|| hook_inputs(frame, seq, tls.as_ptr() as u64, geom.as_ptr() as u64));
+        println!("hook inputs: {us:.3} us a hook draw, of which the reads {blob_us:.3} us ({} B)", b.len());
+        assert!(us < 0.5 || !std::env::var("XNW_TEST_TIMING").is_ok_and(|v| v == "1"), "{us} us");
+        set_hookin(false, 0, 0, 0);
     }
 
     /// A blob first met in a frame that is never written is written by

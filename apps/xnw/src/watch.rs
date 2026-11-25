@@ -186,10 +186,18 @@ fn items<T>(value: &str, parse: fn(&str) -> Result<T, String>) -> Vec<T> {
 }
 
 /// Reads `buf.len()` bytes of our own memory; false when unreadable.
+/// In place first with `XNW_PLAINCOPY=on` (`xnw_core::plaincopy`: a page
+/// that is not there goes on to the kernel's copy, so the result is the
+/// kernel's); the kernel's copies are counted as `ReadProcessMemory probe`.
 pub(crate) fn guarded_read(addr: usize, buf: &mut [u8]) -> bool {
+    if xnw_core::plaincopy::copy(buf.as_mut_ptr(), addr as *const u8, buf.len()) {
+        return true;
+    }
     let mut done = 0;
     // SAFETY: the kernel reports an unmapped page instead of faulting.
-    let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), addr as *const _, buf.as_mut_ptr().cast(), buf.len(), &mut done) };
+    let ok = xnw_core::syscalls::timed(xnw_core::syscalls::Call::ReadProbe, || unsafe {
+        ReadProcessMemory(GetCurrentProcess(), addr as *const _, buf.as_mut_ptr().cast(), buf.len(), &mut done)
+    });
     ok != 0 && done == buf.len()
 }
 
@@ -896,5 +904,30 @@ mod ready_files {
             let got = if calls { items(dir.join(f).to_str().unwrap(), parse_call).len() } else { items(dir.join(f).to_str().unwrap(), parse_watch).len() };
             assert_eq!(got, lines, "{f}");
         }
+    }
+
+    /// `guarded_read` across a page that is not there: false and nothing
+    /// claimed, with `XNW_PLAINCOPY=on` (fault, then the kernel's copy) as
+    /// without it; a read inside the page is whole either way.
+    #[test]
+    fn guarded_read_across_a_hole() {
+        use xnw_core::win::{MEM_RELEASE, VirtualFree};
+        const PAGE: usize = 4096;
+        // SAFETY: memory of the test's own: two pages reserved, the first committed.
+        let base = unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, xnw_core::win::PAGE_NOACCESS);
+            assert!(!base.is_null());
+            assert!(!VirtualAlloc(base, PAGE, MEM_COMMIT, xnw_core::win::PAGE_READWRITE).is_null());
+            base as usize
+        };
+        // SAFETY: the committed page.
+        unsafe { std::slice::from_raw_parts_mut(base as *mut u8, PAGE) }.fill(0xAB);
+        let mut b = vec![0u8; PAGE];
+        assert!(!guarded_read(base + PAGE / 2, &mut b));
+        assert!(!guarded_read(base + PAGE / 2, &mut b), "again, remembered as faulted");
+        assert!(guarded_read(base, &mut b) && b.iter().all(|&x| x == 0xAB));
+        assert!(guarded_read(base + 8, &mut b[..8]) && b[..8].iter().all(|&x| x == 0xAB), "under the in-place floor");
+        // SAFETY: the test's reservation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
     }
 }

@@ -147,7 +147,9 @@ fn world_programs() {
         let descriptors = if std::env::var_os("XNW_WORLD_GPU").is_some() { super::Descriptors::Gpu } else { super::Descriptors::Plan };
         // XNW_WORLD_PAGETABLE: the page-table form (with XNW_WORLD_GPU).
         let pagetable = std::env::var_os("XNW_WORLD_PAGETABLE").is_some();
-        let opts = super::Options { mesh: super::MeshForm::Fallback, descriptors, pagetable, ..Default::default() };
+        // XNW_WORLD_NONUNIFORM: every heap index non-uniform (XNW_HEAP_NONUNIFORM).
+        let nonuniform_heap = std::env::var_os("XNW_WORLD_NONUNIFORM").is_some();
+        let opts = super::Options { mesh: super::MeshForm::Fallback, descriptors, pagetable, nonuniform_heap, keep_uniform_heap: super::heap_uniformity().0, masked_lanes: super::heap_uniformity().1, ..Default::default() };
         let r = super::translate_with(c, opts).map_err(|e| e.to_string()).and_then(|s| {
             table = s.reads_stride_table();
             bounded = s.reads_heap_bounds();
@@ -169,7 +171,8 @@ fn world_programs() {
         });
         match r {
             Ok(how) => {
-                println!("{h} {how}{}{} insts {}->{} bytes {} dxil {dxil_hash:032x} wave {} sfi0 {sfi0:#x}", if table { " (runtime stride table)" } else { "" }, if bounded { " (heap-bounded)" } else { "" }, stats.0, stats.1, stats.2, wave.map_or("any".to_owned(), |w| w.to_string()));
+                let (marked, lanes, handles) = super::last_nonuniform();
+                println!("{h} {how}{}{} insts {}->{} bytes {} dxil {dxil_hash:032x} wave {} sfi0 {sfi0:#x} nonuniform {marked}/{handles} varying {lanes}", if table { " (runtime stride table)" } else { "" }, if bounded { " (heap-bounded)" } else { "" }, stats.0, stats.1, stats.2, wave.map_or("any".to_owned(), |w| w.to_string()));
                 (sum_before, sum_after, sum_bytes, ok) = (sum_before + stats.0, sum_after + stats.1, sum_bytes + stats.2, ok + 1);
             }
             Err(e) => {
@@ -672,6 +675,7 @@ fn stride_table_reads_own_views() {
         probe: false,
         loop_counts: None,
         pagetable: false,
+        barycentrics: false,
     })
     .unwrap();
     let cs = super::HostShader {
@@ -687,6 +691,9 @@ fn stride_table_reads_own_views() {
         descriptor_words: l.descriptor_words,
     };
     assert!(cs.reads_stride_table());
+    // HANG1: the table is a root view (no bounds on the card); its read is
+    // bounded by the heap's view slots, so the program reads the bounds.
+    assert!(cs.reads_heap_bounds(), "the stride-table read is bounded by the heap bounds");
     let Some(host) = Host::for_tests() else { return };
     let (root, pso) = host.compute_pipeline(&cs).unwrap();
     let data: Vec<u32> = (100..164).collect();
@@ -709,7 +716,8 @@ fn stride_table_reads_own_views() {
                 &root,
                 &pso,
                 &Dispatch {
-                    roots: vec![(0, Root::Constants(vec![0, 0, 0, 0, 0])), (1, Root::View { srv: true, data: table })],
+                    // The heap bounds (parameter 2): two view slots.
+                    roots: vec![(0, Root::Constants(vec![0, 0, 0, 0, 0])), (1, Root::View { srv: true, data: table }), (2, Root::Constants(vec![2, 0, 0, 0, 0, 0, 0, 0]))],
                     views: &views,
                     samplers: &[],
                     groups: [1, 1, 1],
@@ -721,6 +729,16 @@ fn stride_table_reads_own_views() {
         assert_eq!(out[0], want, "{kind}");
         println!("{kind}: ok");
     }
+    // HANG1: a slot at or past the heap bound (here the UAV's slot 1, with
+    // one view slot counted) reads entry 0 of the table (not past it: a root
+    // view has no bounds on the card), and its handle is the null: the
+    // store is dropped, nothing faults.
+    let views = [View::Buffer { data: &data, stride: Stride::Structured(16) }, View::RawUav(64)];
+    let table: Vec<u32> = [16, 4].into_iter().flat_map(|s| StrideEntry { stride: s, ..StrideEntry::default() }.words()).collect();
+    let out = host
+        .dispatch(&root, &pso, &Dispatch { roots: vec![(0, Root::Constants(vec![0, 0, 0, 0, 0])), (1, Root::View { srv: true, data: table }), (2, Root::Constants(vec![1, 0, 0, 0, 0, 0, 0, 0]))], views: &views, samplers: &[], groups: [1, 1, 1] })
+        .unwrap();
+    assert_eq!(out[0], vec![0; 64], "a slot past the bound: entry 0 read, the store dropped");
 }
 
 /// XNW: micro-test for (b): 64 uniform constant
@@ -839,6 +857,7 @@ fn page_table_reads_tagged_buffer_records() {
             probe: false,
             loop_counts: None,
             pagetable,
+            barycentrics: false,
         })
         .unwrap();
         let cs = super::HostShader { stage: crate::HwStage::Cs, dxil: l.dxil, user_data: l.user_data, samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: l.root_cbvs, root_srvs: l.root_srvs, root_uavs: l.root_uavs, address_map: l.address_map, descriptor_words: l.descriptor_words };
@@ -908,6 +927,7 @@ fn page_table_reads_root_views_by_address() {
             probe: false,
             loop_counts: None,
             pagetable,
+            barycentrics: false,
         })
         .unwrap_or_else(|e| panic!("pagetable {pagetable}: {e:?}"));
         let cs = super::HostShader { stage: crate::HwStage::Cs, dxil: l.dxil, user_data: l.user_data, samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: l.root_cbvs, root_srvs: l.root_srvs, root_uavs: l.root_uavs, address_map: l.address_map, descriptor_words: l.descriptor_words };
@@ -966,6 +986,7 @@ fn bindless_texture_reads_bound_their_heap_index() {
         probe: false,
         loop_counts: None,
         pagetable: false,
+        barycentrics: false,
     })
     .unwrap();
     let cs = super::HostShader { stage: crate::HwStage::Cs, dxil: l.dxil, user_data: l.user_data, samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: l.root_cbvs, root_srvs: l.root_srvs, root_uavs: l.root_uavs, address_map: l.address_map, descriptor_words: l.descriptor_words };
@@ -1031,6 +1052,7 @@ fn gpu_descriptor_records() {
         probe: false,
         loop_counts: None,
         pagetable: false,
+        barycentrics: false,
     })
     .unwrap();
     let cs = super::HostShader {

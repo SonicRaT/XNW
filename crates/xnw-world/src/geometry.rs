@@ -164,8 +164,13 @@ impl GeomBudget {
 
 /// The device allocation a geometry takes: VB, IB at a 256-byte offset, in
 /// 64 KiB granules (what one committed buffer costs).
+/// A vertex buffer read in place (ZC2) takes no device bytes; with
+/// `XNW_ZEROCOPY_BUDGET=full` it is counted as if copied, so the budgets
+/// upload the same geometries as the copy path (the same-picture proof).
 pub fn device_bytes_of(g: &HostGeometry) -> u64 {
+    static FULL: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("XNW_ZEROCOPY_BUDGET").is_ok_and(|v| v.trim() == "full"));
     let vb = match &g.raw_vb {
+        Some(_) if *FULL && g.vb_place > 0 => g.vb_place.min(super::MAX_VB_BYTES as u64),
         Some(v) => v.len().min(super::MAX_VB_BYTES) as u64,
         None => (g.vertices.len() * 4) as u64,
     };
@@ -516,7 +521,7 @@ mod tests {
     use super::*;
 
     fn geom(bytes: usize) -> HostGeometry {
-        HostGeometry { vertices: Vec::new(), indices: vec![0, 1, 2], raw_vb: Some(vec![0u8; bytes]) }
+        HostGeometry { vertices: Vec::new(), indices: vec![0, 1, 2], raw_vb: Some(vec![0u8; bytes]), vb_place: 0 }
     }
 
     fn key(i: u64) -> GeomKey {

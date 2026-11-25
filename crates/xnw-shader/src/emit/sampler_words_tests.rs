@@ -61,6 +61,7 @@ fn lower(
         probe: false,
         loop_counts: None,
         pagetable: false,
+        barycentrics: false,
     })?;
     if let Ok(mut v) = Validator::load(Validator::default_path().as_deref()) {
         v.validate(&mut l.dxil.clone()).unwrap();
@@ -100,7 +101,7 @@ fn waterfall(extra: &[u32]) -> Vec<u32> {
         0x7E2A_020D, // v_mov_b32 v21, s13
         0x7E2C_020E, // v_mov_b32 v22, s14
         0x7E2E_020F, // v_mov_b32 v23, s15
-        0x8AFE_7E06, // L1: s_andn2_b64 exec, s[6:7], exec
+        0x8AFE_7E06, // s_andn2_b64 exec, s[6:7], exec
         0xBF88_0007, // s_cbranch_execz L2
         0xF408_0304,
         0xFA00_0430, // s_load_dwordx4 s[12:15], s[8:9], 0x430
@@ -109,12 +110,12 @@ fn waterfall(extra: &[u32]) -> Vec<u32> {
         0x7E2A_020D, // v_mov_b32 v21, s13
         0x7E2C_020E, // v_mov_b32 v22, s14
         0x7E2E_020F, // v_mov_b32 v23, s15
-        0x88FE_067E, // L2: s_or_b64 exec, exec, s[6:7]
+        0x88FE_067E, // s_or_b64 exec, exec, s[6:7]
         0xF40C_0401,
         0xFA00_0000, // s_load_dwordx8 s[16:23], s[2:3], null
         0xBF8C_0000, // s_waitcnt 0
         0xBE98_047E, // s_mov_b64 s[24:25], exec
-        0x7E38_0514, // L3: v_readfirstlane_b32 s28, v20
+        0x7E38_0514, // v_readfirstlane_b32 s28, v20
         0x7E3A_0515, // v_readfirstlane_b32 s29, v21
         0x7E3C_0516, // v_readfirstlane_b32 s30, v22
         0x7E3E_0517, // v_readfirstlane_b32 s31, v23

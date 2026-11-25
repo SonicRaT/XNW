@@ -692,6 +692,9 @@ pub enum Root {
         srv: bool,
         data: Vec<u32>,
     },
+    /// XNW: a root UAV at this GPU address as given ([`Host::dispatch`]
+    /// only; null-kind tests).
+    UavAt(u64),
 }
 
 /// Bindings for [`Host::draw`]: root arguments and the heap contents.
@@ -929,7 +932,7 @@ impl Host {
                         at.ptr += (index * size) as u64;
                         list.SetGraphicsRootDescriptorTable(*param, at);
                     }
-                    Root::View { .. } => return Err("root views in a draw".into()),
+                    Root::View { .. } | Root::UavAt(_) => return Err("root views in a draw".into()),
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
@@ -1070,6 +1073,9 @@ pub enum View<'a> {
     Cbv(&'a [u32]),
     /// A buffer SRV over these dwords.
     Buffer { data: &'a [u32], stride: Stride },
+    /// XNW: the slot as this function writes it (or leaves it: never
+    /// written), for null views of each description.
+    Slot(&'a dyn Fn(&ID3D12Device, D3D12_CPU_DESCRIPTOR_HANDLE)),
 }
 
 /// How [`View::Buffer`] is viewed.
@@ -1244,6 +1250,7 @@ impl Host {
                 let mut at = views.GetCPUDescriptorHandleForHeapStart();
                 at.ptr += i * view_size;
                 match *v {
+                    View::Slot(write) => write(dev, at),
                     View::Texture(..) | View::Cube(..) => {
                         let (w, h, texels, faces) = match *v {
                             View::Texture(w, h, t) => (w, h, t, 1),
@@ -1467,6 +1474,7 @@ impl Host {
                         at.ptr += (index * size) as u64;
                         list.SetComputeRootDescriptorTable(*param, at);
                     }
+                    Root::UavAt(va) => list.SetComputeRootUnorderedAccessView(*param, *va),
                     Root::View { srv, data } => {
                         let b = upload(data)?;
                         let va = b.GetGPUVirtualAddress();

@@ -38,6 +38,8 @@ pub struct Report {
     /// the range mask): cur_idx same, differs; range word same, differs
     /// (the range only in captures with the column).
     pub hook_rec: [usize; 4],
+    /// List rows drawn from a variant-11 item (the faces; `--frame-on` them).
+    pub face_rows: Vec<usize>,
 }
 
 /// draws.tsv per draw: the hook-time record's cur_idx and range word
@@ -85,8 +87,13 @@ pub fn fill(dir: &Path, list: &mut FrameList, bits: u32) -> Result<Report, Strin
             let variant = names.get(&d.program).and_then(|n| variant_of(n)).ok_or_else(|| format!("program {:032x} is no standard variant", d.program))?;
             let inp = load(&pack, d)?;
             let (rule, neutral, unmapped) = pg::rule_for(variant, &d.rec.b7, bits, || ps::table_unfilled(&inp.inputs())).map_err(|e| format!("{e} (variant {variant})"))?;
-            let delta = if pg::takes_delta(variant, bits) { inp.t76.clone() } else { Vec::new() };
-            frame.items.push(Item { neutral, unmapped, delta, ..Item::from_inputs(&inp.inputs(), rule) });
+            let mut delta = if pg::takes_delta(variant, bits) { inp.t76.clone() } else { Vec::new() };
+            // HEAD2: variant 11 with its table filled (the head graph's) runs its table step.
+            let (table, table_normals) = if variant == 11 && !neutral { pg::face_table(&inp.inputs()) } else { (Vec::new(), 0) };
+            if variant == 11 && !neutral && crate::le32(&inp.b6, 0xc) == 0 {
+                delta = inp.t76.clone();
+            }
+            frame.items.push(Item { neutral, unmapped, delta, table, table_normals, ..Item::from_inputs(&inp.inputs(), rule) });
             rep.sinks.push((sink, variant));
             *rep.b7_slots.entry(d.rec.b7_slot).or_default() += 1;
             Ok(((frame.items.len() - 1) as u32, variant))
@@ -114,6 +121,9 @@ pub fn fill(dir: &Path, list: &mut FrameList, bits: u32) -> Result<Report, Strin
                     }
                 }
                 *rep.drawn.entry(*variant).or_default() += 1;
+                if *variant == 11 {
+                    rep.face_rows.push(i);
+                }
             }
             Err(e) => *rep.left.entry(e.clone()).or_default() += 1,
         }
@@ -147,8 +157,10 @@ pub fn check(dir: &Path, list: &FrameList, sinks: &[(u32, u32)], host: &xnw_gpu:
         let inp = load(&pack, &dispatches[&sink])?;
         let t = std::time::Instant::now();
         // A neutral face is the reference's variant 11 without its table step.
-        // Variant 2's item carries t76: its delta step first.
-        let w = ps::cpu_rule(&inp.inputs(), item.rule, if item.delta.is_empty() { ps::Before::Nothing } else { ps::Before::Delta });
+        // Variant 2's item carries t76: its delta step first. A face with its
+        // table (HEAD2): the whole variant-11 rule.
+        let before = if variant == 11 && !item.neutral { ps::Before::Tables } else if item.delta.is_empty() { ps::Before::Nothing } else { ps::Before::Delta };
+        let w = ps::cpu_rule(&inp.inputs(), item.rule, before);
         cpu_ms += t.elapsed().as_secs_f64() * 1e3;
         let (cpos, cnrm) = range_decode(&w.bytes, item.word());
         let tol = step(ps::range(item.word()).2) + 1e-4;
@@ -196,12 +208,16 @@ pub fn gpu_arg(args: &[String], dir: &Path, list: &mut FrameList) -> Result<Opti
         Some(o) => return Err(format!("--preskin-gpu{o}: use --preskin-gpu or --preskin-gpu=check")),
         None => return Ok(None),
     };
-    let bits = args.iter().position(|a| a == "--preskin-bits").and_then(|i| args.get(i + 1)).and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok()).unwrap_or(0);
+    let mut bits = args.iter().position(|a| a == "--preskin-bits").and_then(|i| args.get(i + 1)).and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok()).unwrap_or(0);
+    // `headgraph=on`: the faces from the head graph's table (HEAD2).
+    if crate::head_graph::switch_on(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default()) {
+        bits |= pg::BIT_FACE_TABLE;
+    }
     let r = fill(dir, list, bits)?;
     let per = r.drawn.iter().map(|(v, n)| format!("v{v} {n}")).collect::<Vec<_>>().join(", ");
     let left = r.left.iter().map(|(why, n)| format!("{n} {why}")).collect::<Vec<_>>().join("; ");
-    println!("pre-skin (gpu): {} PreSkinD rows, {} joined to a dispatch; given to the device pass {} ({}); left as they were: {}; {} items ({} neutral faces: variant 11 from its bind shape; {} unmapped: variants 7-10 without their maps; {} with t76's delta (variant 2); bits {bits:#x})", r.rows, r.joined, r.drawn.values().sum::<usize>(), per, if left.is_empty() { "none".into() } else { left }, list.preskin.items.len(), list.preskin.items.iter().filter(|i| i.neutral).count(), list.preskin.items.iter().filter(|i| i.unmapped).count(), list.preskin.items.iter().filter(|i| !i.delta.is_empty()).count());
-    println!("  pre-skin (gpu): dispatches by b7 slot (root x 96 + slot): {:?}; rows by (ped, has palette): {:?}; row vertex buffer = dispatch vertex view: {} rows, differs {}; hook record vs own: cur_idx same {}, differs {}; range same {}, differs {}", r.b7_slots, r.row_kinds, r.vb_same.0, r.vb_same.1, r.hook_rec[0], r.hook_rec[1], r.hook_rec[2], r.hook_rec[3]);
+    println!("pre-skin (gpu): {} PreSkinD rows, {} joined to a dispatch; given to the device pass {} ({}); left as they were: {}; {} items ({} neutral faces: variant 11 from its bind shape; {} unmapped: variants 7-10 without their maps; {} with t76's delta (variant 2); {} faces from their table; bits {bits:#x})", r.rows, r.joined, r.drawn.values().sum::<usize>(), per, if left.is_empty() { "none".into() } else { left }, list.preskin.items.len(), list.preskin.items.iter().filter(|i| i.neutral).count(), list.preskin.items.iter().filter(|i| i.unmapped).count(), list.preskin.items.iter().filter(|i| !i.delta.is_empty()).count(), list.preskin.items.iter().filter(|i| !i.table.is_empty()).count());
+    println!("  pre-skin (gpu): dispatches by b7 slot (root x 96 + slot): {:?}; rows by (ped, has palette): {:?}; row vertex buffer = dispatch vertex view: {} rows, differs {}; hook record vs own: cur_idx same {}, differs {}; range same {}, differs {}; face rows {:?}", r.b7_slots, r.row_kinds, r.vb_same.0, r.vb_same.1, r.hook_rec[0], r.hook_rec[1], r.hook_rec[2], r.hook_rec[3], r.face_rows);
     if check_too {
         let host = xnw_gpu::host::Host::new(None).map_err(|e| e.to_string())?;
         check(dir, list, &r.sinks, &host)?;

@@ -44,6 +44,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
+// The instance rule (LOD slot, frustum, sane record) is shared with the device cull (PERF3).
+use xnw_world::gpucull::{MAX_BATCH, frustum_planes, in_frustum, lod_slot, plausible_record};
 use xnw_frame::{Bounds, Mesh, OBJ_MAX_VERTICES, Streams, WaterMap, WorldDraw, WorldSrc, WorldStats, camera_position, decode_indexed, decode_meshlets, expand_meshlets, fnv, light_of, plausible, rigid_world, rstate_text, sky_of, sun_of, vb_ready, water_grid, water_tint, write_world};
 
 const IMAGE_BASE: usize = 0x1_4000_0000;
@@ -114,6 +116,10 @@ mod imposter;
 mod bridgeps;
 /// The list's geometry reads (`geomcopy=direct`, `geomasync=on`).
 mod geomread;
+/// `xnw burst`: a captured burst through the live list and pass functions.
+pub(crate) mod burst;
+/// The burst's title memory as the run had it: the census and `XNW_ZEROCOPY=on` (ZC1).
+mod burst_mem;
 
 // ---- configuration ----
 
@@ -147,6 +153,8 @@ struct Config {
     skinlog: usize,
     /// `pack=2`: the frame pack v2 in seq frames.
     pack: bool,
+    /// `hookin=1`: the hook's inputs per hook draw in the pack (v2.8).
+    hookin: bool,
     /// `scan=exit`: scan.txt from the scene scan's records at the exit of
     /// the compaction 0x14547BE70 (its wrapper 0x140B5F960 calls it from
     /// our hook), not at the drain's entry, which can race the next scan.
@@ -156,7 +164,7 @@ struct Config {
 fn parse(v: &str) -> Result<Config, String> {
     let mut parts = v.split(',').map(str::trim);
     let dir = parts.next().filter(|d| !d.is_empty()).ok_or("no directory")?;
-    let mut c = Config { dir: PathBuf::from(dir), frames: 3, max: 20_000, at: Vec::new(), raw: 0, render: false, seq: false, skinlog: 0, census: false, auto: None, auto_veh: 0, cut_present: false, pack: false, scan_exit: false };
+    let mut c = Config { dir: PathBuf::from(dir), frames: 3, max: 20_000, at: Vec::new(), raw: 0, render: false, seq: false, skinlog: 0, census: false, auto: None, auto_veh: 0, cut_present: false, pack: false, scan_exit: false, hookin: false };
     for p in parts {
         let (k, val) = p.split_once('=').ok_or_else(|| format!("`{p}`: key=value"))?;
         let n = |s: &str| s.trim().parse::<u64>().map_err(|_| format!("`{p}`: bad number"));
@@ -167,6 +175,7 @@ fn parse(v: &str) -> Result<Config, String> {
             "skinlog" => c.skinlog = n(val)? as usize,
             "census" => c.census = n(val)? != 0,
             "cut" => c.cut_present = val.trim() == "present",
+            "hookin" => c.hookin = n(val)? != 0,
             "scan" => match val.trim() {
                 "exit" => c.scan_exit = true,
                 "drain" => c.scan_exit = false,
@@ -206,7 +215,7 @@ fn parse(v: &str) -> Result<Config, String> {
                 c.at = val.split('+').map(n).collect::<Result<_, _>>()?;
                 c.at.sort_unstable();
             }
-            _ => return Err(format!("`{p}`: unknown key (frames, max, at, seq, raw, skinlog, census, cut, pack, scan)")),
+            _ => return Err(format!("`{p}`: unknown key (frames, max, at, seq, raw, skinlog, census, cut, pack, scan, hookin)")),
         }
     }
     Ok(c)
@@ -264,6 +273,9 @@ fn offsets(frames: usize) -> Vec<u64> {
 // ---- guarded reads ----
 
 fn bytes(addr: u64, len: usize) -> Option<Vec<u8>> {
+    if burst::serving() {
+        return burst::read(addr, len, |to, from| crate::watch::guarded_read(from as usize, to));
+    }
     if addr < 0x1_0000 || addr.checked_add(len as u64).is_none_or(|end| end > 0x8000_0000_0000) {
         return None;
     }
@@ -849,6 +861,15 @@ impl State {
             // (it was decided by the writer, far behind the title), and the
             // frame's pack data moves into the capture (fault A).
             c.dump = !self.cfg.render || auto_dump(&self.cfg, &c) || (c.ordinal != usize::MAX && self.cfg.raw > 0);
+            if !c.dump {
+                // Its scan snapshot is not wanted: the queue keeps only the
+                // dumped frames' (a 120-frame window kept 25 of 120 while it
+                // held every frame).
+                let f = c.frame;
+                if let Ok(mut q) = SCANS.lock() {
+                    q.retain(|(g, _)| u64::from(*g) != f);
+                }
+            }
             if self.cfg.pack {
                 c.pack = Mutex::new(pack::take(c.frame, c.dump));
             }
@@ -1048,6 +1069,7 @@ fn hook_with(s: &State, now: u64, geom: u64, ret: u64, inst: Option<u64>, tls: u
                 pack::hook_objects(now, pack_seq, d.palette, prev, d.model, d.ent.at);
             }
             if pack_seq != 0 {
+                pack::hook_inputs(now, pack_seq, tls, geom);
                 pack::hook_views(now, &[d.tex_desc, d.layer_desc[0], d.layer_desc[1], d.layer_desc[2], d.layer_desc[3]], &[(d.vb_at, d.vb_len), (d.mesh_at, d.mesh_len)]);
             }
         }
@@ -1407,56 +1429,9 @@ struct InstInfo {
 }
 
 const NO_LOD: u8 = 0xFF;
-/// Instance indices are 16 bits: at most 65,536 per batch.
-const MAX_BATCH: u32 = 65_536;
+/// A list row drawn from the CPU's instances (not a device-culled batch).
+const NO_CULL: u32 = u32::MAX;
 const LODREC_BYTES: usize = 140;
-
-/// The LOD slot the culling shader gives instance `r` (16
-/// floats) at distance `d` under LOD record `t` (35 floats), or None when it
-/// is dropped (scale fields, far fade). Draw it iff the slot equals this
-/// call's lod - firstLod.
-fn lod_slot(t: &[f32; 35], r: &[f32; 16], d: f32) -> Option<usize> {
-    // 2. rec_i+0x30 / +0x38.
-    if r[12].min(r[14]) <= 0.0 {
-        return None;
-    }
-    // 3. Far fade T+0x58 {s0, s1}: gone at d >= s1.
-    let (s0, s1) = (t[22], t[23]);
-    let e = s0.min(s1 - 1e-7);
-    if d >= e && (s1 <= e || 1.0 - (d - e) / (s1 - e) <= 0.0) {
-        return None;
-    }
-    // 4. Slot from the distances T+0x48 (< 0: absent); the last has no upper bound.
-    let dd = [t[18], t[19], t[20], t[21]];
-    let last = if dd[3] >= 0.0 {
-        3
-    } else if dd[2] >= 0.0 {
-        2
-    } else if dd[1] >= 0.0 {
-        1
-    } else {
-        0
-    };
-    let mut k = if last == 0 || dd[1] < 0.0 {
-        last
-    } else if dd[0] >= 0.0 && d < dd[0] {
-        0
-    } else {
-        (1..last).find(|&k| dd[k] >= 0.0 && d < dd[k]).unwrap_or(last)
-    };
-    // 5. Cross-fade band T+0x30: the hard switch (T+0x44 bit 0) at mid-band,
-    // and the band's far end, move to the next slot (the band's double draw: U).
-    if k < last {
-        let (w, gap) = (t[12 + k], dd[k] - d);
-        if w > 0.0 && gap < w {
-            let x = gap / w;
-            if (t[17].to_bits() & 1 != 0 && x < 0.5) || x < 1.0 / 255.0 {
-                k += 1;
-            }
-        }
-    }
-    Some(k)
-}
 
 /// One instanced call's records filtered by the LOD rule into
 /// camera-relative worlds (12 floats each, appended to `out`): (tested, drawn).
@@ -1467,33 +1442,6 @@ fn lod_slot(t: &[f32; 35], r: &[f32; 16], d: f32) -> Option<usize> {
 #[cfg(test)]
 fn prefilter(block: &[u8], lod: Option<(&[f32; 35], usize)>, hide: Option<&[u32]>, cam: [f32; 3], out: &mut Vec<f32>) -> (u32, u32, u32) {
     prefilter_why(block, lod, hide, cam, out, None, None, &mut [0; 3])
-}
-
-/// The planes of a camera-relative view-projection
-/// (row vectors, reverse Z): left, right, bottom, top, near; (n, d) with |n| = 1.
-pub(crate) fn frustum_planes(vp: &[f32; 16]) -> [[f32; 4]; 5] {
-    let col = |j: usize| [vp[j], vp[4 + j], vp[8 + j], vp[12 + j]];
-    let (x, y, z, w) = (col(0), col(1), col(2), col(3));
-    let pl = |a: [f32; 4], s: f32, b: [f32; 4]| {
-        let p: [f32; 4] = std::array::from_fn(|k| a[k] + s * b[k]);
-        let l = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt().max(1e-12);
-        p.map(|v| v / l)
-    };
-    [pl(w, 1.0, x), pl(w, -1.0, x), pl(w, 1.0, y), pl(w, -1.0, y), pl(w, -1.0, z)]
-}
-
-/// An instance's bounding sphere (LOD record T: centre +0x08,
-/// radius +0x14; scale 1 / min(rec +0x30, +0x38)) against the planes, in
-/// camera-relative space; false when outside (or a scale <= 0).
-fn in_frustum(t: &[f32; 35], r: &[f32; 16], cam: [f32; 3], planes: &[[f32; 4]; 5]) -> bool {
-    let s = r[12].min(r[14]);
-    if !(s > 0.0) {
-        return false;
-    }
-    let (c, rad) = ([t[2], t[3], t[4]], t[5] / s);
-    // Rows 0..2 of the 3x4 record, translation in .w (absolute), made camera-relative.
-    let p: [f32; 3] = std::array::from_fn(|k| r[4 * k] * c[0] + r[4 * k + 1] * c[1] + r[4 * k + 2] * c[2] + r[4 * k + 3] - cam[k]);
-    planes.iter().all(|pl| pl[0] * p[0] + pl[1] * p[1] + pl[2] * p[2] + pl[3] >= -rad)
 }
 
 /// [`prefilter`] that can also note, per instance, (index, outcome, distance,
@@ -1553,7 +1501,18 @@ fn cached_bounds(block: &std::sync::Arc<Vec<u8>>, t: &[f32; 35]) -> Option<([f32
 #[allow(clippy::too_many_arguments)]
 fn prefilter_batch(block: &std::sync::Arc<Vec<u8>>, len: usize, lod: Option<(&[f32; 35], usize)>, hide: Option<&[u32]>, cam: [f32; 3], out: &mut Vec<f32>, why: Option<&mut Vec<(u32, u8, f32, u8)>>, planes: &[[f32; 4]; 5], counts: &mut [u32; 3]) -> (u32, u32, u32) {
     let n = (len / 64).min(MAX_BATCH as usize) as u32;
-    let mut planes_for_instances = Some(planes);
+    match batch_test(block, n, lod, cam, planes, counts) {
+        None => (n, 0, 0),
+        Some(need_planes) => prefilter_why(&block[..len], lod, hide, cam, out, why, need_planes.then_some(planes), counts),
+    }
+}
+
+/// The batch-level half of [`prefilter_batch`]: None when the whole batch
+/// is outside or at another LOD slot (counted in `counts`), else whether its
+/// instances still need the frustum test (false: the batch sphere is inside
+/// every plane). The device cull (`gpucull=on`) keeps this on the CPU.
+fn batch_test(block: &std::sync::Arc<Vec<u8>>, n: u32, lod: Option<(&[f32; 35], usize)>, cam: [f32; 3], planes: &[[f32; 4]; 5], counts: &mut [u32; 3]) -> Option<bool> {
+    let mut need_planes = true;
     if let Some((t, slot)) = lod
         && let Some((c, rad)) = cached_bounds(block, t)
     {
@@ -1561,10 +1520,10 @@ fn prefilter_batch(block: &std::sync::Arc<Vec<u8>>, len: usize, lod: Option<(&[f
         let dist: Vec<f32> = planes.iter().map(|pl| pl[0] * p[0] + pl[1] * p[1] + pl[2] * p[2] + pl[3]).collect();
         if dist.iter().any(|d| *d < -rad) {
             counts[0] += n;
-            return (n, 0, 0);
+            return None;
         }
         if dist.iter().all(|d| *d >= rad) {
-            planes_for_instances = None;
+            need_planes = false;
         }
         let d = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
         let unit = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0];
@@ -1576,10 +1535,10 @@ fn prefilter_batch(block: &std::sync::Arc<Vec<u8>>, len: usize, lod: Option<(&[f
         };
         if skip {
             counts[1] += n;
-            return (n, 0, 0);
+            return None;
         }
     }
-    prefilter_why(&block[..len], lod, hide, cam, out, why, planes_for_instances, counts)
+    Some(need_planes)
 }
 
 /// With `planes`, outcome 5 = outside the frustum (tested before the
@@ -1688,6 +1647,10 @@ unsafe fn pread<T: Copy>(addr: u64) -> Option<T> {
 
 /// `len` bytes at `addr` by the fault-fixed copy (None: out of range or faulted).
 fn dcopy(addr: u64, len: usize) -> Option<Vec<u8>> {
+    if burst::serving() {
+        // SAFETY: into the table's own buffer of `to.len()` bytes.
+        return burst::read(addr, len, |to, from| unsafe { fcopy(to.as_mut_ptr(), from, to.len()) });
+    }
     if !(0x1_0000..0x8000_0000_0000).contains(&addr) || addr.checked_add(len as u64)? > 0x8000_0000_0000 {
         return None;
     }
@@ -1985,6 +1948,9 @@ static DRAIN_CUT: AtomicBool = AtomicBool::new(false);
 /// The frame a draw belongs to: the title's frame id under the drain cut,
 /// else our presented frame (the old cut).
 fn frame_key() -> u64 {
+    if burst::serving() {
+        return burst::frame();
+    }
     if DRAIN_CUT.load(Ordering::Relaxed) { u64::from(title_frame()) } else { xnw_gpu::d3d12x::presented() }
 }
 
@@ -1992,6 +1958,9 @@ fn frame_key() -> u64 {
 /// last recorded draw, when that is the draw the sink belongs to (this
 /// frame's, and no hook since). False: no such draw.
 fn attach_wheel(w: skinhook::WheelInst) -> bool {
+    if burst::serving() {
+        return burst::attach(|d| d.skinned.then(|| d.wheel = Some(w)).is_some());
+    }
     let Some(s) = STATE.get() else { return false };
     let slot = s.slot();
     let Ok(mut g) = slot.lock() else { return false };
@@ -2012,6 +1981,9 @@ fn attach_wheel(w: skinhook::WheelInst) -> bool {
 /// meshlet buffer (vb_at, vb_len, mesh_at), when it is the draw a sink
 /// belongs to (this frame's, and no hook since).
 fn last_draw_streams() -> Option<(u64, u64, u64)> {
+    if burst::serving() {
+        return burst::current().map(|d| d.streams);
+    }
     let s = STATE.get()?;
     let slot = s.slot();
     let g = slot.lock().ok()?;
@@ -2022,6 +1994,12 @@ fn last_draw_streams() -> Option<(u64, u64, u64)> {
 /// `bridgeps`: gives a draw's binding inputs to this thread's last
 /// recorded draw (as [`attach_sink_range`]). False: no such draw.
 fn attach_bridged(o: Box<xnw_world::bridged::Owned>) -> bool {
+    if burst::serving() {
+        return burst::attach(|d| {
+            d.bridged = Some(o);
+            true
+        });
+    }
     let Some(s) = STATE.get() else { return false };
     let slot = s.slot();
     let Ok(mut g) = slot.lock() else { return false };
@@ -2042,6 +2020,12 @@ fn attach_bridged(o: Box<xnw_world::bridged::Owned>) -> bool {
 /// +0x54) to this thread's last recorded draw, when that is the draw the
 /// sink belongs to (this frame's, and no hook since). False: no such draw.
 fn attach_sink_range(word: u32) -> bool {
+    if burst::serving() {
+        return burst::attach(|d| {
+            d.sink_range = Some(word);
+            true
+        });
+    }
     let Some(s) = STATE.get() else { return false };
     let slot = s.slot();
     let Ok(mut g) = slot.lock() else { return false };
@@ -2065,6 +2049,32 @@ static SINK_WHEELS: AtomicBool = AtomicBool::new(false);
 static SINK_PRESKIN: AtomicBool = AtomicBool::new(false);
 static SINK_BRIDGE: AtomicBool = AtomicBool::new(false);
 
+/// Registers the list sink's consumers the switches ask for (the live
+/// probe, and `xnw burst`, which hands them a capture's sinks).
+pub(crate) fn install_sinks(render: bool) {
+    if preskin::on() {
+        preskin::install();
+        SINK_PRESKIN.store(true, Ordering::Relaxed);
+        xnw_core::info!("world render: pre-skin: PreSkinD draws joined by their own record (+0x54 at T9 slot 0, read at the list sink)");
+    }
+    if skinhook::rules() & skinhook::VEH_INST != 0 && render {
+        SINK_WHEELS.store(true, Ordering::Relaxed);
+        xnw_core::info!("world render: vehicle wheels: instanced wheel and tyre draws read at the list sink (skinrules bit 8)");
+    }
+    if bridgeps::on() && render {
+        SINK_BRIDGE.store(true, Ordering::Relaxed);
+        xnw_core::info!("world render: bridgeps: draws of pixel programs {:08x?} read at the list sink for the title's own programs in our pass", bridgeps::wanted());
+    }
+    if SINK_PRESKIN.load(Ordering::Relaxed) || SINK_WHEELS.load(Ordering::Relaxed) || SINK_BRIDGE.load(Ordering::Relaxed) {
+        xnw_gpu::d3d12x::tap::set_draw_tap(Some((sink_want, on_sink)));
+    }
+}
+
+/// Which consumers are on: (wheels, pre-skin, bridged rows).
+pub(crate) fn sinks_on() -> (bool, bool, bool) {
+    (SINK_WHEELS.load(Ordering::Relaxed), SINK_PRESKIN.load(Ordering::Relaxed), SINK_BRIDGE.load(Ordering::Relaxed))
+}
+
 fn sink_want(pipeline: usize) -> bool {
     (SINK_WHEELS.load(Ordering::Relaxed) && skinhook::wheel_want(pipeline)) || (SINK_PRESKIN.load(Ordering::Relaxed) && preskin::draw_want(pipeline)) || (SINK_BRIDGE.load(Ordering::Relaxed) && bridgeps::draw_want(pipeline))
 }
@@ -2077,6 +2087,61 @@ fn on_sink(d: &xnw_gpu::d3d12x::tap::TapDraw) {
     }
     if SINK_BRIDGE.load(Ordering::Relaxed) && bridgeps::draw_want(d.pipeline) {
         bridgeps::on_draw_sink(d);
+    }
+}
+
+/// A row's placement fields as the wheel placement reads and sets them.
+pub(crate) struct WheelRow {
+    pub world: xnw_world::Mat,
+    pub palette: u32,
+    pub bone_first: u32,
+    pub bone_count: u32,
+    pub remap: u32,
+    pub inst_first: u32,
+    pub inst_count: u32,
+}
+
+/// Instanced vehicle draws (skinrules bit 8): one instance per record read
+/// at the sink, the bones at the draw's palette base after the palette,
+/// reached through a remap relative to the row's first bone. `left`: rows
+/// with reads, of them left as they were (a remap already, no palette or
+/// instances, palette too far); `rows`: rows drawn per instance. The live
+/// list build and `xnw burst` both place a row's wheel here.
+pub(crate) fn place_wheel(list: &mut xnw_world::FrameList, wheel_pal: &mut Option<u32>, w: &skinhook::WheelInst, r: &mut WheelRow, left: &mut [u32; 4], rows: &mut u32) {
+    left[0] += 1;
+    if r.remap != xnw_world::NO_REMAP {
+        left[1] += 1;
+    } else if w.worlds.is_empty() || (r.palette as usize) >= list.palettes.len() {
+        left[2] += 1;
+    }
+    // The wheel bones go into the wheels' own palette and the row's bones
+    // start at them (remap entry b = b), so `palette too far` (left[3])
+    // stays 0. Appended to the row's palette they lay past the 12-bit
+    // remap reach (0x1000 bones from the row's first bone): frame 2760 of a capture
+    // `palette too far 8` of 8, behind the frame's 3215 skin bones and 11
+    // vehicle index tables (352 KiB, about 7500 bones); the replay's
+    // palette holds no vehicle tables, so its wheels fit.
+    if r.remap == xnw_world::NO_REMAP && !w.worlds.is_empty() && (r.palette as usize) < list.palettes.len() {
+        let p = *wheel_pal.get_or_insert_with(|| {
+            list.palette_at_draw.resize(list.palettes.len(), false);
+            list.palettes.push(Vec::new());
+            list.palette_at_draw.push(true);
+            (list.palettes.len() - 1) as u32
+        });
+        let (pal, n) = (&mut list.palettes[p as usize], skinhook::WHEEL_BONES as u32);
+        let e = (pal.len() / 12) as u32;
+        pal.extend_from_slice(&w.bones);
+        r.remap = pal.len() as u32;
+        pal.extend((0..n).map(f32::from_bits));
+        pal.resize(pal.len().next_multiple_of(12), 0.0);
+        (r.palette, r.bone_first, r.bone_count) = (p, e, n);
+        r.inst_first = (list.instances.len() / 12) as u32;
+        for x in &w.worlds {
+            list.instances.extend_from_slice(x);
+        }
+        r.inst_count = w.worlds.len() as u32;
+        r.world = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        *rows += 1;
     }
 }
 
@@ -3070,6 +3135,13 @@ fn matrix_text(m: &[f32]) -> String {
     m.chunks(4).map(|r| format!("{:.5} {:.5} {:.5} {:.5}", r[0], r[1], r[2], r[3])).collect::<Vec<_>>().join(" | ")
 }
 
+/// A camera matrix as text that reads back bit for bit (shortest round-trip
+/// decimals): with 5 decimals the replay's frustum planes were ~2 mm off at
+/// 157 m and three records of pk5 f977 row 431 flipped at the top plane.
+fn matrix_exact(m: &[f32]) -> String {
+    m.chunks(4).map(|r| format!("{} {} {} {}", r[0], r[1], r[2], r[3])).collect::<Vec<_>>().join(" | ")
+}
+
 fn write_frame(s: &State, c: Capture) -> std::io::Result<()> {
     write_frame_with(s, &c, true)
 }
@@ -3437,8 +3509,8 @@ fn write_frame_with(s: &State, c: &Capture, finish: bool) -> std::io::Result<()>
         cams.sort_by_key(|(_, k)| std::cmp::Reverse(k.draws));
         for (vp, k) in &cams {
             writeln!(out, "viewport {vp:#x} draws {}", k.draws)?;
-            writeln!(out, "  view {}", matrix_text(&k.view))?;
-            writeln!(out, "  proj {}", matrix_text(&k.proj))?;
+            writeln!(out, "  view {}", matrix_exact(&k.view))?;
+            writeln!(out, "  proj {}", matrix_exact(&k.proj))?;
             writeln!(out, "  origin {:.4} {:.4} {:.4} {:.4}", k.origin[0], k.origin[1], k.origin[2], k.origin[3])?;
         }
     }
@@ -3554,12 +3626,6 @@ fn render_switch(name: &str, default: bool) -> bool {
 
 fn switch_in(v: &str, name: &str, default: bool) -> bool {
     v.split(',').map(str::trim).filter_map(|p| p.strip_prefix(name)?.strip_prefix('=')).last().map_or(default, |s| s != "off")
-}
-
-/// An instance record whose 3x3 part is not a plausible transform
-/// (a row norm outside 1e-3..1e3, or not finite) is not drawn.
-fn plausible_record(r: &[f32; 16]) -> bool {
-    r[..12].iter().all(|v| v.is_finite()) && [0, 4, 8].iter().all(|&k| (1e-6..1e6).contains(&(r[k] * r[k] + r[k + 1] * r[k + 1] + r[k + 2] * r[k + 2])))
 }
 
 /// The share of the screen an instance's bounding sphere covers:
@@ -3717,6 +3783,10 @@ fn render_frame(c: Capture, cache: &mut xnw_world::GeometryCache<()>, dump: Opti
     {
         list.water = Some(xnw_world::Water { grid, origin: xnw_world::camera_position(&cam.view), tint: water_tint(list.sun) });
     }
+    // The ocean wave ring the CPU samples (worldwater.rs, XNW_WATER_SIM).
+    if let Some(s) = STATE.get() {
+        crate::worldwater::tick(s.title, c.frame);
+    }
     // The heightmap terrain's tile records (worldterrain.rs).
     if crate::worldterrain::enabled()
         && let Some(s) = STATE.get()
@@ -3775,7 +3845,17 @@ fn render_frame(c: Capture, cache: &mut xnw_world::GeometryCache<()>, dump: Opti
     // Instance blocks as camera-relative worlds, filtered per call by the
     // LOD rule, once per (block, viewport, lod, LOD record).
     // The third value is why a batch draws nothing (SKIP_*; 0 when it draws).
-    let mut inst_at: HashMap<(u32, u64, u32, u32), (u32, u32, u8)> = HashMap::new();
+    // The fourth is the batch in `list.cull` (gpucull=on; NO_CULL: drawn from the CPU's instances).
+    let mut inst_at: HashMap<(u32, u64, u32, u32), (u32, u32, u8, u32)> = HashMap::new();
+    // `gpucull=on` (PERF3): the batch test stays here, the per-instance test and
+    // the worlds are made by the pass's compute; a dumped frame keeps the CPU
+    // path (its list.tsv and instances.bin are the replay's input).
+    let gpucull = render_switch("gpucull", false) && dump.is_none();
+    // `hair=on` (HAIR2, default off): the strand chain runs in the replay only; the live path is a stub.
+    static HAIR_STUB: std::sync::Once = std::sync::Once::new();
+    if render_switch("hair", false) {
+        HAIR_STUB.call_once(|| xnw_core::info!("world: hair=on: the strand chain and strand draws run in the replay only (world-render); live path stubbed while the card is frozen"));
+    }
     // The title's multi-pass techniques (0x1451AD540: one draw
     // per technique pass, passes[base+k] with its own program set) submit the
     // same geometry, placement, state and sample mask again; our pass draws
@@ -3839,7 +3919,7 @@ fn render_frame(c: Capture, cache: &mut xnw_world::GeometryCache<()>, dump: Opti
                 skip[di] = SKIP_INST_NO_CAMERA;
                 continue;
             };
-            let (first, count, why_none) = *inst_at.entry((i.block, d.viewport, i.lod, i.lodrec)).or_insert_with(|| {
+            let (first, count, why_none, cull_batch) = *inst_at.entry((i.block, d.viewport, i.lod, i.lodrec)).or_insert_with(|| {
                 let origin = camera_position(&cam.view);
                 let first = (list.instances.len() / 12) as u32;
                 let t = c.lod_list.get(i.lodrec as usize).map(|b| f32s::<35>(b));
@@ -3852,7 +3932,7 @@ fn render_frame(c: Capture, cache: &mut xnw_world::GeometryCache<()>, dump: Opti
                     no_lod += 1;
                     // Without a LOD record only the first LOD's call draws (no stacking).
                     if i.first_lod != NO_LOD && i.lod != u32::from(i.first_lod) {
-                        return (first, 0, SKIP_INST_NO_LOD_RECORD);
+                        return (first, 0, SKIP_INST_NO_LOD_RECORD, NO_CULL);
                     }
                 }
                 let room = (4 * xnw_world::MAX_INSTANCES as usize).saturating_sub(list.instances.len() / 12);
@@ -3862,6 +3942,29 @@ fn render_frame(c: Capture, cache: &mut xnw_world::GeometryCache<()>, dump: Opti
                 let planes = frustum_planes(&xnw_world::Camera { viewport: 0, view: cam.view, proj: cam.proj }.view_proj_relative());
                 let mut counts = [0u32; 3];
                 let tp = Instant::now();
+                if gpucull {
+                    let n = (block.len() / 64).min(MAX_BATCH as usize) as u32;
+                    let verdict = batch_test(block, n, lod, origin, &planes, &mut counts);
+                    let pushed = verdict.and_then(|need_planes| {
+                        // Kind S and grass blocks are the same allocation across frames (kept on the device).
+                        let keep = c.inst_src.get(i.block as usize).is_some_and(|s| *s != 0);
+                        list.cull.push(xnw_world::gpucull::Batch { records: block.clone(), len: n, keep, lod: lod.map(|(t, s)| (*t, s as u32)), hide: hide.map(<[u32]>::to_vec).unwrap_or_default(), origin, planes: need_planes.then_some(planes), out_first: 0 })
+                    });
+                    // A full cull frame falls back to the CPU test below.
+                    if verdict.is_none() || pushed.is_some() {
+                        split[0] += tp.elapsed().as_nanos() as u64;
+                        outside += counts[0];
+                        wrong_lod += counts[1];
+                        batches += 1;
+                        gpu_batches += u32::from(i.gpu != 0);
+                        tested += n;
+                        per_vp.entry(d.viewport).or_default().0 += n;
+                        return match pushed {
+                            Some(b) => (list.cull.batches[b as usize].out_first, n, SKIP_LISTED, b),
+                            None => (first, 0, inst_zero_reason(n, 0, counts), NO_CULL),
+                        };
+                    }
+                }
                 let (n, k, h) = prefilter_batch(block, block.len().min(64 * room), lod, hide, origin, &mut list.instances, why.as_mut(), &planes, &mut counts);
                 split[0] += tp.elapsed().as_nanos() as u64;
                 // Drawn instances whose bounding sphere (LOD record
@@ -3898,11 +4001,14 @@ fn render_frame(c: Capture, cache: &mut xnw_world::GeometryCache<()>, dump: Opti
                 let v = per_vp.entry(d.viewport).or_default();
                 v.0 += n;
                 v.1 += k;
-                (first, k, if k == 0 { inst_zero_reason(n, h, counts) } else { SKIP_LISTED })
+                (first, k, if k == 0 { inst_zero_reason(n, h, counts) } else { SKIP_LISTED }, NO_CULL)
             });
             if count == 0 {
                 skip[di] = why_none;
                 continue;
+            }
+            if cull_batch != NO_CULL {
+                list.cull.rows.push((list.draws.len() as u32, cull_batch));
             }
             list.draws.push(DrawRecord { geom: key, world: identity, viewport: d.viewport, effect: d.shader, albedo: Albedo::Flat(xnw_world::flat_colour(d.shader)), palette: NO_PALETTE, stage: stage_of(d), inst_first: first, inst_count: count, bone_first: 0, bone_count: 0, material: xnw_world::Material { albedo_desc: d.tex_desc, alpha_clip: d.alpha_clip, layers: d.layer_desc, stipple: xnw_world::stipple_lanes(d.stipple), state_index: [d.state[0], d.state[1], d.state[2]], ..Default::default() }, state: states.get(d), remap: xnw_world::NO_REMAP, ped: false });
             list_v1.push(v1_of(d));
@@ -3957,49 +4063,11 @@ fn render_frame(c: Capture, cache: &mut xnw_world::GeometryCache<()>, dump: Opti
         // Instanced vehicle draws (skinrules bit 8): one instance per record read at the
         // sink, the bones at the draw's palette base after the palette, reached through a
         // remap relative to the row's first bone.
-        let (mut world, mut inst_first, mut inst_count, mut remap) = (world, 0u32, 0u32, remap);
-        let (mut palette, mut bone_first, mut bone_count) = (palette, bone_first, bone_count);
+        let mut wr = WheelRow { world, palette, bone_first, bone_count, remap, inst_first: 0, inst_count: 0 };
         if let Some(w) = d.wheel.as_deref() {
-            wheel_left[0] += 1;
-            if remap != xnw_world::NO_REMAP {
-                wheel_left[1] += 1;
-            } else if w.worlds.is_empty() || (palette as usize) >= list.palettes.len() {
-                wheel_left[2] += 1;
-            }
+            place_wheel(&mut list, &mut wheel_pal, w, &mut wr, &mut wheel_left, &mut wheel_rows);
         }
-        // The wheel bones go into the wheels' own palette and the row's bones
-        // start at them (remap entry b = b), so `palette too far` (wheel_left[3])
-        // stays 0. Appended to the row's palette they lay past the 12-bit
-        // remap reach (0x1000 bones from the row's first bone): frame 2760 of a capture
-        // `palette too far 8` of 8, behind the frame's 3215 skin bones and 11
-        // vehicle index tables (352 KiB, about 7500 bones); the replay's
-        // palette holds no vehicle tables, so its wheels fit.
-        if let Some(w) = d.wheel.as_deref()
-            && remap == xnw_world::NO_REMAP
-            && !w.worlds.is_empty()
-            && (palette as usize) < list.palettes.len()
-        {
-            let p = *wheel_pal.get_or_insert_with(|| {
-                list.palette_at_draw.resize(list.palettes.len(), false);
-                list.palettes.push(Vec::new());
-                list.palette_at_draw.push(true);
-                (list.palettes.len() - 1) as u32
-            });
-            let (pal, n) = (&mut list.palettes[p as usize], skinhook::WHEEL_BONES as u32);
-            let e = (pal.len() / 12) as u32;
-            pal.extend_from_slice(&w.bones);
-            remap = pal.len() as u32;
-            pal.extend((0..n).map(f32::from_bits));
-            pal.resize(pal.len().next_multiple_of(12), 0.0);
-            (palette, bone_first, bone_count) = (p, e, n);
-            inst_first = (list.instances.len() / 12) as u32;
-            for x in &w.worlds {
-                list.instances.extend_from_slice(x);
-            }
-            inst_count = w.worlds.len() as u32;
-            world = identity;
-            wheel_rows += 1;
-        }
+        let WheelRow { world, palette, bone_first, bone_count, remap, inst_first, inst_count } = wr;
         let tex = d.diffuse.map_or(0, |(_, _, _, t)| t.at);
         let ta = Instant::now();
         let alb = (tex != 0).then(|| *albedos.entry((tex, d.effect)).or_insert_with(|| albedo(tex, d.effect)));
@@ -4161,7 +4229,7 @@ fn render_frame(c: Capture, cache: &mut xnw_world::GeometryCache<()>, dump: Opti
             let mut f = xnw_world::bridged::Frame::new(rows);
             (f.not_ready, f.unread) = (not_ready, unread);
             if frame % 60 == 0 {
-                xnw_core::info!("world render: frame {frame}: bridgeps reads: {} rows, {} KiB read from title memory since the last line", f.rows.len(), bridgeps::take_read_bytes() >> 10);
+                xnw_core::info!("{}", bridgeps::reads_line(frame, f.rows.len()));
             }
             list.bridged = Some(std::sync::Arc::new(f));
         }
@@ -4663,6 +4731,11 @@ struct Coherence {
     /// camera is a correct cull (the pass draws with the camera it tested); one
     /// under a still camera is not (FLK3 replay: only LOD-pair swaps there).
     ours_still: u32,
+    /// Of the title's drops (not hooked), those under a still main camera:
+    /// all stages, and stages 65, 70, 71 (depth prepass, G-buffer). FLK4: in 120
+    /// still-camera frames (pk7f) the title dropped no stage 65/70 draw, so a
+    /// still-camera count there is a drop the camera does not explain.
+    title_still: [u32; 2],
     /// The main camera's forward axis in the last two lists (newest first).
     fwd: [Option<[f32; 3]>; 2],
 }
@@ -4729,6 +4802,9 @@ fn coherence(list: &FrameList, skipped: HashMap<(u64, u32), u8>) {
                     if let Some(r) = k.prev_skip.get(key) {
                         *k.ours.entry(*r).or_default() += m;
                         k.ours_still += if still { m } else { 0 };
+                    } else if still {
+                        k.title_still[0] += m;
+                        k.title_still[1] += if matches!(key.1, 65 | 70 | 71) { m } else { 0 };
                     }
                 }
             }
@@ -4766,7 +4842,7 @@ fn coherence(list: &FrameList, skipped: HashMap<(u64, u32), u8>) {
                 v.iter().take(4).map(|((s, i), n)| format!("stage {s}{} {n}", if *i { " instanced" } else { "" })).collect::<Vec<_>>().join(", ")
             },
             k.there_once,
-            ours_line(k.missing_back, &k.ours, k.ours_still, late)
+            ours_line(k.missing_back, &k.ours, k.ours_still, k.title_still, late)
         );
         *k = Coherence { prev: k.prev.take(), prev2: k.prev2.take(), prev_skip: std::mem::take(&mut k.prev_skip), fwd: k.fwd, start: Some(Instant::now()), ..Default::default() };
     }
@@ -4775,13 +4851,14 @@ fn coherence(list: &FrameList, skipped: HashMap<(u64, u32), u8>) {
 /// The coherence line's tail: of the missing-then-back draws, those
 /// hooked that frame but given no row by us (per reason), those the title
 /// never hooked; and the draws recorded after their frame's cut (dropped).
-/// `still`: of ours, those under a still main camera.
-fn ours_line(missing: u32, ours: &HashMap<u8, u32>, still: u32, late: [u64; 2]) -> String {
+/// `still`: of ours, those under a still main camera; `title_still`: of the
+/// title's, those under a still main camera (all stages, stages 65/70/71).
+fn ours_line(missing: u32, ours: &HashMap<u8, u32>, still: u32, title_still: [u32; 2], late: [u64; 2]) -> String {
     let n: u32 = ours.values().sum();
     let mut v: Vec<_> = ours.iter().collect();
     v.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
     let why = v.iter().take(4).map(|(r, c)| format!("{} {c}", SKIP_NAMES.get(**r as usize).unwrap_or(&"?"))).collect::<Vec<_>>().join(", ");
-    format!("missing-then-back hooked but not listed {n} ({why}; camera still {still}), not hooked {}; late draws {} in {} captures (recorded after their frame's cut)", missing.saturating_sub(n), late[0], late[1])
+    format!("missing-then-back hooked but not listed {n} ({why}; camera still {still}), not hooked {} (camera still {}, at stages 65/70/71 {}); late draws {} in {} captures (recorded after their frame's cut)", missing.saturating_sub(n), title_still[0], title_still[1], late[0], late[1])
 }
 
 /// Whether this frame's list is dumped.
@@ -4830,7 +4907,7 @@ fn dump_list(dir: &std::path::Path, list: &FrameList) -> std::io::Result<()> {
     std::fs::write(fdir.join("list.tsv"), out)?;
     let mut cams = String::from("# live frame list cameras (view, projection)\n");
     for c in &list.cameras {
-        let _ = writeln!(cams, "viewport {:#x} draws {}\n  view {}\n  proj {}", c.viewport, list.draws.iter().filter(|d| d.viewport == c.viewport).count(), matrix_text(&c.view), matrix_text(&c.proj));
+        let _ = writeln!(cams, "viewport {:#x} draws {}\n  view {}\n  proj {}", c.viewport, list.draws.iter().filter(|d| d.viewport == c.viewport).count(), matrix_exact(&c.view), matrix_exact(&c.proj));
     }
     std::fs::write(fdir.join("camera.txt"), cams)?;
     for (i, p) in list.palettes.iter().enumerate() {
@@ -4892,7 +4969,7 @@ pub unsafe fn start(base: usize) {
         }
     };
     crate::worldtex::set_globals(base);
-    let (cfg_cut_present, cfg_scan_exit) = (cfg.cut_present, cfg.scan_exit);
+    let (cfg_cut_present, cfg_scan_exit, cfg_hookin) = (cfg.cut_present, cfg.scan_exit, cfg.hookin);
     // The residency and scene-event hooks in every recording mode (capture
     // too: place.tsv / cine.tsv); geometry bytes are offered only to a screen pass.
     let (install, offer) = crate::worldahead::modes(render.as_deref());
@@ -4919,27 +4996,14 @@ pub unsafe fn start(base: usize) {
             pack::set_arena(real(base, ARENA_BASE));
             pack::set_imposter_types(real(base, 0x1_4767_65A8));
             pack::set_preskin_lists(real(base, 0x1478A9A50));
+            pack::set_lights(real(base, 0x1_487B_AF40), real(base, 0x1_48FD_C4D0), real(base, 0x1_488C_D81C));
+            pack::set_hookin(cfg_hookin, real(base, MATRIX_SLOT), real(base, MATRIX_CACHE), real(base, PAL_BASE));
             pack::enable();
         } else {
             xnw_core::warn!("world probe: pack=2 writes seq frames only (add seq=...); pack off");
         }
     }
-    if preskin::on() {
-        preskin::install();
-        SINK_PRESKIN.store(true, Ordering::Relaxed);
-        xnw_core::info!("world render: pre-skin: PreSkinD draws joined by their own record (+0x54 at T9 slot 0, read at the list sink)");
-    }
-    if skinhook::rules() & skinhook::VEH_INST != 0 && cfg.render {
-        SINK_WHEELS.store(true, Ordering::Relaxed);
-        xnw_core::info!("world render: vehicle wheels: instanced wheel and tyre draws read at the list sink (skinrules bit 8)");
-    }
-    if bridgeps::on() && cfg.render {
-        SINK_BRIDGE.store(true, Ordering::Relaxed);
-        xnw_core::info!("world render: bridgeps: draws of pixel programs {:08x?} read at the list sink for the title's own programs in our pass", bridgeps::wanted());
-    }
-    if SINK_PRESKIN.load(Ordering::Relaxed) || SINK_WHEELS.load(Ordering::Relaxed) || SINK_BRIDGE.load(Ordering::Relaxed) {
-        xnw_gpu::d3d12x::tap::set_draw_tap(Some((sink_want, on_sink)));
-    }
+    install_sinks(cfg.render);
     // The imposter reads need the arena and the type table (the pack sets
     // them too; they are addresses only).
     if imposter::on() {
@@ -5460,6 +5524,14 @@ mod tests {
         assert!(!in_frustum(&t, &tr, [0.0; 3], &planes), "beside");
     }
 
+    /// camera.txt's matrices read back bit for bit (the replay's frustum is the live one).
+    #[test]
+    fn camera_text_reads_back_exactly() {
+        let m: [f32; 16] = [-0.645_281_3, 0.220_694_8, -0.731_372_1, 0.0, 1e-7, 3.333_333_3, -0.001_471_2, 1.0, 1291.436_2, -380.879_18, 1251.059_6, 1.0, 0.15, -1.0, 2.5e-9, 0.0];
+        let back: Vec<f32> = matrix_exact(&m).replace('|', " ").split_whitespace().map(|x| x.parse().unwrap()).collect();
+        assert_eq!(back.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), m.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+    }
+
     /// A header without a stream table (word 0 = 0, or a zero
     /// scale) is not ready; Q24 and float3 headers are.
     /// An outcome row is WHY_ROW bytes with its fields where
@@ -5709,7 +5781,7 @@ mod tests {
 
     fn test_state(dir: &std::path::Path, seq: bool) -> State {
         let (tx, _rx) = mpsc::channel::<Capture>();
-        let cfg = Config { dir: dir.to_path_buf(), frames: 3, max: 100_000, at: Vec::new(), raw: 1, render: false, seq, skinlog: 0, census: false, auto: None, auto_veh: 0, cut_present: false, pack: false, scan_exit: false };
+        let cfg = Config { dir: dir.to_path_buf(), frames: 3, max: 100_000, at: Vec::new(), raw: 1, render: false, seq, skinlog: 0, census: false, auto: None, auto_veh: 0, cut_present: false, pack: false, scan_exit: false, hookin: false };
         State { cfg, title: 0, tls_index: 0, g: Globals::default(), base: AtomicU64::new(0), wait_world: false, done: AtomicBool::new(false), pending: AtomicU64::new(u64::MAX), slots: Mutex::new(Vec::new()), sent: AtomicU64::new(u64::MAX), late: [AtomicU64::new(0), AtomicU64::new(0)], tx: Mutex::new(tx) }
     }
 
@@ -5787,7 +5859,8 @@ mod tests {
             assert_eq!((k.missing_back, k.gaps), (1, 1));
             assert_eq!(k.ours.get(&SKIP_INST_FRUSTUM), Some(&1), "the drop is ours");
             assert_eq!(k.ours_still, 1, "the camera only moved: still");
-            assert_eq!(ours_line(3, &k.ours, k.ours_still, [5, 2]), "missing-then-back hooked but not listed 1 (inst_frustum 1; camera still 1), not hooked 2; late draws 5 in 2 captures (recorded after their frame's cut)");
+            assert_eq!(k.title_still, [0, 0], "no title drop yet");
+            assert_eq!(ours_line(3, &k.ours, k.ours_still, [2, 1], [5, 2]), "missing-then-back hooked but not listed 1 (inst_frustum 1; camera still 1), not hooked 2 (camera still 2, at stages 65/70/71 1); late draws 5 in 2 captures (recorded after their frame's cut)");
         }
         // The same drop while the camera turns 10 degrees a list is not under a still camera.
         let turned = |frame: u64, deg: f32, with_b: bool| {
@@ -5803,9 +5876,21 @@ mod tests {
         coherence(&turned(20, 0.0, true), HashMap::new());
         coherence(&turned(21, 10.0, false), HashMap::from([((2, 67), SKIP_INST_FRUSTUM)]));
         coherence(&turned(22, 20.0, true), HashMap::new());
+        {
+            let g = COHERENCE.lock().unwrap();
+            let k = g.as_ref().unwrap();
+            assert_eq!((k.ours.get(&SKIP_INST_FRUSTUM), k.ours_still), (Some(&1), 0), "a turning camera's drop");
+        }
+        // The title's drop (not hooked): counted under a still camera, by stage.
+        if let Ok(mut g) = COHERENCE.lock() {
+            *g = None;
+        }
+        coherence(&list(30, 0.0, true), HashMap::new());
+        coherence(&list(31, 0.5, false), HashMap::new());
+        coherence(&list(32, 1.0, true), HashMap::new());
         let g = COHERENCE.lock().unwrap();
         let k = g.as_ref().unwrap();
-        assert_eq!((k.ours.get(&SKIP_INST_FRUSTUM), k.ours_still), (Some(&1), 0), "a turning camera's drop");
+        assert_eq!((k.ours.len(), k.title_still), (0, [1, 0]), "a stage-67 title drop under a still camera");
     }
 
     /// Drain cut: draws of title frame 10 recorded on three threads (one of them

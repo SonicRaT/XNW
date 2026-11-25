@@ -319,7 +319,7 @@ pub fn warm(s: &Settings) -> Result<Outcome, String> {
     }
     // With the library file's length: a run that stored pipelines (or a
     // driver that refused the library) changes it.
-    let library_len = || std::fs::metadata(dir.join("pipelines").join("host-pipelines.bin")).map_or(0, |m| m.len());
+    let library_len = || std::fs::metadata(library::library_file(&dir.join("pipelines"))).map_or(0, |m| m.len());
     let stamp = || format!("{:032x}", stamp_of(&texts, library_len()));
     let stamp_file = dir.join("pipelines").join(STAMP_FILE);
 

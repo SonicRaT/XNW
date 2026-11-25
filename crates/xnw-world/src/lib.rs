@@ -45,6 +45,8 @@ pub mod preskin;
 pub mod imposter;
 /// One captured draw through the title's own mesh and pixel program.
 pub mod bridge;
+/// One compute runner for captured title dispatches over buffers and textures, results kept by title address.
+pub mod compute;
 /// The title's pixel programs per row in our pass, live and replayed.
 pub mod bridged;
 /// The title's mesh programs in our pass (`bridgems`).
@@ -53,6 +55,10 @@ pub mod bridge_ms;
 pub mod preskin_gpu;
 /// Strand hair: the title's strand draws as data, the strand vertex rule.
 pub mod hair;
+/// The instance cull on the device (`gpucull=on`): per-instance frustum and LOD, indirect draws.
+pub mod gpucull;
+/// `gbuf=on`: the title's G-buffer layout beside our picture (LIT2).
+pub mod gbuf;
 
 pub type Mat = [f32; 16];
 
@@ -503,6 +509,9 @@ pub struct FrameList {
     pub imposters: Option<std::sync::Arc<imposter::Imposters>>,
     /// Rows drawn again by the title's own pixel programs (`bridgeps`; None: off).
     pub bridged: Option<std::sync::Arc<bridged::Frame>>,
+    /// Instanced rows culled on the device (`gpucull=on`; empty: none): their
+    /// `inst_first`/`inst_count` index the cull's output, not `instances`.
+    pub cull: gpucull::CullFrame,
 }
 
 /// An instance record (64 B: rows 0..2 of a row-major 3x4, translation
@@ -723,6 +732,10 @@ pub struct HostGeometry {
     pub vertices: Vec<f32>,
     pub indices: Vec<u32>,
     pub raw_vb: Option<Vec<u8>>,
+    /// `XNW_ZEROCOPY` (ZC2): the raw vertex buffer's bytes left in title
+    /// memory at the key's `vb_at` (`raw_vb` then holds only its header):
+    /// the pass binds them in place. 0: all in `raw_vb`.
+    pub vb_place: u64,
 }
 
 
@@ -782,10 +795,12 @@ ByteAddressBuffer pal : register(t1);
 ByteAddressBuffer inst : register(t2);
 Texture2D albedoTex[1024] : register(t3); // TEX_SLOTS (test `albedo_table_matches_tex_slots`)
 SamplerState wrapAniso : register(s0);
-float3 il(uint i, uint k) { uint a = (i * 12 + k) * 4; return a + 12 <= instBytes && a < 0x7FFFFFF0 ? asfloat(inst.Load3(a)) : float3(0, 0, 0); }
-uint ld(uint a) { return a + 4 <= vbBytes && a < 0x7FFFFFF0 ? vb.Load(a) : 0; }
-float4 pl(uint i) { uint a = i * 16; return a + 16 <= palBytes && a < 0x7FFFFFF0 ? asfloat(pal.Load4(a)) : float4(0, 0, 0, 0); }
-uint pu(uint i) { uint a = i * 4; return a + 4 <= palBytes && a < 0x7FFFFFF0 ? pal.Load(a) : 0; }
+// `?:` runs both sides: the condition picks the address (0 is inside every
+// view), then the value; a load past a view is never issued (GBV id 1005, HANG1).
+float3 il(uint i, uint k) { uint a = (i * 12 + k) * 4; bool ok = a + 12 <= instBytes && a < 0x7FFFFFF0; float3 v = asfloat(inst.Load3(ok ? a : 0)); return ok ? v : float3(0, 0, 0); }
+uint ld(uint a) { bool ok = a + 4 <= vbBytes && a < 0x7FFFFFF0; uint v = vb.Load(ok ? a : 0); return ok ? v : 0; }
+float4 pl(uint i) { uint a = i * 16; bool ok = a + 16 <= palBytes && a < 0x7FFFFFF0; float4 v = asfloat(pal.Load4(ok ? a : 0)); return ok ? v : float4(0, 0, 0, 0); }
+uint pu(uint i) { uint a = i * 4; bool ok = a + 4 <= palBytes && a < 0x7FFFFFF0; uint v = pal.Load(ok ? a : 0); return ok ? v : 0; }
 uint at(uint w, uint v) { return ((w >> 3) & 0x3C) * v + ((w >> 7) & 0x1FFFFFC); }
 float3 position(uint v) {
     uint w = ld(0), a = at(w, v);
@@ -891,6 +906,23 @@ VsOut vs_rec(uint id : SV_VertexID) {
     o.col = float4(0, 0, 0, 0);
     return o;
 }
+#ifdef GBUF
+// `gbuf=on` (gbuf.rs): the title's G-buffer beside the picture. shade() leaves
+// its albedo (linear) and unit normal here.
+static float3 gbBase = 0;
+static float3 gbN = float3(0, 0, 1);
+// The title's RT1 (PS_DeferredTextured ff2c46ab 0x1d0..0x2ec): octahedral normal,
+// 12 + 12 bits, word = y' << 12 | x', as (0, byte 0, byte 1, byte 2) / 255.
+float4 gbufNormal(float3 n) {
+    float s = max(abs(n.x) + abs(n.y) + abs(n.z), 1e-6);
+    float f = saturate(-n.z / s);
+    float2 p = n.xy / s;
+    p += float2(p.x >= 0 ? f : -f, p.y >= 0 ? f : -f);
+    uint2 q = min(uint2(p * 2047.5 + 2047.5), 4095);
+    uint w = (q.y << 12) | q.x;
+    return float4(0, w & 255, (w >> 8) & 255, (w >> 16) & 255) / 255.0;
+}
+#endif
 float4 shade(VsOut i) {
     if (flags & 1) return float4(0.95, 0.95, 0.9, 1);
     // ID mode (world-render --pick): the draw's index + 1 as the colour.
@@ -932,6 +964,11 @@ float4 shade(VsOut i) {
         base = acc;
     }
     float3 n = normalize(i.normal + 1e-6);
+#ifdef GBUF
+    // Linear albedo: the old path re-encoded an sRGB view's value (undone here).
+    gbBase = (!chain && texIndex != 0 && (matFlags & 2) != 0) ? pow(saturate(base), 2.2) : base;
+    gbN = n;
+#endif
 #ifdef LAB_VIEW
     // The lab's view modes (xnw-lab prepends the define). Geometry first:
     // 1 shaded by normal, no textures; 2 bones per draw (grey: none; hue by count);
@@ -960,8 +997,14 @@ float4 shade(VsOut i) {
 }
 // One return in the entry: the newer WARP (1.0.22) removes the device
 // (no layer message) on a pixel shader that returns inside a branch.
+#ifdef GBUF
+struct GbufOut { float4 c : SV_Target0; float4 albedo : SV_Target1; float4 normal : SV_Target2; };
+[RootSignature(RS)]
+GbufOut ps(VsOut i) { GbufOut o; o.c = shade(i); o.albedo = float4(gbBase, 0); o.normal = gbufNormal(gbN); return o; }
+#else
 [RootSignature(RS)]
 float4 ps(VsOut i) : SV_Target { return shade(i); }
+#endif
 "#;
 
 /// A geometry on the device: vertex and index buffers (upload heap, read in
@@ -979,6 +1022,8 @@ pub struct GpuGeometry {
     raw: Option<(u32, u32)>,
     /// The largest index + 1 (a pre-skin item must have that many vertices).
     top: u32,
+    /// Its vertex buffer read in place (ZC2): its entry in `Pass::zc_geoms`.
+    in_place: Option<(u64, u64, u64)>,
 }
 
 /// Device pages (default heap, 64 MiB; a larger geometry gets a page
@@ -1138,10 +1183,20 @@ fn filtered_count(main: usize, kept: usize) -> usize {
 pub struct PassStats {
     /// Geometry copies skipped (outside the page or the staging).
     pub copies_refused: usize,
+    /// `XNW_ZEROCOPY` (ZC2): geometries read in place, and those dropped
+    /// this frame because their window went or the title remapped their
+    /// pages (read again).
+    pub in_place_geoms: usize,
+    pub in_place_dropped: usize,
     /// Rows drawn from the title's mesh programs (`bridgems`); of them with the title's pixel program.
     pub bridged: usize,
     pub bridged_title_ps: usize,
     pub draws: usize,
+    /// Submissions of the frame (1, more with `chunk`), the longest fence
+    /// wait of one and the longest timestamped GPU time of one (ms).
+    pub submits: u32,
+    pub submit_wait_ms: f64,
+    pub submit_gpu_ms: f64,
     pub triangles: u64,
     pub skipped: usize,
     pub skinned: usize,
@@ -1221,6 +1276,8 @@ pub const LAYER_DEBUG_STAGES: [u32; 2] = [71, 75];
 /// Stage 65 is the depth prepass (depth only): its draws repeat the
 /// opaque G-buffer stages, so the default view leaves them out.
 pub const PREPASS_STAGES: [u32; 1] = [65];
+/// Submissions per frame that carry a pair of timestamps (`chunk` can make more; those go untimed).
+const STAMP_PAIRS: u32 = 256;
 /// Instances drawn per draw at most.
 pub const MAX_INSTANCES: u32 = 65_536;
 /// Largest index count drawn per geometry (clamp) and vertex buffer taken.
@@ -1242,6 +1299,9 @@ pub struct Pass {
     heap_step: u32,
     next_slot: u32,
     free_slots: Vec<u32>,
+    /// Geometries whose vertex buffer is read in place (ZC2), by title
+    /// address (then mesh address and hash): bytes, GPU address of the view, key.
+    zc_geoms: std::collections::BTreeMap<(u64, u64, u64), (u64, u64, GeomKey)>,
     palettes: [Option<(ID3D12Resource, *mut u8, usize)>; 2],
     /// Per-frame instance buffers (heap slots 2 and 3), alternating.
     instances: [Option<(ID3D12Resource, *mut u8, usize)>; 2],
@@ -1268,6 +1328,12 @@ pub struct Pass {
     list: ID3D12GraphicsCommandList,
     fence: ID3D12Fence,
     fence_value: u64,
+    /// Draws per submission (`--chunk N`; 0: the frame in one list):
+    /// the list is closed, sent and waited for every N draws, so no single
+    /// submission can run near the driver's 2 s timeout on the card.
+    pub chunk: u32,
+    /// A pair of timestamps per submission (query heap, readback), made at the first frame.
+    stamps: Option<(ID3D12QueryHeap, ID3D12Resource)>,
     pub width: u32,
     pub height: u32,
     pub cache: GeometryCache<GpuGeometry>,
@@ -1302,6 +1368,8 @@ pub struct Pass {
     pub states: bool,
     state_psos: HashMap<RenderState, ID3D12PipelineState>,
     raw_shaders: (ID3DBlob, ID3DBlob),
+    /// `gbuf=on`: the raw pixel entry compiled without `GBUF` (dual-source states).
+    raw_plain_ps: Option<ID3DBlob>,
     /// Per-frame budgets (screen: bounded so a camera cut cannot
     /// stall a frame; offline: unbounded): upload bytes, new state pipelines.
     /// Geometries over the budget wait in `pending` (drawn from a later frame).
@@ -1345,6 +1413,12 @@ pub struct Pass {
     /// list uses (to the fence) and the grey stand-in texture.
     pub bridge_on: bool,
     pub bridge_stats: bridged::Stats,
+    /// The bridged rows' textures are asked for although the rows are not
+    /// drawn (`bridge_on` off): the replay's first frame warms them, so the
+    /// watched frame with the rows reads no texels.
+    pub bridge_warm: bool,
+    /// The bridged rows' device objects (heaps, kept inputs, uploads), kept across frames.
+    pub bridge_gpu: bridged::Gpu,
     bridge_keep: Vec<windows::core::IUnknown>,
     bridge_grey: Option<ID3D12Resource>,
     /// The words buffer (upload memory, mapped): the frame table's slot 86 for the bridged rows.
@@ -1362,8 +1436,12 @@ pub struct Pass {
     /// The raw shader's source (`vs_rec` is compiled from it on demand),
     /// its record-drawing pipeline and the heap slot of the record ring.
     raw_source: String,
+    /// `gbuf=on`: the title's G-buffer targets beside the colour target.
+    gbuf: Option<gbuf::Targets>,
     rec_pso: Option<ID3D12PipelineState>,
     rec_slot: Option<u32>,
+    /// The instance cull on the device (made at its first batch).
+    pub cull: gpucull::GpuCull,
 }
 
 /// Screen-mode budgets per frame.
@@ -1459,6 +1537,7 @@ fn pipeline_with(device: &ID3D12Device, root: &ID3D12RootSignature, vs: &ID3DBlo
     };
     desc.RTVFormats[0] = COLOUR;
     desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+    gbuf::layout(&mut desc, blob_bytes(ps));
     // SAFETY: the description and what it points at outlive the call.
     let pso = unsafe { device.CreateGraphicsPipelineState::<ID3D12PipelineState>(&desc) };
     drop(ManuallyDrop::into_inner(desc.pRootSignature));
@@ -1467,8 +1546,10 @@ fn pipeline_with(device: &ID3D12Device, root: &ID3D12RootSignature, vs: &ID3DBlo
 
 /// The raw-path pipeline for a title render state. Values outside
 /// the D3D12 enum ranges fall back to ours (depth GREATER with write, no blend).
-fn pipeline_state(device: &ID3D12Device, root: &ID3D12RootSignature, vs: &ID3DBlob, ps: &ID3DBlob, s: &RenderState) -> Result<ID3D12PipelineState> {
-    pipeline_state_with(device, root, vs, ps, s, &[])
+/// `plain`: with `gbuf=on`, the pixel entry without the G-buffer outputs,
+/// for states that blend with source 1 ([`gbuf::pixel_for`]).
+fn pipeline_state(device: &ID3D12Device, root: &ID3D12RootSignature, vs: &ID3DBlob, ps: &ID3DBlob, plain: Option<&ID3DBlob>, s: &RenderState) -> Result<ID3D12PipelineState> {
+    pipeline_state_with(device, root, vs, gbuf::pixel_for(ps, plain, &s.blend), s, &[])
 }
 
 /// [`pipeline_state`] with an input layout (empty: none).
@@ -1513,6 +1594,7 @@ fn pipeline_state_with(device: &ID3D12Device, root: &ID3D12RootSignature, vs: &I
         (rt.SrcBlend, rt.DestBlend, rt.BlendOp) = (D3D12_BLEND(i32::from(b[1])), D3D12_BLEND(i32::from(b[2])), D3D12_BLEND_OP(i32::from(b[3])));
         (rt.SrcBlendAlpha, rt.DestBlendAlpha, rt.BlendOpAlpha) = (D3D12_BLEND(i32::from(b[4])), D3D12_BLEND(i32::from(b[5])), D3D12_BLEND_OP(i32::from(b[6])));
     }
+    gbuf::layout(&mut desc, blob_bytes(ps));
     // SAFETY: the description and what it points at outlive the call.
     let pso = unsafe { device.CreateGraphicsPipelineState::<ID3D12PipelineState>(&desc) };
     drop(ManuallyDrop::into_inner(desc.pRootSignature));
@@ -1550,6 +1632,8 @@ impl Pass {
     /// waits for its own work).
     pub fn set_raw_shader(&mut self, source: &str) -> std::result::Result<(), String> {
         let e = |e: windows::core::Error| e.to_string();
+        let plain = if gbuf::on() { Some(compile_source(source, c"ps", c"ps_5_1")?) } else { None };
+        let source = &gbuf::source(source);
         let (vs, ps) = (compile_source(source, c"vs", c"vs_5_1")?, compile_source(source, c"ps", c"ps_5_1")?);
         // SAFETY: object creation from blobs that outlive each call.
         let (root, raw, wire, decal) = unsafe {
@@ -1559,8 +1643,8 @@ impl Pass {
             let decal = pipeline_with(&self.device, &root, &vs, &ps, &[], false, true).map_err(e)?;
             (root, raw, wire, decal)
         };
-        (self.raw_root, self.raw_pso, self.wire_pso, self.decal_pso, self.raw_shaders) = (root, raw, wire, decal, (vs, ps));
-        (self.raw_source, self.rec_pso) = (source.to_string(), None);
+        (self.raw_root, self.raw_pso, self.wire_pso, self.decal_pso, self.raw_shaders, self.raw_plain_ps) = (root, raw, wire, decal, (vs, ps), plain);
+        (self.raw_source, self.rec_pso) = (source.clone(), None);
         self.state_psos.clear();
         self.pso_jobs = None;
         self.pso_asked.clear();
@@ -1572,8 +1656,12 @@ impl Pass {
     /// The pass on `host`'s device: pipelines, `width` x `height` targets.
     pub fn new(host: &xnw_gpu::host::Host, width: u32, height: u32) -> std::result::Result<Pass, String> {
         let e = |e: windows::core::Error| e.to_string();
+        // `gbuf=on`: before any pipeline is made (they read it).
+        gbuf::set(gbuf::parse_switch(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default()));
+        let raw_source = gbuf::source(RAW_SHADER);
         let (vs, ps) = (compile(c"vs", c"vs_5_1")?, compile(c"ps", c"ps_5_1")?);
-        let (rvs, rps) = (compile_source(RAW_SHADER, c"vs", c"vs_5_1")?, compile_source(RAW_SHADER, c"ps", c"ps_5_1")?);
+        let (rvs, rps) = (compile_source(&raw_source, c"vs", c"vs_5_1")?, compile_source(&raw_source, c"ps", c"ps_5_1")?);
+        let raw_plain_ps = if gbuf::on() { Some(compile_source(RAW_SHADER, c"ps", c"ps_5_1")?) } else { None };
         let device = host.device.clone();
         // SAFETY: object creation with descriptions that outlive each call.
         unsafe {
@@ -1591,7 +1679,7 @@ impl Pass {
             // The sky: no depth test or write (drawn first, behind everything).
             let (svs, sps) = (compile_source(SKY_SHADER, c"vs", c"vs_5_1")?, compile_source(SKY_SHADER, c"ps", c"ps_5_1")?);
             let sky_root: ID3D12RootSignature = device.CreateRootSignature(0, blob_bytes(&svs)).map_err(e)?;
-            let sky_pso = pipeline_state(&device, &sky_root, &svs, &sps, &RenderState::default()).map_err(e)?;
+            let sky_pso = pipeline_state(&device, &sky_root, &svs, &sps, None, &RenderState::default()).map_err(e)?;
             // Water: depth test GREATER (reverse Z) without write, straight alpha.
             let (wvs, wps) = (compile_source(WATER_SHADER, c"vs", c"vs_5_1")?, compile_source(WATER_SHADER, c"ps", c"ps_5_1")?);
             let water_root: ID3D12RootSignature = device.CreateRootSignature(0, blob_bytes(&wvs)).map_err(e)?;
@@ -1609,10 +1697,25 @@ impl Pass {
             let colour = texture(COLOUR, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_CLEAR_VALUE { Format: COLOUR, Anonymous: D3D12_CLEAR_VALUE_0 { Color: [0.09, 0.09, 0.1, 1.0] } }).map_err(e)?;
             let shown = texture(COLOUR, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_CLEAR_VALUE { Format: COLOUR, Anonymous: D3D12_CLEAR_VALUE_0 { Color: [0.09, 0.09, 0.1, 1.0] } }).map_err(e)?;
             let depth = texture(DEPTH, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_CLEAR_VALUE { Format: DEPTH, Anonymous: D3D12_CLEAR_VALUE_0 { DepthStencil: D3D12_DEPTH_STENCIL_VALUE { Depth: 0.0, Stencil: 0 } } }).map_err(e)?;
-            let small = |kind| device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC { Type: kind, NumDescriptors: 1, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE, NodeMask: 0 });
-            let rtv = small(D3D12_DESCRIPTOR_HEAP_TYPE_RTV).map_err(e)?;
-            let dsv = small(D3D12_DESCRIPTOR_HEAP_TYPE_DSV).map_err(e)?;
+            let small = |kind, n| device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC { Type: kind, NumDescriptors: n, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE, NodeMask: 0 });
+            let rtv = small(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 3).map_err(e)?;
+            let dsv = small(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1).map_err(e)?;
             device.CreateRenderTargetView(&colour, None, rtv.GetCPUDescriptorHandleForHeapStart());
+            // `gbuf=on`: the title's RT0 and RT1 at RTV slots 1 and 2.
+            let gbuf_targets = if gbuf::on() {
+                let rstep = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV) as usize;
+                let black = |f: DXGI_FORMAT| D3D12_CLEAR_VALUE { Format: f, Anonymous: D3D12_CLEAR_VALUE_0 { Color: [0.0; 4] } };
+                let t = gbuf::Targets {
+                    albedo: texture(gbuf::ALBEDO, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, black(gbuf::ALBEDO)).map_err(e)?,
+                    normal: texture(gbuf::NORMAL, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, black(gbuf::NORMAL)).map_err(e)?,
+                };
+                let at = |k: usize| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: rtv.GetCPUDescriptorHandleForHeapStart().ptr + k * rstep };
+                device.CreateRenderTargetView(&t.albedo, None, at(1));
+                device.CreateRenderTargetView(&t.normal, None, at(2));
+                Some(t)
+            } else {
+                None
+            };
             device.CreateDepthStencilView(&depth, None, dsv.GetCPUDescriptorHandleForHeapStart());
             let readback = host.buffer(u64::from(width) * 4 * u64::from(height), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST).map_err(e)?;
             let alloc: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
@@ -1633,6 +1736,7 @@ impl Pass {
                 heap_step,
                 next_slot: 4,
                 free_slots: Vec::new(),
+                zc_geoms: Default::default(),
                 palettes: [None, None],
                 instances: [None, None],
                 light_cb: [None, None],
@@ -1651,6 +1755,8 @@ impl Pass {
                 list,
                 fence,
                 fence_value: 0,
+                chunk: 0,
+                stamps: None,
                 width,
                 height,
                 cache: GeometryCache::default(),
@@ -1669,6 +1775,7 @@ impl Pass {
                 states: true,
                 state_psos: HashMap::new(),
                 raw_shaders: (rvs, rps),
+                raw_plain_ps,
                 pso_budget: usize::MAX,
                 pso_async: false,
                 pso_jobs: None,
@@ -1692,6 +1799,8 @@ impl Pass {
                 imposters,
                 bridge_on: false,
                 bridge_stats: bridged::Stats::default(),
+                bridge_warm: false,
+                bridge_gpu: bridged::Gpu::default(),
                 bridge_keep: Vec::new(),
                 bridge_grey: None,
                 bridge_words: None,
@@ -1699,11 +1808,18 @@ impl Pass {
                 cuts: cuts::CutWatch::new(false),
                 preskin: preskin_gpu::GpuPreskin::default(),
                 bridge_ms: None,
-                raw_source: RAW_SHADER.to_string(),
+                raw_source,
                 rec_pso: None,
+                gbuf: gbuf_targets,
                 rec_slot: None,
+                cull: gpucull::GpuCull::default(),
             })
         }
+    }
+
+    /// The pass's device (offline checks run beside it).
+    pub fn device(&self) -> &ID3D12Device {
+        &self.device
     }
 
     /// The colour target (render-target state between draws).
@@ -1797,12 +1913,12 @@ impl Pass {
         if self.pso_jobs.is_none() {
             let (ask_tx, ask_rx) = std::sync::mpsc::channel::<RenderState>();
             let (done_tx, done_rx) = std::sync::mpsc::channel();
-            let parts = SendBox((self.device.clone(), self.raw_root.clone(), self.raw_shaders.0.clone(), self.raw_shaders.1.clone()));
+            let parts = SendBox((self.device.clone(), self.raw_root.clone(), self.raw_shaders.0.clone(), self.raw_shaders.1.clone(), self.raw_plain_ps.clone()));
             std::thread::spawn(move || {
-                let SendBox((device, root, vs, ps)) = parts;
+                let SendBox((device, root, vs, ps, plain)) = parts;
                 for s in ask_rx {
                     let t0 = std::time::Instant::now();
-                    let p = pipeline_state(&device, &root, &vs, &ps, &s).map_err(|e| xnw_core::warn!("world render: state pipeline {s:?} failed: {e}")).ok();
+                    let p = pipeline_state(&device, &root, &vs, &ps, plain.as_ref(), &s).map_err(|e| xnw_core::warn!("world render: state pipeline {s:?} failed: {e}")).ok();
                     if done_tx.send(SendBox((s, p, t0.elapsed().as_secs_f64() * 1e3))).is_err() {
                         break;
                     }
@@ -1828,19 +1944,101 @@ impl Pass {
         }
     }
 
+    /// `XNW_ZEROCOPY` (ZC2): geometries whose in-place vertex buffer lies in
+    /// a window heap released since the last frame, or in title pages
+    /// remapped since (the view reads the section's old page), are dropped
+    /// and read again. Their number.
+    fn zc_changes(&mut self) -> usize {
+        let c = xnw_gpu::shared::world_changes();
+        if self.zc_geoms.is_empty() || c.gone.is_empty() && c.remapped.is_empty() && !c.overflow {
+            return 0;
+        }
+        let mut drop: Vec<GeomKey> = Vec::new();
+        if c.overflow || !c.gone.is_empty() {
+            for &(len, gpu, key) in self.zc_geoms.values() {
+                if c.overflow || c.gone.iter().any(|&(g, n)| gpu < g + n && gpu + len > g) {
+                    drop.push(key);
+                }
+            }
+        }
+        // A geometry starts at most MAX_VB_BYTES before a remapped range it overlaps.
+        for &(a, n) in &c.remapped {
+            let from = (a.saturating_sub(MAX_VB_BYTES as u64), 0, 0);
+            for (&(at, _, _), &(len, _, key)) in self.zc_geoms.range(from..(a + n, 0, 0)) {
+                if at + len > a {
+                    drop.push(key);
+                }
+            }
+        }
+        drop.sort_unstable_by_key(|k| (k.vb_at, k.mesh_at, k.hash));
+        drop.dedup();
+        let known = geometry::known();
+        for key in &drop {
+            self.geom.drop_key(known, key);
+            if let Some(old) = self.cache.remove(key) {
+                self.release(old);
+            }
+        }
+        drop.len()
+    }
+
     /// Drops a cached geometry: its heap slot and its page range.
     fn release(&mut self, g: GpuGeometry) {
         if let Some((slot, _)) = g.raw {
             self.free_slots.push(slot);
         }
+        if let Some(k) = g.in_place {
+            self.zc_geoms.remove(&k);
+        }
         self.pages.free(g.place);
     }
 
-    fn upload(&mut self, g: &HostGeometry, clamped: &mut u64) -> Result<Option<GpuGeometry>> {
+    fn upload(&mut self, key: &GeomKey, g: &HostGeometry, clamped: &mut u64) -> Result<Option<GpuGeometry>> {
         let indices = &g.indices[..g.indices.len().min(MAX_INDICES) / 3 * 3];
         *clamped += (g.indices.len() - indices.len()) as u64;
         if let Some(raw) = &g.raw_vb {
             let raw = &raw[..raw.len().min(MAX_VB_BYTES) & !3];
+            // `XNW_ZEROCOPY` (ZC1, ZC2): the vertex buffer read in place in
+            // title memory (a raw view needs a 16-byte offset); only the
+            // indices (meshlets expanded on the CPU) go to the device. With
+            // `vb_place` the reader copied only its header: in place or not
+            // at all (asked again; the reader then copies it whole).
+            let len = if g.vb_place > 0 { g.vb_place.min(MAX_VB_BYTES as u64) & !3 } else { raw.len() as u64 };
+            let in_place = if xnw_gpu::shared::world_part(xnw_gpu::shared::WORLD_GEOM) { xnw_gpu::shared::world_range(key.vb_at, len).filter(|r| r.offset.is_multiple_of(16)) } else { None };
+            if g.vb_place > 0 && in_place.is_none() {
+                return Ok(None);
+            }
+            if let Some(r) = in_place {
+                let Some(slot) = self.free_slots.pop().or_else(|| (self.next_slot < HEAP_SLOTS - TEX_SLOTS).then(|| {
+                    self.next_slot += 1;
+                    self.next_slot - 1
+                })) else {
+                    return Ok(None);
+                };
+                let (place, ib_at) = match self.stage_buffer(&[], as_bytes(indices)) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        self.free_slots.push(slot);
+                        return Err(e);
+                    }
+                };
+                // View bounds: exactly the vertex buffer's bytes (the window
+                // holds them whole: `world_range`).
+                self.raw_view_at(&r.buffer, r.offset, len, slot);
+                // SAFETY: live buffers.
+                let (ia, gpu) = unsafe { (self.pages.buffer(place.0).GetGPUVirtualAddress() + place.1 + ib_at, r.buffer.GetGPUVirtualAddress() + r.offset) };
+                self.zc_geoms.insert((key.vb_at, key.mesh_at, key.hash), (len, gpu, *key));
+                return Ok(Some(GpuGeometry {
+                    vbv: D3D12_VERTEX_BUFFER_VIEW::default(),
+                    ibv: D3D12_INDEX_BUFFER_VIEW { BufferLocation: ia, SizeInBytes: (indices.len() * 4) as u32, Format: DXGI_FORMAT_R32_UINT },
+                    indices: indices.len() as u32,
+                    bytes: (indices.len() * 4) as u64,
+                    raw: Some((slot, len as u32)),
+                    top: indices.iter().max().map_or(0, |m| m + 1),
+                    place,
+                    in_place: Some((key.vb_at, key.mesh_at, key.hash)),
+                }));
+            }
             let Some(slot) = self.free_slots.pop().or_else(|| (self.next_slot < HEAP_SLOTS - TEX_SLOTS).then(|| {
                 self.next_slot += 1;
                 self.next_slot - 1
@@ -1866,6 +2064,7 @@ impl Pass {
                 raw: Some((slot, raw.len() as u32)),
                 top: indices.iter().max().map_or(0, |m| m + 1),
                 place,
+                in_place: None,
             }));
         }
         let (place, ib_at) = self.stage_buffer(as_bytes(&g.vertices), as_bytes(indices))?;
@@ -1883,6 +2082,7 @@ impl Pass {
             raw: None,
             top: 0,
             place,
+            in_place: None,
         }))
     }
     /// Draws `list`'s main view: the list's new geometries first, then any
@@ -1922,9 +2122,12 @@ impl Pass {
         // Every failure names its call, sizes and the frame.
         let frame = list.frame;
         let at = |what: String| move |e: windows::core::Error| format!("frame {frame}: {what}: {e}");
-        let e = |e: windows::core::Error| format!("frame {frame}: {e}");
         let cam = *list.main_camera().ok_or("no camera")?;
         let mut st = PassStats::default();
+        // `XNW_ZEROCOPY` (ZC2): no window heap is released from here to the
+        // fence; one released or remapped since the last frame is dropped first.
+        let _in_flight = xnw_gpu::shared::world_frame();
+        st.in_place_dropped = self.zc_changes();
         let t0 = std::time::Instant::now();
         let now = cuts::now_ms();
         self.cuts.camera(list.frame, &cam, now);
@@ -2042,7 +2245,7 @@ impl Pass {
                 self.release(old);
                 st.replaced += 1;
             }
-            match self.upload(&g, &mut st.clamped) {
+            match self.upload(&key, &g, &mut st.clamped) {
                 Ok(Some(gpu)) => {
                     st.uploaded_geometries += 1;
                     st.uploaded_bytes += gpu.bytes;
@@ -2058,6 +2261,7 @@ impl Pass {
             // `g` (the CPU bytes) goes here.
         }
         st.pending = self.geom.pending_count();
+        st.in_place_geoms = self.zc_geoms.len();
         st.upload_ms = tu.elapsed().as_secs_f64() * 1e3;
         let (n, b) = (st.uploaded_geometries - before.0, st.uploaded_bytes - before.1);
         if n >= 4 {
@@ -2145,10 +2349,24 @@ impl Pass {
             self.list.Reset(&self.alloc, &self.pso).map_err(at("list Reset".into()))?;
             let list_com = self.list.clone();
             let l = &list_com;
+            // One timestamp pair per submission; `chunk`: the frame in several.
+            self.stamps_ready()?;
+            let (mut sub_k, mut chunk_from, mut chunk_wait) = (0u32, 0usize, 0f64);
+            self.stamp_open(l, sub_k);
             let (rtv, dsv) = (self.rtv.GetCPUDescriptorHandleForHeapStart(), self.dsv.GetCPUDescriptorHandleForHeapStart());
             l.ClearRenderTargetView(rtv, &[0.09, 0.09, 0.1, 1.0], None);
             l.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0, 0, None);
-            l.OMSetRenderTargets(1, Some(&rtv), false, Some(&dsv));
+            // `gbuf=on`: the G-buffer targets follow the colour target (one range of three).
+            let targets = if self.gbuf.is_some() {
+                let rstep = self.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV) as usize;
+                for k in 1..3 {
+                    l.ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE { ptr: rtv.ptr + k * rstep }, &[0.0; 4], None);
+                }
+                3
+            } else {
+                1
+            };
+            l.OMSetRenderTargets(targets, Some(&rtv), true, Some(&dsv));
             l.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: self.width as f32, Height: self.height as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
             l.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: self.width as i32, bottom: self.height as i32 }]);
             l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -2186,6 +2404,8 @@ impl Pass {
                     self.raw_view(ring, bytes, slot);
                 }
             }
+            // The device cull of the instanced rows (`gpucull=on`): per list draw its argument slot.
+            let culled = self.cull_record(list, l);
             // This frame's albedo table (uploads recorded on this list first).
             let (heap_cpu, step) = (self.heap.GetCPUDescriptorHandleForHeapStart().ptr, self.heap_step as usize);
             let cpu = |slot: u32| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: heap_cpu + slot as usize * step };
@@ -2196,7 +2416,7 @@ impl Pass {
             let tex_base = self.tex.opts.frame_ms;
             self.tex.opts.frame_ms = self.cuts.tex_ms(tex_base);
             // The bridged rows' textures last (our rows' come first in the table).
-            let bridged = list.bridged.as_deref().filter(|_| self.bridge_on);
+            let bridged = list.bridged.as_deref().filter(|_| self.bridge_on || self.bridge_warm);
             self.tex.prepare(&self.device, l, &mut draws.iter().flat_map(|r| r.material.layers).chain(draws.iter().map(|r| r.material.albedo_desc)).chain(bridged.into_iter().flat_map(|f| f.rows.iter().flat_map(|r| r.1.handles()))), &cpu);
             self.tex.opts.frame_ms = tex_base;
             st.tex_ms = tt.elapsed().as_secs_f64() * 1e3;
@@ -2226,16 +2446,44 @@ impl Pass {
                 self.imposters.record(l, list, &cam);
             }
             let passes: &[bool] = if self.wire { &[false, true] } else { &[false] };
+            // `gbuf=on`: targets bound (3; 1 for transparent rows and dual-source states).
+            let (mut rts, mut gbuf_done) = (if self.gbuf.is_some() { 3u32 } else { 1 }, false);
             for &wire in passes {
                 let mut raw_bound: Option<bool> = None;
+                // Table 3 holds the cull's output (a device-culled row) rather than the frame's instances.
+                let mut inst_cull_bound = false;
+                let mut indirect: Option<u32> = None;
                 let mut bound = Bound::Raw;
                 let mut water_done = wire;
                 for r in &draws {
+                    // `chunk`: every N draws the list so far is sent and waited for; the new
+                    // list gets the frame's targets, viewport and heap again, the rest at the next draw.
+                    if self.chunk > 0 && st.draws + st.bridged >= chunk_from + self.chunk as usize {
+                        chunk_from = st.draws + st.bridged;
+                        self.stamp_close(l, sub_k);
+                        l.Close().map_err(at(format!("chunk list Close after {chunk_from} draws")))?;
+                        let (w, g) = self.send_wait(l, sub_k, "pass chunk", frame)?;
+                        (chunk_wait, st.submits, sub_k) = (chunk_wait + w, st.submits + 1, sub_k + 1);
+                        (st.submit_wait_ms, st.submit_gpu_ms) = (st.submit_wait_ms.max(w), st.submit_gpu_ms.max(g.unwrap_or(0.0)));
+                        self.alloc.Reset().map_err(at("chunk allocator Reset".into()))?;
+                        self.list.Reset(&self.alloc, &self.pso).map_err(at("chunk list Reset".into()))?;
+                        self.stamp_open(l, sub_k);
+                        let (rtv, dsv) = (self.rtv.GetCPUDescriptorHandleForHeapStart(), self.dsv.GetCPUDescriptorHandleForHeapStart());
+                        l.OMSetRenderTargets(rts, Some(&rtv), true, Some(&dsv));
+                        l.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: self.width as f32, Height: self.height as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
+                        l.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: self.width as i32, bottom: self.height as i32 }]);
+                        l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                        l.SetDescriptorHeaps(&[Some(self.heap.clone())]);
+                        raw_bound = None;
+                        inst_cull_bound = false;
+                    }
                     // Water after opaque and decals, before transparent (14).
                     if !water_done && TRANSPARENT_STAGES.contains(&r.stage) {
                         water_done = true;
                         st.water = self.record_water(list, &cam).map_err(at("water grid upload".into()))?;
                         raw_bound = None;
+                        // `gbuf=on`: transparent rows come after the title's G-buffer.
+                        gbuf_done = true;
                     }
                     // a bridged row draws from its records, not our geometry.
                     let idx = ((*r as *const DrawRecord as usize).wrapping_sub(list.draws.as_ptr() as usize) / std::mem::size_of::<DrawRecord>()) as u32;
@@ -2318,7 +2566,7 @@ impl Pass {
                         if !self.pso_async && !self.state_psos.contains_key(&s) && self.state_psos.len() < MAX_STATE_PSOS && new_psos < self.pso_budget {
                             let tp = std::time::Instant::now();
                             new_psos += 1;
-                            match pipeline_state(&self.device, &self.raw_root, &self.raw_shaders.0, &self.raw_shaders.1, &s) {
+                            match pipeline_state(&self.device, &self.raw_root, &self.raw_shaders.0, &self.raw_shaders.1, self.raw_plain_ps.as_ref(), &s) {
                                 Ok(p) => {
                                     self.state_psos.insert(s, p);
                                 }
@@ -2348,6 +2596,15 @@ impl Pass {
                         }
                         bound = want;
                     }
+                    // A dual-source state blends into one target only (bound with three, WARP drew it wrong).
+                    if self.gbuf.is_some() {
+                        let n = if gbuf_done || matches!(want, Bound::State(s) if gbuf::dual_source(&s.blend)) { 1 } else { 3 };
+                        if n != rts {
+                            let (rtv, dsv) = (self.rtv.GetCPUDescriptorHandleForHeapStart(), self.dsv.GetCPUDescriptorHandleForHeapStart());
+                            l.OMSetRenderTargets(n, Some(&rtv), true, Some(&dsv));
+                            rts = n;
+                        }
+                    }
                     l.IASetIndexBuffer(Some(&ibv));
                     match raw {
                         Some((slot, vb_bytes)) => {
@@ -2362,6 +2619,7 @@ impl Pass {
                                 bound = want;
                                 l.SetGraphicsRootDescriptorTable(2, self.gpu_slot(turn as u32));
                                 l.SetGraphicsRootDescriptorTable(3, self.gpu_slot(2 + turn as u32));
+                                inst_cull_bound = false;
                                 l.SetGraphicsRootDescriptorTable(4, tex_table);
                                 l.SetGraphicsRootConstantBufferView(5, light_va);
                                 raw_bound = Some(true);
@@ -2418,14 +2676,29 @@ impl Pass {
                             k[37] = first;
                             k[38] = count;
                             k[39] = inst_bytes;
+                            // A device-culled row reads the cull's output: its reserved run, the survivors drawn indirectly.
+                            let cull_slot = culled.as_ref().and_then(|c| c.slot_of(k[57].wrapping_sub(1)));
+                            if let (Some(c), Some(_)) = (&culled, cull_slot) {
+                                k[37] = r.inst_first;
+                                k[38] = r.inst_count.min(MAX_INSTANCES);
+                                k[39] = c.out_bytes.min(u64::from(u32::MAX)) as u32;
+                            }
+                            if cull_slot.is_some() != inst_cull_bound {
+                                inst_cull_bound = cull_slot.is_some();
+                                l.SetGraphicsRootDescriptorTable(3, match (&culled, inst_cull_bound) {
+                                    (Some(c), true) => self.gpu_slot(c.view_slot),
+                                    _ => self.gpu_slot(2 + turn as u32),
+                                });
+                            }
+                            indirect = cull_slot;
                             if let Some(s) = list.sun {
                                 for (j, v) in s.iter().enumerate() {
                                     k[40 + j] = v.to_bits();
                                 }
                             }
                             instances = count.max(1);
-                            st.instanced += usize::from(count > 0 && !wire);
-                            st.instances += u64::from(count) * u64::from(!wire);
+                            st.instanced += usize::from((count > 0 || indirect.is_some()) && !wire);
+                            st.instances += u64::from(count) * u64::from(!wire && indirect.is_none());
                             if let Some(s) = list.sky.filter(|_| self.sky) {
                                 for (j, v) in s.fog.iter().enumerate() {
                                     k[52 + j] = v.to_bits();
@@ -2452,7 +2725,10 @@ impl Pass {
                             l.IASetVertexBuffers(0, Some(&[vbv]));
                         }
                     }
-                    l.DrawIndexedInstanced(indices, instances, 0, 0, 0);
+                    match (indirect.take(), &culled) {
+                        (Some(slot), Some(c)) => l.ExecuteIndirect(&c.signature, 1, &c.args, u64::from(slot) * u64::from(gpucull::ARG_BYTES), None, 0),
+                        _ => l.DrawIndexedInstanced(indices, instances, 0, 0, 0),
+                    }
                     if !wire {
                         st.draws += 1;
                         st.triangles += u64::from(indices / 3);
@@ -2489,6 +2765,7 @@ impl Pass {
                 drop(ManuallyDrop::into_inner(src.pResource));
                 transition(l, &self.colour, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
             }
+            self.stamp_close(l, sub_k);
             l.Close().map_err(at(format!(
                 "list Close (an invalid recorded call): {} geometry copies ({} skipped), {} texture uploads this frame, {} draws, {} instances, palettes {} B, terrain {}",
                 self.copies.len(),
@@ -2499,14 +2776,10 @@ impl Pass {
                 st.palette_bytes,
                 self.terrain.opts.on
             )))?;
-            st.record_ms = t0.elapsed().as_secs_f64() * 1e3;
-            let t1 = std::time::Instant::now();
-            self.queue.ExecuteCommandLists(&[Some(l.cast().map_err(e)?)]);
-            self.fence_value += 1;
-            self.queue.Signal(&self.fence, self.fence_value).map_err(at("queue Signal".into()))?;
-            let event: HANDLE = CreateEventW(None, false, false, None).map_err(at("CreateEvent".into()))?;
-            self.fence.SetEventOnCompletion(self.fence_value, event).map_err(at("SetEventOnCompletion".into()))?;
-            WaitForSingleObject(event, INFINITE);
+            st.record_ms = t0.elapsed().as_secs_f64() * 1e3 - chunk_wait;
+            let (w, g) = self.send_wait(l, sub_k, "pass", frame)?;
+            st.submits += 1;
+            (st.submit_wait_ms, st.submit_gpu_ms) = (st.submit_wait_ms.max(w), st.submit_gpu_ms.max(g.unwrap_or(0.0)));
             // The copies ran: the staging space is free again (and a large
             // one made for a big offline frame goes).
             self.copies.clear();
@@ -2514,18 +2787,86 @@ impl Pass {
             if self.staging.as_ref().is_some_and(|s| s.2 > 256 << 20) {
                 self.staging = None;
             }
-            let _ = CloseHandle(event);
             self.tex.finished();
             self.terrain.finished();
-            if let Some(r) = xnw_gpu::d3d12x::host::removal_report(&self.device) {
-                return Err(format!("frame {}: after the frame's wait: {r}", list.frame));
-            }
-            st.gpu_ms = t1.elapsed().as_secs_f64() * 1e3;
+            st.gpu_ms = w + chunk_wait;
         }
         st.new_psos += new_psos;
         self.cuts.parts([st.upload_ms, st.tex_ms, (st.record_ms - st.upload_ms - st.tex_ms).max(0.0), st.gpu_ms]);
         self.cuts.end(t0.elapsed().as_secs_f64() * 1e3, cuts::now_ms());
         Ok(st)
+    }
+
+    /// The pass's timestamp heap and readback, made once.
+    fn stamps_ready(&mut self) -> std::result::Result<(), String> {
+        if self.stamps.is_none() {
+            let mut h: Option<ID3D12QueryHeap> = None;
+            // SAFETY: our device; the heap is kept with the pass.
+            unsafe { self.device.CreateQueryHeap(&D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: 2 * STAMP_PAIRS, NodeMask: 0 }, &mut h) }.map_err(|e| format!("pass query heap: {e}"))?;
+            let rb = bridge::buffer(&self.device, 16 * u64::from(STAMP_PAIRS), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST)?;
+            self.stamps = Some((h.ok_or("pass query heap: none")?, rb));
+        }
+        Ok(())
+    }
+
+    /// The first timestamp of submission `k` on the open list (none past [`STAMP_PAIRS`]).
+    fn stamp_open(&self, l: &ID3D12GraphicsCommandList, k: u32) {
+        if let Some((h, _)) = self.stamps.as_ref().filter(|_| k < STAMP_PAIRS) {
+            // SAFETY: an open list, a query index inside the heap.
+            unsafe { l.EndQuery(h, D3D12_QUERY_TYPE_TIMESTAMP, 2 * k) };
+        }
+    }
+
+    /// The second timestamp of submission `k` and the pair's resolve, before the list closes.
+    fn stamp_close(&self, l: &ID3D12GraphicsCommandList, k: u32) {
+        if let Some((h, rb)) = self.stamps.as_ref().filter(|_| k < STAMP_PAIRS) {
+            // SAFETY: as above; the readback holds 2 * STAMP_PAIRS values.
+            unsafe {
+                l.EndQuery(h, D3D12_QUERY_TYPE_TIMESTAMP, 2 * k + 1);
+                l.ResolveQueryData(h, D3D12_QUERY_TYPE_TIMESTAMP, 2 * k, 2, rb, 16 * u64::from(k));
+            }
+        }
+    }
+
+    /// Sends the closed list `l` and waits for its fence under the GPU
+    /// watchdog (`xnw_gpu::gpuwatch`: the card's time of this submission
+    /// alone, not the CPU's recording); its fence wait and timestamped GPU ms.
+    fn send_wait(&mut self, l: &ID3D12GraphicsCommandList, k: u32, label: &'static str, frame: u64) -> std::result::Result<(f64, Option<f64>), String> {
+        let at = |what: &'static str| move |e: windows::core::Error| format!("frame {frame}: {label}: {what}: {e}");
+        // SAFETY: our queue, fence and a closed list of ours; the event is closed here.
+        let wait = unsafe {
+            self.queue.ExecuteCommandLists(&[Some(l.cast().map_err(at("list cast"))?)]);
+            let sent = xnw_gpu::gpuwatch::begin(label);
+            self.fence_value += 1;
+            self.queue.Signal(&self.fence, self.fence_value).map_err(at("queue Signal"))?;
+            let event: HANDLE = CreateEventW(None, false, false, None).map_err(at("CreateEvent"))?;
+            self.fence.SetEventOnCompletion(self.fence_value, event).map_err(at("SetEventOnCompletion"))?;
+            WaitForSingleObject(event, INFINITE);
+            let _ = CloseHandle(event);
+            if let Some(r) = xnw_gpu::d3d12x::host::removal_report(&self.device) {
+                xnw_gpu::gpuwatch::end(label, sent, None);
+                return Err(format!("frame {frame}: after the {label} wait: {r}"));
+            }
+            let stamp = self.stamp_ms(k);
+            (xnw_gpu::gpuwatch::end(label, sent, stamp), stamp)
+        };
+        Ok(wait)
+    }
+
+    /// Submission `k`'s GPU milliseconds by its timestamps, once its fence was reached.
+    fn stamp_ms(&self, k: u32) -> Option<f64> {
+        let (_, rb) = self.stamps.as_ref().filter(|_| k < STAMP_PAIRS)?;
+        // SAFETY: the copy is done (the fence was reached); 16 B of the readback read.
+        let t = unsafe {
+            let mut p = std::ptr::null_mut();
+            rb.Map(0, Some(&D3D12_RANGE { Begin: 16 * k as usize, End: 16 * k as usize + 16 }), Some(&mut p)).ok()?;
+            let t = std::slice::from_raw_parts(p.cast::<u64>().add(2 * k as usize), 2).to_vec();
+            rb.Unmap(0, Some(&D3D12_RANGE::default()));
+            t
+        };
+        // SAFETY: our queue.
+        let f = unsafe { self.queue.GetTimestampFrequency() }.ok()?;
+        Some(t[1].saturating_sub(t[0]) as f64 * 1e3 / f.max(1) as f64)
     }
 
     /// Records the frame's water (uploading its grid when it changed):
@@ -2576,12 +2917,12 @@ impl Pass {
                 self.bridge_words = Some((r, at.cast::<u8>(), want.max(1 << 20)));
             }
             let (words, wp, wlen) = self.bridge_words.clone().ok_or("no words buffer")?;
-            f.write_words(std::slice::from_raw_parts_mut(wp, wlen as usize));
             let grey = self.bridge_grey.clone().ok_or("no grey texture")?;
             let tex = &self.tex;
             let texture = |h: u64| tex.host_view(h);
-            let t = bridged::Target { rtv: self.rtv.GetCPUDescriptorHandleForHeapStart(), dsv: self.dsv.GetCPUDescriptorHandleForHeapStart(), width: self.width, height: self.height, texture: &texture, grey: &grey, words: (&words, wlen) };
-            bridged::record(&self.device, l, f, &t, &mut self.bridge_keep)
+            let flat = |h: u64| tex.flat_reason(h) as usize;
+            let t = bridged::Target { rtv: self.rtv.GetCPUDescriptorHandleForHeapStart(), dsv: self.dsv.GetCPUDescriptorHandleForHeapStart(), width: self.width, height: self.height, texture: &texture, flat: &flat, grey: &grey, words: (&words, wlen, wp) };
+            self.bridge_gpu.record(&self.device, l, f, &t, &mut self.bridge_keep)
         }
     }
 
@@ -2624,6 +2965,26 @@ impl Pass {
     /// into (`bridgeps`: `bridge::run_into`).
     pub fn bridge_into(&self) -> bridge::Into {
         bridge::Into { colour: self.colour.clone(), depth: self._depth.clone() }
+    }
+
+    /// Our depth target read back as float rows (after a [`Pass::draw`]):
+    /// reverse depth, what the title's own programs test against (HAIR4: the
+    /// strand pixels `hair=on` paints).
+    pub fn read_depth(&self) -> std::result::Result<Vec<f32>, String> {
+        bridge_ms::read_depth_on(&self.device, &self.queue, &self._depth, self.width, self.height)
+    }
+
+    /// `gbuf=on`: the G-buffer targets and the depth read back (after a
+    /// [`Pass::draw`]); None with the G-buffer off.
+    pub fn read_gbuf(&self) -> Option<std::result::Result<gbuf::Read, String>> {
+        let t = self.gbuf.as_ref()?;
+        Some(gbuf::read(&self.device, &self.queue, t, &self._depth, self.width, self.height))
+    }
+
+    /// The validation layer's stored messages on the pass's device
+    /// ([`bridge::layer_messages`]; `XNW_GPU_DEBUG=layer`).
+    pub fn layer_messages(&self) -> Vec<String> {
+        bridge::layer_messages(&self.device)
     }
 
     pub fn read_rgba(&self) -> std::result::Result<Vec<u8>, String> {
@@ -2868,7 +3229,7 @@ fn screen_frame_inner() -> Option<ID3D12Resource> {
     }
     // The only place the pass is made: never without `XNW_WORLD_RENDER=screen..`
     // (`capture` and `1` record and dump only; no device work of ours).
-    let opts = screen_mode()?;
+    screen_mode()?;
     let list = lists().take();
     if let Some(l) = &list {
         SCREEN_FRAME.store(l.frame, std::sync::atomic::Ordering::Relaxed);
@@ -2876,80 +3237,8 @@ fn screen_frame_inner() -> Option<ID3D12Resource> {
     let mut guard = SCREEN.lock().ok()?;
     if guard.is_none() {
         let host = xnw_gpu::d3d12x::host::host_device()?;
-        match Pass::new(host, 1920, 1080) {
-            Ok(mut p) => {
-                (p.wire, p.only_stage, p.skin, p.states, p.sky, p.water, p.peds, p.decal_hold) = (opts.wire, opts.stage, opts.skin, opts.states, opts.sky, opts.water, opts.peds, opts.decal_hold);
-                // Skinned non-ped draws only with `skinned=on`.
-                p.skinned = std::env::var("XNW_WORLD_RENDER").is_ok_and(|v| v.split(',').any(|s| s.trim() == "skinned=on"));
-                // `skinrules=<hex>` (default 0: the default maths and skips).
-                p.skin_rules = parse_skin_rules(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default());
-                p.pso_budget = SCREEN_PSO_BUDGET;
-                p.pso_async = true;
-                p.upload_ms_budget = Some(SCREEN_UPLOAD_MS);
-                p.geom.budget = parse_geom_budget(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default());
-                p.tex.opts = parse_screen_tex(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default());
-                // `terrain=on` (off by default), `terraintri=`; its textures follow tex= (live or off).
-                p.terrain.opts = terrain::parse_screen(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default());
-                // `imposters=on` (off by default): cards for the title's imposter batches.
-                p.imposters.opts = imposter::parse_screen(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default());
-                // `bridgeps=on|<hashes>` (off by default): those rows again with the title's own
-                // programs (the list sink's tap reads their bindings); on the hardware
-                // adapter only with XNW_BRIDGE_HW=1 (a scheduled run).
-                let bridgeps = bridge::parse_switch(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default());
-                if !bridgeps.is_empty() {
-                    let hw = std::env::var("XNW_BRIDGE_HW").ok().as_deref() == Some("1");
-                    p.bridge_on = host.caps.software || hw;
-                    xnw_core::info!(
-                        "world render: bridgeps: {} pixel programs ({bridgeps:08x?}) {} on {}",
-                        bridgeps.len(),
-                        if p.bridge_on { "drawn by the title's own programs over ours" } else { "not drawn: the hardware adapter needs XNW_BRIDGE_HW=1" },
-                        host.caps.adapter
-                    );
-                }
-                // `bridgems=on|<hashes>` (off by default): the replay draws those rows from the title's mesh programs (`bridge_ms`); live waits for a binding source too.
-                let bridgems = bridge_ms::parse_switch(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default());
-                if !bridgems.is_empty() {
-                    xnw_core::info!("world render: bridgems asks for {} mesh programs; the live pass has no source of their bindings yet: drawn by our own programs", bridgems.len());
-                }
-                p.terrain.table.opts.mode = p.tex.opts.mode;
-                p.terrain.table.opts.async_reads = p.tex.opts.async_reads;
-                // Every per-frame budget of the pass on one line (geometry, textures, pipelines).
-                xnw_core::info!(
-                    "world render: our pass on {} (1920x1080, {opts:?}); budgets per frame: geometry {} MiB / {} uploads (device {} MiB), textures {} MiB / {} uploads, pipelines {} new; total uploads {} MiB",
-                    host.caps.adapter,
-                    p.geom.budget.frame_bytes >> 20,
-                    p.geom.budget.frame_count,
-                    p.geom.budget.device_bytes >> 20,
-                    p.tex.opts.upload_bytes >> 20,
-                    p.tex.opts.uploads,
-                    p.pso_budget,
-                    (p.geom.budget.frame_bytes + p.tex.opts.upload_bytes) >> 20
-                );
-                xnw_core::info!("world render: textures {:?}, geometry {:?}", p.tex.opts, p.geom.budget);
-                xnw_core::info!("world render: skin: rules {:#x}, skinned {}, peds {}", p.skin_rules, if p.skinned { "on" } else { "off" }, if p.peds { "on" } else { "off" });
-                // The ped pre-skin (`preskin=on`): its program is made here, not in a frame.
-                if preskin_gpu::screen_switch(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default()) {
-                    match p.preskin_prepare() {
-                        Ok(ms) => xnw_core::info!("world render: pre-skin on (our compute pass; program made in {ms:.0} ms)"),
-                        Err(e) => xnw_core::warn!("world render: pre-skin program failed: {e}"),
-                    }
-                }
-                // `light=old` keeps the earlier lighting.
-                p.light_old = std::env::var("XNW_WORLD_RENDER").is_ok_and(|v| v.split(',').any(|s| s.trim() == "light=old"));
-                // `layers=c0|c1|off` (default c1).
-                p.layers = parse_layers(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default());
-                // Hold partial pictures at cuts (`hold=off`: show every frame as drawn).
-                p.cuts = cuts::CutWatch::new(!std::env::var("XNW_WORLD_RENDER").is_ok_and(|v| v.split(',').any(|s| s.trim() == "hold=off")));
-                // `cutfast=on` (off by default, CUT1): a camera cut's queue drained in 2 frames, its texture reads capped.
-                p.cuts.fast = std::env::var("XNW_WORLD_RENDER").is_ok_and(|v| v.split(',').any(|s| s.trim() == "cutfast=on"));
-                xnw_core::info!(
-                    "world render: cuts: hold {} (a picture under {:.0}% of the main view's triangles is not shown, at most {HOLD} ms), complete at {:.0}%, cut at {} m / {} deg / coverage under {:.0}%; upload time {} ms a frame, x{} while a cut recovers; pipelines off the frame (async), {} a frame; fast {} (queue drained in {} frames, at most {} ms a frame; texture reads {} ms); texture reads cap {} ms",
-                    p.cuts.hold, 100.0 * cuts::HOLD_COVERAGE, 100.0 * cuts::COMPLETE_COVERAGE, cuts::CUT_METRES, cuts::CUT_DEGREES, 100.0 * cuts::CUT_COVERAGE, SCREEN_UPLOAD_MS, p.cuts.boost, p.pso_budget, p.cuts.fast, cuts::DRAIN_FRAMES, cuts::DRAIN_MAX_MS, cuts::CUT_TEX_MS, p.tex.opts.frame_ms, HOLD = cuts::HOLD_MS
-                );
-                // `stipple=off` draws cross-fading LODs solid (bisecting).
-                p.stipple = !std::env::var("XNW_WORLD_RENDER").is_ok_and(|v| v.split(',').any(|s| s.trim() == "stipple=off"));
-                *guard = Some(p);
-            }
+        match screen_pass(host) {
+            Ok(p) => *guard = Some(p),
             Err(e) => {
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| xnw_core::warn!("world render: no pass: {e}"));
@@ -2972,116 +3261,204 @@ fn screen_frame_inner() -> Option<ID3D12Resource> {
         LAST.store(l.frame, std::sync::atomic::Ordering::Relaxed);
         true
     });
-    if let Some(mut list) = list {
-        let t = std::time::Instant::now();
-        // The new geometries move into the queue (no copy of their bytes).
-        for (key, g) in std::mem::take(&mut list.ahead_geoms) {
-            pass.geom.offer_ahead(geometry::known(), key, g, list.frame);
-        }
-        for (key, g) in std::mem::take(&mut list.new_geoms) {
-            pass.geom.offer(geometry::known(), key, g, list.frame);
-        }
-        // The lighting in use, once at the first lit frame and every 3,600 frames.
-        if let Some(l) = list.light {
-            static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-            if FIRST.swap(false, std::sync::atomic::Ordering::Relaxed) || list.frame % 3600 == 0 {
-                xnw_core::info!("{}{}", l.line(), if pass.light_old { " (light=old: not used)" } else { "" });
-            }
-        }
-        match pass.draw(&list, &mut |_| None, false) {
-            Ok(st) => {
-                // One line per camera cut, when its picture is complete.
-                if let Some(l) = pass.cuts.line.take() {
-                    xnw_core::info!("{l}");
-                }
-                if pass.tex.opts.mode != TexMode::Off
-                    && let Some(lines) = pass.tex.log_line()
-                {
-                    for l in lines {
-                        xnw_core::info!("{l}");
-                    }
-                }
-                pass.log_geometry(list.frame, &st);
-                let total = t.elapsed().as_secs_f64() * 1e3;
-                cost_pass(total, st.upload_ms, st.pso_ms);
-                if total > 50.0 {
-                    let steps = [("upload", st.upload_ms), ("pipelines", st.pso_ms), ("textures", st.tex_ms), ("record", st.record_ms - st.upload_ms - st.pso_ms - st.tex_ms), ("GPU", st.gpu_ms)];
-                    let worst = steps.iter().copied().fold(("-", 0.0), |a, b| if b.1 > a.1 { b } else { a });
-                    xnw_core::warn!(
-                        "world render: slow frame {}: {total:.1} ms in our pass, mostly {} ({:.1} ms): upload {:.1} ms ({} geometries, {} KiB, {} pending), pipelines {} new in {:.1} ms, textures {:.1} ms, record {:.1} ms, GPU {:.1} ms, {} draws{}",
-                        list.frame,
-                        worst.0,
-                        worst.1,
-                        st.upload_ms,
-                        st.uploaded_geometries,
-                        st.uploaded_bytes >> 10,
-                        st.pending,
-                        st.new_psos,
-                        st.pso_ms,
-                        st.tex_ms,
-                        st.record_ms,
-                        st.gpu_ms,
-                        st.draws,
-                        if st.held { " (held)" } else { "" }
-                    );
-                }
-                if list.skin_hooked > 0 && st.skinned == 0 && pass.skin {
-                    static WARNED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                    if WARNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 60 == 0 {
-                        xnw_core::warn!("world render: frame {}: skinned 0 of {} hooked: no skin palette reached the pass", list.frame, list.skin_hooked);
-                    }
-                }
-                if list.frame % 60 == 0 && (!list.preskin.items.is_empty() || list.preskin.unreadable > 0) {
-                    let s = pass.preskin_stats();
-                    xnw_core::info!("{}", preskin_gpu::line(list.frame, &list.preskin, &s));
-                }
-                if list.frame % 60 == 0 && pass.bridge_on {
-                    let none = bridged::Frame::default();
-                    xnw_core::info!("{}", bridged::line(list.frame, list.bridged.as_deref().unwrap_or(&none), &pass.bridge_stats));
-                }
-                if list.frame % 60 == 0 && pass.imposters.opts.on {
-                    xnw_core::info!("{}", pass.imposters.frame_line(list.frame, list.imposters.as_deref()));
-                }
-                if list.frame % 60 == 0 && pass.terrain.opts.on {
-                    for l in pass.terrain.log_lines() {
-                        xnw_core::info!("{l}");
-                    }
-                }
-                if list.frame % 60 == 0 {
-                    xnw_core::info!(
-                        "world render: frame {}: {} draws (skinned {} of {} hooked, {} with the ped remap, {} peds skipped, {} skinned skipped, {} decals held, {} without geometry, {} filtered, {} with the title's state, {} state pipelines), {} triangles; {} geometries uploaded ({} replaced, {} indices clamped) ({} KiB), palettes {} B; record {:.1} ms, GPU {:.1} ms, total {:.1} ms",
-                        list.frame,
-                        st.draws,
-                        st.skinned,
-                        list.skin_hooked,
-                        st.remapped,
-                        st.peds_skipped,
-                        st.skinned_skipped,
-                        st.decals_held,
-                        st.skipped,
-                        st.filtered,
-                        st.stated,
-                        pass.state_psos.len(),
-                        st.triangles,
-                        st.uploaded_geometries,
-                        st.replaced,
-                        st.clamped,
-                        st.uploaded_bytes >> 10,
-                        st.palette_bytes,
-                        st.record_ms,
-                        st.gpu_ms,
-                        t.elapsed().as_secs_f64() * 1e3
-                    );
-                }
-            }
-            Err(e) => {
-                xnw_core::warn!("world render: pass failed: {e}; off");
-                *guard = None;
-                return None;
-            }
-        }
+    if let Some(list) = list
+        && let Err(e) = screen_draw(pass, list, false)
+    {
+        xnw_core::warn!("world render: pass failed: {e}; off");
+        *guard = None;
+        return None;
     }
     Some(pass.shown().clone())
+}
+
+/// The screen pass as the live path makes it: 1920x1080 on `host`, every
+/// option from `XNW_WORLD_RENDER` (`xnw burst` makes its pass here too).
+pub fn screen_pass(host: &xnw_gpu::host::Host) -> std::result::Result<Pass, String> {
+    // Parsed again, not `screen_mode()`: `xnw burst` sets the variable after main read it.
+    let opts = parse_screen(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default()).ok_or("XNW_WORLD_RENDER does not ask for the screen")?;
+    let mut p = Pass::new(host, 1920, 1080)?;
+    (p.wire, p.only_stage, p.skin, p.states, p.sky, p.water, p.peds, p.decal_hold) = (opts.wire, opts.stage, opts.skin, opts.states, opts.sky, opts.water, opts.peds, opts.decal_hold);
+    // Skinned non-ped draws only with `skinned=on`.
+    p.skinned = std::env::var("XNW_WORLD_RENDER").is_ok_and(|v| v.split(',').any(|s| s.trim() == "skinned=on"));
+    // `skinrules=<hex>` (default 0: the default maths and skips).
+    p.skin_rules = parse_skin_rules(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default());
+    p.pso_budget = SCREEN_PSO_BUDGET;
+    p.pso_async = true;
+    p.upload_ms_budget = Some(SCREEN_UPLOAD_MS);
+    p.geom.budget = parse_geom_budget(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default());
+    p.tex.opts = parse_screen_tex(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default());
+    // `terrain=on` (off by default), `terraintri=`; its textures follow tex= (live or off).
+    p.terrain.opts = terrain::parse_screen(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default());
+    // `imposters=on` (off by default): cards for the title's imposter batches.
+    p.imposters.opts = imposter::parse_screen(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default());
+    // `bridgeps=on|<hashes>` (off by default): those rows again with the title's own
+    // programs (the list sink's tap reads their bindings); on the hardware
+    // adapter only with XNW_BRIDGE_HW=1 (a scheduled run).
+    let bridgeps = bridge::parse_switch(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default());
+    if !bridgeps.is_empty() {
+        let hw = std::env::var("XNW_BRIDGE_HW").ok().as_deref() == Some("1");
+        p.bridge_on = host.caps.software || hw;
+        xnw_core::info!(
+            "world render: bridgeps: {} pixel programs ({bridgeps:08x?}) {} on {}",
+            bridgeps.len(),
+            if p.bridge_on { "drawn by the title's own programs over ours" } else { "not drawn: the hardware adapter needs XNW_BRIDGE_HW=1" },
+            host.caps.adapter
+        );
+    }
+    // `bridgems=on|<hashes>` (off by default): the replay draws those rows from the title's mesh programs (`bridge_ms`); live waits for a binding source too.
+    let bridgems = bridge_ms::parse_switch(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default());
+    if !bridgems.is_empty() {
+        xnw_core::info!("world render: bridgems asks for {} mesh programs; the live pass has no source of their bindings yet: drawn by our own programs", bridgems.len());
+    }
+    p.terrain.table.opts.mode = p.tex.opts.mode;
+    p.terrain.table.opts.async_reads = p.tex.opts.async_reads;
+    // Every per-frame budget of the pass on one line (geometry, textures, pipelines).
+    xnw_core::info!(
+        "world render: our pass on {} (1920x1080, {opts:?}); budgets per frame: geometry {} MiB / {} uploads (device {} MiB), textures {} MiB / {} uploads, pipelines {} new; total uploads {} MiB",
+        host.caps.adapter,
+        p.geom.budget.frame_bytes >> 20,
+        p.geom.budget.frame_count,
+        p.geom.budget.device_bytes >> 20,
+        p.tex.opts.upload_bytes >> 20,
+        p.tex.opts.uploads,
+        p.pso_budget,
+        (p.geom.budget.frame_bytes + p.tex.opts.upload_bytes) >> 20
+    );
+    xnw_core::info!("world render: textures {:?}, geometry {:?}", p.tex.opts, p.geom.budget);
+    xnw_core::info!("world render: skin: rules {:#x}, skinned {}, peds {}", p.skin_rules, if p.skinned { "on" } else { "off" }, if p.peds { "on" } else { "off" });
+    // The ped pre-skin (`preskin=on`): its program is made here, not in a frame.
+    if preskin_gpu::screen_switch(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default()) {
+        match p.preskin_prepare() {
+            Ok(ms) => xnw_core::info!("world render: pre-skin on (our compute pass; program made in {ms:.0} ms)"),
+            Err(e) => xnw_core::warn!("world render: pre-skin program failed: {e}"),
+        }
+    }
+    // `light=old` keeps the earlier lighting.
+    p.light_old = std::env::var("XNW_WORLD_RENDER").is_ok_and(|v| v.split(',').any(|s| s.trim() == "light=old"));
+    // `layers=c0|c1|off` (default c1).
+    p.layers = parse_layers(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default());
+    // Hold partial pictures at cuts (`hold=off`: show every frame as drawn).
+    p.cuts = cuts::CutWatch::new(!std::env::var("XNW_WORLD_RENDER").is_ok_and(|v| v.split(',').any(|s| s.trim() == "hold=off")));
+    // `cutfast=on` (off by default, CUT1): a camera cut's queue drained in 2 frames, its texture reads capped.
+    p.cuts.fast = std::env::var("XNW_WORLD_RENDER").is_ok_and(|v| v.split(',').any(|s| s.trim() == "cutfast=on"));
+    xnw_core::info!(
+        "world render: cuts: hold {} (a picture under {:.0}% of the main view's triangles is not shown, at most {HOLD} ms), complete at {:.0}%, cut at {} m / {} deg / coverage under {:.0}%; upload time {} ms a frame, x{} while a cut recovers; pipelines off the frame (async), {} a frame; fast {} (queue drained in {} frames, at most {} ms a frame; texture reads {} ms); texture reads cap {} ms",
+        p.cuts.hold, 100.0 * cuts::HOLD_COVERAGE, 100.0 * cuts::COMPLETE_COVERAGE, cuts::CUT_METRES, cuts::CUT_DEGREES, 100.0 * cuts::CUT_COVERAGE, SCREEN_UPLOAD_MS, p.cuts.boost, p.pso_budget, p.cuts.fast, cuts::DRAIN_FRAMES, cuts::DRAIN_MAX_MS, cuts::CUT_TEX_MS, p.tex.opts.frame_ms, HOLD = cuts::HOLD_MS
+    );
+    // `stipple=off` draws cross-fading LODs solid (bisecting).
+    p.stipple = !std::env::var("XNW_WORLD_RENDER").is_ok_and(|v| v.split(',').any(|s| s.trim() == "stipple=off"));
+    Ok(p)
+}
+
+/// One finished list into the screen pass, as the live path draws it: its new
+/// geometries offered to the queue, drawn, and the live log lines (cut, slow
+/// frame, every 60 frames). `xnw burst` draws its lists here too (`readback`:
+/// the picture copied for [`Pass::read_rgba`]).
+pub fn screen_draw(pass: &mut Pass, mut list: FrameList, readback: bool) -> std::result::Result<PassStats, String> {
+    let t = std::time::Instant::now();
+    // The new geometries move into the queue (no copy of their bytes).
+    for (key, g) in std::mem::take(&mut list.ahead_geoms) {
+        pass.geom.offer_ahead(geometry::known(), key, g, list.frame);
+    }
+    for (key, g) in std::mem::take(&mut list.new_geoms) {
+        pass.geom.offer(geometry::known(), key, g, list.frame);
+    }
+    // The lighting in use, once at the first lit frame and every 3,600 frames.
+    if let Some(l) = list.light {
+        static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+        if FIRST.swap(false, std::sync::atomic::Ordering::Relaxed) || list.frame % 3600 == 0 {
+            xnw_core::info!("{}{}", l.line(), if pass.light_old { " (light=old: not used)" } else { "" });
+        }
+    }
+    let st = pass.draw(&list, &mut |_| None, readback)?;
+    // One line per camera cut, when its picture is complete.
+    if let Some(l) = pass.cuts.line.take() {
+        xnw_core::info!("{l}");
+    }
+    if pass.tex.opts.mode != TexMode::Off
+        && let Some(lines) = pass.tex.log_line()
+    {
+        for l in lines {
+            xnw_core::info!("{l}");
+        }
+    }
+    pass.log_geometry(list.frame, &st);
+    let total = t.elapsed().as_secs_f64() * 1e3;
+    cost_pass(total, st.upload_ms, st.pso_ms);
+    if total > 50.0 {
+        let steps = [("upload", st.upload_ms), ("pipelines", st.pso_ms), ("textures", st.tex_ms), ("record", st.record_ms - st.upload_ms - st.pso_ms - st.tex_ms), ("GPU", st.gpu_ms)];
+        let worst = steps.iter().copied().fold(("-", 0.0), |a, b| if b.1 > a.1 { b } else { a });
+        xnw_core::warn!(
+            "world render: slow frame {}: {total:.1} ms in our pass, mostly {} ({:.1} ms): upload {:.1} ms ({} geometries, {} KiB, {} pending), pipelines {} new in {:.1} ms, textures {:.1} ms, record {:.1} ms, GPU {:.1} ms, {} draws{}",
+            list.frame,
+            worst.0,
+            worst.1,
+            st.upload_ms,
+            st.uploaded_geometries,
+            st.uploaded_bytes >> 10,
+            st.pending,
+            st.new_psos,
+            st.pso_ms,
+            st.tex_ms,
+            st.record_ms,
+            st.gpu_ms,
+            st.draws,
+            if st.held { " (held)" } else { "" }
+        );
+    }
+    if list.skin_hooked > 0 && st.skinned == 0 && pass.skin {
+        static WARNED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if WARNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 60 == 0 {
+            xnw_core::warn!("world render: frame {}: skinned 0 of {} hooked: no skin palette reached the pass", list.frame, list.skin_hooked);
+        }
+    }
+    if list.frame % 60 == 0 && (!list.preskin.items.is_empty() || list.preskin.unreadable > 0) {
+        let s = pass.preskin_stats();
+        xnw_core::info!("{}", preskin_gpu::line(list.frame, &list.preskin, &s));
+    }
+    if list.frame % 60 == 0 && !list.cull.rows.is_empty() {
+        let s = pass.cull_stats();
+        xnw_core::info!("{}", gpucull::line(list.frame, &s));
+    }
+    if list.frame % 60 == 0 && pass.bridge_on {
+        let none = bridged::Frame::default();
+        xnw_core::info!("{}", bridged::line(list.frame, list.bridged.as_deref().unwrap_or(&none), &pass.bridge_stats));
+    }
+    if list.frame % 60 == 0 && pass.imposters.opts.on {
+        xnw_core::info!("{}", pass.imposters.frame_line(list.frame, list.imposters.as_deref()));
+    }
+    if list.frame % 60 == 0 && pass.terrain.opts.on {
+        for l in pass.terrain.log_lines() {
+            xnw_core::info!("{l}");
+        }
+    }
+    if list.frame % 60 == 0 {
+        xnw_core::info!(
+            "world render: frame {}: {} draws (skinned {} of {} hooked, {} with the ped remap, {} peds skipped, {} skinned skipped, {} decals held, {} without geometry, {} filtered, {} with the title's state, {} state pipelines), {} triangles; {} geometries uploaded ({} replaced, {} indices clamped) ({} KiB), palettes {} B; record {:.1} ms, GPU {:.1} ms, total {:.1} ms",
+            list.frame,
+            st.draws,
+            st.skinned,
+            list.skin_hooked,
+            st.remapped,
+            st.peds_skipped,
+            st.skinned_skipped,
+            st.decals_held,
+            st.skipped,
+            st.filtered,
+            st.stated,
+            pass.state_psos.len(),
+            st.triangles,
+            st.uploaded_geometries,
+            st.replaced,
+            st.clamped,
+            st.uploaded_bytes >> 10,
+            st.palette_bytes,
+            st.record_ms,
+            st.gpu_ms,
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    Ok(st)
 }
 
 
@@ -3127,6 +3504,35 @@ mod tests {
         // The checker sees a return inside a branch.
         let early = "float4 ps(VsOut i) : SV_Target { if (a) return 1; return 0; }";
         assert_eq!(pixel_entries(early)[0].matches("return").count(), 2);
+    }
+
+    /// HANG1: no load is the arm of a `?:` (HLSL runs both arms, so the
+    /// load runs whatever the condition says; through a root view it reads
+    /// past its buffer on the card). Every guarded load picks its address.
+    #[test]
+    fn no_load_in_a_conditional_arm() {
+        let shaders = [("SHADER", SHADER), ("RAW_SHADER", RAW_SHADER), ("WATER_SHADER", WATER_SHADER), ("SKY_SHADER", SKY_SHADER), ("IMPOSTER_SHADER", imposter::IMPOSTER_SHADER), ("TERRAIN_SHADER", terrain::TERRAIN_SHADER), ("gpucull", gpucull::SHADER), ("preskin_gpu", preskin_gpu::SHADER)];
+        // Both arms of each `?`: the text after it up to the end of its
+        // expression (a `;`, a `,` or `)` closing what encloses it).
+        let arm = |src: &str| {
+            src.lines().filter(|l| !l.trim_start().starts_with("//")).any(|l| {
+                l.match_indices('?').any(|(at, _)| {
+                    let mut depth = 0i32;
+                    let end = l[at + 1..].char_indices().find(|&(_, c)| {
+                        depth += i32::from(c == '(') - i32::from(c == ')');
+                        c == ';' || depth < 0 || (c == ',' && depth == 0)
+                    });
+                    l[at + 1..at + 1 + end.map_or(l.len() - at - 1, |e| e.0)].contains(".Load")
+                })
+            })
+        };
+        for (name, src) in shaders {
+            assert!(!arm(src), "{name}: a load in a conditional arm");
+        }
+        assert!(arm("uint ld(uint a) { return a < n ? vb.Load(a) : 0; }"), "the checker sees one");
+        assert!(arm("float4 r(bool f, uint a) { return asfloat(f ? 0 : kept.Load4(a)); }"), "and the second arm");
+        assert!(!arm("uint ld(uint a) { bool ok = a < n; uint v = vb.Load(ok ? a : 0); return ok ? v : 0; }"));
+        assert!(!arm("float4 f = asfloat(frame.Load4(c ? a : 0)), k = asfloat(kept.Load4(c ? 0 : a));"));
     }
 
     /// Frame 1700's main viewport (camera.txt).
@@ -3235,7 +3641,7 @@ mod tests {
         let geom = GeomKey { mesh_at: 1, ..Default::default() };
         let rec = DrawRecord { geom, world: id, viewport: 1, effect: 0, albedo: Albedo::Flat([1.0, 0.0, 0.0]), palette: NO_PALETTE, stage: 0, inst_first: 0, inst_count: 0, bone_first: 0, bone_count: 0, material: Material::default(), state: None, remap: NO_REMAP, ped: false };
         let list = FrameList { frame: 1, draws: vec![rec], cameras: vec![cam], main: Some(1), ..Default::default() };
-        let tri = HostGeometry { vertices: pack_vertices(&[[-1.0, -1.0, -3.0], [1.0, -1.0, -3.0], [0.0, 1.0, -3.0]], &[[0.0, 0.0, 1.0]; 3], &[]), indices: vec![0, 1, 2], raw_vb: None };
+        let tri = HostGeometry { vertices: pack_vertices(&[[-1.0, -1.0, -3.0], [1.0, -1.0, -3.0], [0.0, 1.0, -3.0]], &[[0.0, 0.0, 1.0]; 3], &[]), indices: vec![0, 1, 2], raw_vb: None, vb_place: 0 };
         let mut once = Some(tri);
         let st = pass.draw(&list, &mut |_| once.take(), true).unwrap();
         assert_eq!((st.draws, st.triangles, st.uploaded_geometries), (1, 1, 1));
@@ -3269,7 +3675,7 @@ mod tests {
         let id: Mat = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
         let cam = Camera { viewport: 1, view: id, proj: PROJ };
         let geom = GeomKey { mesh_at: 7, ..Default::default() };
-        let g = HostGeometry { vertices: Vec::new(), indices: vec![0, 1, 2, 2, 1, 900], raw_vb: Some(vb) };
+        let g = HostGeometry { vertices: Vec::new(), indices: vec![0, 1, 2, 2, 1, 900], raw_vb: Some(vb), vb_place: 0 };
         let rec = DrawRecord { geom, world: id, viewport: 1, effect: 0, albedo: Albedo::Flat([0.0, 1.0, 0.0]), palette: NO_PALETTE, stage: 0, inst_first: 0, inst_count: 0, bone_first: 0, bone_count: 0, material: Material::default(), state: None, remap: NO_REMAP, ped: false };
         let mut list = FrameList { frame: 1, draws: vec![rec], cameras: vec![cam], main: Some(1), new_geoms: vec![(geom, g)], ..Default::default() };
         let st = pass.draw(&list, &mut |_| None, true).unwrap();
@@ -3342,7 +3748,7 @@ mod tests {
             instances.extend(instance_world(&rec, [0.0; 3]));
         }
         let rec = DrawRecord { geom, world: id, viewport: 1, effect: 0, albedo: Albedo::Flat([0.0, 0.0, 1.0]), palette: NO_PALETTE, stage: 0, inst_first: 0, inst_count: 2, bone_first: 0, bone_count: 0, material: Material::default(), state: None, remap: NO_REMAP, ped: false };
-        let g = HostGeometry { vertices: Vec::new(), indices: vec![0, 1, 2], raw_vb: Some(vb) };
+        let g = HostGeometry { vertices: Vec::new(), indices: vec![0, 1, 2], raw_vb: Some(vb), vb_place: 0 };
         let mut list = FrameList { frame: 1, draws: vec![rec], cameras: vec![Camera { viewport: 1, view: id, proj: PROJ }], main: Some(1), new_geoms: vec![(geom, g)], instances, ..Default::default() };
         let st = pass.draw(&list, &mut |_| None, true).unwrap();
         assert_eq!((st.instanced, st.instances), (1, 2));
@@ -3409,7 +3815,7 @@ mod tests {
         let geom = GeomKey { mesh_at: mesh, ..Default::default() };
         let material = Material { albedo_desc: slot, alpha_clip: clip, ..Default::default() };
         let rec = DrawRecord { geom, world: id, viewport: 1, effect: 0, albedo: Albedo::Flat([0.0, 1.0, 0.0]), palette: NO_PALETTE, stage: 0, inst_first: 0, inst_count: 0, bone_first: 0, bone_count: 0, material, state: None, remap: NO_REMAP, ped: false };
-        let g = HostGeometry { vertices: Vec::new(), indices: vec![0, 1, 2], raw_vb: Some(vb) };
+        let g = HostGeometry { vertices: Vec::new(), indices: vec![0, 1, 2], raw_vb: Some(vb), vb_place: 0 };
         FrameList { frame: 1, draws: vec![rec], cameras: vec![Camera { viewport: 1, view: id, proj: PROJ }], main: Some(1), new_geoms: vec![(geom, g)], ..Default::default() }
     }
 
@@ -3653,7 +4059,7 @@ mod tests {
                 // Sizes as in a test run: most small, every 50th large (1.2 MiB).
                 let vb = if i % 50 == 0 { 1_200_000 } else { 1_000 + (i as usize * 7919) % 30_000 };
                 let tris = if i % 50 == 0 { 2_000 } else { 32 + (i as u32 * 31) % 400 };
-                geoms.push((key, HostGeometry { vertices: Vec::new(), indices: vec![0; 3 * tris as usize], raw_vb: Some(vec![0u8; vb]) }));
+                geoms.push((key, HostGeometry { vertices: Vec::new(), indices: vec![0; 3 * tris as usize], raw_vb: Some(vec![0u8; vb]), vb_place: 0 }));
                 let mut world: Mat = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
                 world[12] = at + (i % 37) as f32;
                 world[14] = -5.0 - (i % 91) as f32 * 3.0;
@@ -3751,7 +4157,7 @@ mod tests {
         let id: Mat = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
         let n = 1_230u64;
         let new_geoms: Vec<(GeomKey, HostGeometry)> = (0..n)
-            .map(|i| (GeomKey { mesh_at: 0x1000 + i, hash: i, ..Default::default() }, HostGeometry { vertices: Vec::new(), indices: (0..1_536).collect(), raw_vb: Some(vec![0u8; 21_200]) }))
+            .map(|i| (GeomKey { mesh_at: 0x1000 + i, hash: i, ..Default::default() }, HostGeometry { vertices: Vec::new(), indices: (0..1_536).collect(), raw_vb: Some(vec![0u8; 21_200]), vb_place: 0 }))
             .collect();
         let mib = new_geoms.iter().map(|(_, g)| g.raw_vb.as_ref().unwrap().len() + 4 * g.indices.len()).sum::<usize>() as f64 / f64::from(1 << 20);
         let list = FrameList { frame: 1, cameras: vec![Camera { viewport: 1, view: id, proj: PROJ }], main: Some(1), new_geoms, ..Default::default() };
@@ -3865,7 +4271,7 @@ mod tests {
         let rec = |rgb: [f32; 3], stage: u32, state: Option<RenderState>| DrawRecord { geom, world: id, viewport: 1, effect: 0, albedo: Albedo::Flat(rgb), palette: NO_PALETTE, stage, inst_first: 0, inst_count: 0, bone_first: 0, bone_count: 0, material: Material::default(), state, remap: NO_REMAP, ped: false };
         // Additive blend (ONE, ONE, ADD), depth test GE without write: the decal's red adds to the opaque blue.
         let add = RenderState { depth_enable: true, depth_write: false, depth_func: 7, depth_bias: 0, bias_clamp: 0, slope_bias: 0, blend: [1, 2, 2, 1, 2, 2, 1, 0xF] };
-        let g = HostGeometry { vertices: Vec::new(), indices: vec![0, 1, 2], raw_vb: Some(vb) };
+        let g = HostGeometry { vertices: Vec::new(), indices: vec![0, 1, 2], raw_vb: Some(vb), vb_place: 0 };
         let draws = vec![rec([1.0, 0.0, 0.0], 74, Some(add)), rec([0.0, 1.0, 0.0], 36, None), rec([0.0, 0.0, 1.0], 67, None)];
         let list = FrameList { frame: 1, draws, cameras: vec![Camera { viewport: 1, view: id, proj: PROJ }], main: Some(1), new_geoms: vec![(geom, g)], ..Default::default() };
         let st = pass.draw(&list, &mut |_| None, true).unwrap();
@@ -3929,7 +4335,7 @@ mod tests {
         let id: Mat = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
         let geom = GeomKey { mesh_at: 13, ..Default::default() };
         let rec = DrawRecord { geom, world: id, viewport: 1, effect: 0, albedo: Albedo::Flat([0.5, 0.5, 0.5]), palette: NO_PALETTE, stage: 0, inst_first: 0, inst_count: 0, bone_first: 0, bone_count: 0, material: Material::default(), state: None, remap: NO_REMAP, ped: false };
-        let g = HostGeometry { vertices: Vec::new(), indices: vec![0, 1, 2], raw_vb: Some(vb) };
+        let g = HostGeometry { vertices: Vec::new(), indices: vec![0, 1, 2], raw_vb: Some(vb), vb_place: 0 };
         let curve = [0.22, 0.3, 0.1, 0.2, 0.01, 0.3, 4.0];
         let pi = std::f32::consts::PI;
         let light = lighting::Lighting { dir: [0.0, 0.0, 1.0], radiance: [pi; 3], mult: pi, amb_sky: [0.0; 3], amb_ground: [0.0; 3], exposure: 1.0, ev: 0.0, bias: 0.0, strength: 1.0, moon: false, sky_scale: 1.0, curve };
@@ -3980,7 +4386,7 @@ mod tests {
         let id: Mat = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
         let geom = GeomKey { mesh_at: 15, ..Default::default() };
         let rec = DrawRecord { geom, world: id, viewport: 1, effect: 0, albedo: Albedo::Flat([0.9, 0.9, 0.9]), palette: NO_PALETTE, stage: 71, inst_first: 0, inst_count: 0, bone_first: 0, bone_count: 0, material: Material::default(), state: None, remap: NO_REMAP, ped: false };
-        let g = HostGeometry { vertices: Vec::new(), indices: vec![0, 1, 2], raw_vb: Some(vb) };
+        let g = HostGeometry { vertices: Vec::new(), indices: vec![0, 1, 2], raw_vb: Some(vb), vb_place: 0 };
         let mut list = FrameList { frame: 1, draws: vec![rec], cameras: vec![Camera { viewport: 1, view: id, proj: PROJ }], main: Some(1), new_geoms: vec![(geom, g)], ..Default::default() };
         pass.layers_debug = true;
         let st = pass.draw(&list, &mut |_| None, true).unwrap();

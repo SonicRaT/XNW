@@ -1,6 +1,7 @@
 // Ported from VIctory crates/victory-shader/src/emit/mod.rs, commit d2a4bae1f49533ef5cb512fd1b1ba1513f2e1989, GPL-3.0-or-later.
 // With VIctory open pull requests (GPL-3.0-or-later) where they touch this file: (8ae232f, d112889), (4c9a922, db20637, 3e8f2d3), (815178d), (fa5189d).
 // With VIctory (head 42538cd, on upstream 4322b61; GPL-3.0-or-later): unknown-stride structured buffers read through the runtime stride table (shader side).
+// With victory-fork (a26859f, GPL-3.0-or-later): the retry of a program refused for a first half of an interpolation.
 //! DXIL emission (decision 0003, step 3): a console vertex, pixel, compute
 //! or mesh shader as a PC DXIL container (SM 6.6) that host D3D12 accepts.
 //! Compute shaders keep the console's thread-group size; one that depends
@@ -81,6 +82,10 @@
 pub mod address_map;
 mod bitcode;
 #[cfg(test)]
+mod barycentric_tests;
+#[cfg(test)]
+mod first_half_tests;
+#[cfg(test)]
 mod s7_tests;
 mod container;
 #[cfg(all(windows, any(test, feature = "host")))]
@@ -103,6 +108,11 @@ mod valu_tests;
 mod wave;
 #[cfg(all(test, windows))]
 mod world_tests;
+#[cfg(all(test, windows))]
+mod null_kind_tests;
+// XNW: the non-uniform heap index on the software adapter.
+#[cfg(all(test, windows))]
+mod heap_uniform_tests;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
@@ -173,7 +183,14 @@ pub mod host_copies {
 /// 23: sampler dwords held as data (a waterfall loop over a sampler's
 /// dwords reads them as their sampler heap offsets; a sampler heap dword
 /// on a dead join edge is dropped).
-pub const VERSION: u32 = 23;
+/// 24: computed barycentrics on a host that has them (victory-fork
+/// 578d459); also retries the earlier lifts (sampler phi, wave64 s_mov mask).
+/// 25: first halves of interpolations read as data, on a retry (
+/// victory-fork a26859f).
+/// 26: (every heap index that may differ between lanes, or that a
+/// block only some lanes run reads, is declared non-uniform): breaking for
+/// every program with such an index.
+pub const VERSION: u32 = 26;
 
 /// Part of every shader-cache key: raise it when programs that
 /// already translated must be translated again (see [`VERSION`]).
@@ -183,8 +200,8 @@ pub const VERSION: u32 = 23;
 /// budget 256 in every stage). 4: merged at `VERSION` 20 (parked
 /// scalars as virtual registers). 5: merged at `VERSION` 21 (the
 /// cache record gains root UAVs and the address-map and words flags). 6: (heap indices
-/// bounded).
-pub const VERSION_BREAKING: u32 = 6;
+/// bounded). 7: merged at `VERSION` 26 (non-uniform heap indices).
+pub const VERSION_BREAKING: u32 = 7;
 
 /// The mesh fallback's own translator version, part of the cache key of
 /// mesh programs only (a `VERSION` change retranslates every program,
@@ -372,6 +389,57 @@ pub struct Options {
     /// XNW: `XNW_PAGETABLE=1`, with GPU-side descriptors): buffer
     /// records tagged [`PAGE_TAG`] are read through the page table.
     pub pagetable: bool,
+    /// XNW: the host has SM 6.1 barycentrics (OPTIONS3
+    /// BarycentricsSupported): an interpolation with computed barycentrics
+    /// reads the attribute's vertices (`attributeAtVertex`) and the
+    /// barycentrics (`SV_Barycentrics`), as victory-fork 578d459 does.
+    /// Off: refused, as before (the RX 5700 XT reports 0; WARP 1.0.22, 1).
+    pub barycentrics: bool,
+    /// XNW (`XNW_HEAP_NONUNIFORM=<hash prefix>,...|all`): every
+    /// descriptor heap index of the program is declared non-uniform. Our
+    /// "scalar" indices are per-lane values that lanes outside the
+    /// executing mask never computed; WARP 1.0.22 reads a uniform-declared
+    /// index from lane 0 whether or not it runs (ref4b: CS_Prop_BatchCull
+    /// 0451d340, lane 0 slot 0, a null, lane 1 slot 729: AV at 0x388).
+    pub nonuniform_heap: bool,
+    /// XNW (`XNW_HEAP_UNIFORMITY=off`): every heap index keeps
+    /// the form the lowering gave it; the uniformity pass
+    /// (`bitcode::uniform`), which declares non-uniform each index that
+    /// may differ between lanes, is skipped. For bisecting only.
+    pub keep_uniform_heap: bool,
+    /// XNW: the host reads a uniform-declared heap index from
+    /// lane 0 whether lane 0 runs or not (WARP 1.0.22): an index
+    /// read where only some lanes run is declared non-uniform too
+    /// ("masked" in `bitcode::uniform`). Off: only indices that vary
+    /// between lanes (the hardware adapter: its compiler reads the first
+    /// active lane). `XNW_ADAPTER=warp`, or `XNW_HEAP_UNIFORMITY=masked`.
+    pub masked_lanes: bool,
+}
+
+thread_local! {
+    /// [`Options::nonuniform_heap`] of the translation on this thread.
+    pub(crate) static NONUNIFORM_HEAP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// [`Options::keep_uniform_heap`] and [`Options::masked_lanes`] of the
+    /// translation on this thread.
+    pub(crate) static HEAP_UNIFORMITY: std::cell::Cell<(bool, bool)> = const { std::cell::Cell::new((false, false)) };
+}
+
+/// `XNW_HEAP_UNIFORMITY`: `off` ([`Options::keep_uniform_heap`]), `masked`
+/// ([`Options::masked_lanes`] on any adapter); else the masked rule with
+/// `XNW_ADAPTER=warp` only (read each time: replay sets it when it picks
+/// the adapter). Returns (keep, masked).
+pub fn heap_uniformity() -> (bool, bool) {
+    let v = std::env::var("XNW_HEAP_UNIFORMITY").unwrap_or_default();
+    let warp = std::env::var("XNW_ADAPTER").is_ok_and(|a| a.trim().eq_ignore_ascii_case("warp"));
+    (v.trim() == "off", v.trim() == "masked" || warp)
+}
+
+/// Whether `XNW_HEAP_NONUNIFORM` names the program with container hash `hash`.
+pub fn nonuniform_heap_for(hash: u128) -> bool {
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let list = LIST.get_or_init(|| std::env::var("XNW_HEAP_NONUNIFORM").unwrap_or_default().split(',').map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty()).collect());
+    let hex = format!("{hash:032x}");
+    list.iter().any(|p| p == "all" || hex.starts_with(p.as_str()))
 }
 
 /// Where a translated program finds its descriptors (XNW; the record
@@ -535,6 +603,7 @@ pub struct UserData {
 pub fn runtime_options(stage: &str, hash: u128, probe: bool, loop_counts: Option<u32>) -> Options {
     static PAGETABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let pagetable = *PAGETABLE.get_or_init(|| std::env::var("XNW_PAGETABLE").is_ok_and(|v| v.trim() == "1"));
+    let uniformity = heap_uniformity();
     Options {
         fma: fma_for(hash),
         mesh: if stage == "mesh" { MeshForm::Fallback } else { MeshForm::Native },
@@ -542,6 +611,12 @@ pub fn runtime_options(stage: &str, hash: u128, probe: bool, loop_counts: Option
         probe,
         loop_counts,
         pagetable,
+        // XNW: a host with barycentrics; xnw-gpu's `options_for`
+        // puts the device's answer here.
+        barycentrics: true,
+        nonuniform_heap: nonuniform_heap_for(hash),
+        keep_uniform_heap: uniformity.0,
+        masked_lanes: uniformity.1,
     }
 }
 
@@ -570,6 +645,14 @@ pub fn fma_for(hash: u128) -> Fma {
 /// translated (after any clean-up pass; 0 before the first).
 pub fn last_insts() -> usize {
     shader::INSTS.with(std::cell::Cell::get)
+}
+
+/// XNW: of the last program this thread translated, the heap
+/// handles the uniformity pass declared non-uniform, those of them whose
+/// index varies between lanes (the rest: read where only some lanes run),
+/// and all heap handles (0, 0, 0 with the pass off).
+pub fn last_nonuniform() -> (usize, usize, usize) {
+    shader::NONUNIFORM_MARKED.with(std::cell::Cell::get)
 }
 
 thread_local! {
@@ -603,7 +686,31 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 }
 
 /// [`translate`] with options (XNW addition: the multiply-add mode).
+///
+/// victory-fork a26859f: a program refused because the first half of an
+/// interpolation is read as data is translated once more with first halves
+/// evaluated as the pair they start (`lower::with_first_half_pairs`), and
+/// only such a program: with that on for every program, 8,551 pixel
+/// programs of the title that already translated came out changed (an extra
+/// evaluation in each), for the sake of 9 that did not translate.
 pub fn translate_with(container: &[u8], opts: Options) -> Result<HostShader, ShaderError> {
+    translate_patched(container, opts, &[])
+}
+
+/// `translate_with` over code with `words` (byte offset, instruction word)
+/// written over the program's code after its export patches: the debug
+/// export of `world-render --lighting --ps-patch` (XNW LIT3). Same-size
+/// replacements only; nothing else calls it with words.
+pub fn translate_patched(container: &[u8], opts: Options, words: &[(u32, u32)]) -> Result<HostShader, ShaderError> {
+    match translate_plain(container, opts, words) {
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
+            lower::with_first_half_pairs(|| translate_plain(container, opts, words))
+        }
+        other => other,
+    }
+}
+
+fn translate_plain(container: &[u8], opts: Options, words: &[(u32, u32)]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -629,7 +736,13 @@ pub fn translate_with(container: &[u8], opts: Options) -> Result<HostShader, Sha
             .iter()
             .all(|r| native.stage.user_sgpr(r.user_data) >= 16);
     let t = std::time::Instant::now();
-    let p = ir::build_with(&native.patched_code(), native.wave64, native.vgprs, spilled);
+    let mut code = native.patched_code();
+    for &(off, word) in words {
+        let at = off as usize;
+        let slot = code.get_mut(at..at + 4).ok_or(ShaderError::Malformed("debug patch outside the code"))?;
+        slot.copy_from_slice(&word.to_le_bytes());
+    }
+    let p = ir::build_with(&code, native.wave64, native.vgprs, spilled);
     lap("ir", t);
     let p = p?;
     let t = std::time::Instant::now();
@@ -728,6 +841,8 @@ pub fn emit_with(
         }
         _ => 0,
     };
+    NONUNIFORM_HEAP.with(|f| f.set(opts.nonuniform_heap));
+    HEAP_UNIFORMITY.with(|f| f.set((opts.keep_uniform_heap, opts.masked_lanes)));
     let l = lower::lower(&lower::Parts {
         native,
         p,
@@ -744,7 +859,11 @@ pub fn emit_with(
         probe: opts.probe,
         loop_counts: opts.loop_counts,
         pagetable: opts.pagetable,
-    })?;
+        barycentrics: opts.barycentrics,
+    });
+    NONUNIFORM_HEAP.with(|f| f.set(false));
+    HEAP_UNIFORMITY.with(|f| f.set((false, false)));
+    let l = l?;
     Ok(HostShader {
         stage: native.stage,
         dxil: l.dxil,
@@ -1468,6 +1587,7 @@ mod tests {
             probe: false,
             loop_counts: None,
             pagetable: false,
+            barycentrics: false,
         })
         .unwrap();
         let mut dxil = l.dxil;

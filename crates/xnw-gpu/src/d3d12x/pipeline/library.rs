@@ -12,7 +12,16 @@
 //! compiler (a crash parks the thread, an endless compile is suspended,
 //! both are left out from then on). Changed: Win32 through xnw-core, a
 //! lost worker is not replaced, the crashed list holds this run's too.
-//!
+//! One library file per translator generation (`VERSION_BREAKING`):
+//! `host-pipelines-g<N>.bin`, the newest two kept and the older deleted:
+//! VIctory (`pipeline/library.rs` at upstream, GPL-3.0-or-later)
+//! keeps `dir/<translator hash>` per translation, because one shared file
+//! was overwritten by a 612 KB one after a translator edit (926 MB, 7.5
+//! minutes of warm-up lost). Changed: our generation is `VERSION_BREAKING`,
+//! not a source hash; a new generation's library starts from the newest
+//! other one (pipelines are named by their DXIL, so every program the new
+//! translator left unchanged is still a hit), and the file from before
+//! generations, `host-pipelines.bin`, counts as generation 0.
 //!
 //! 1. Every host pipeline goes into the host's pipeline library, named by
 //!    a hash of all that its host description holds (the translated
@@ -76,7 +85,53 @@ struct Library {
 // mutex that holds the library.
 unsafe impl Send for Library {}
 
-const LIBRARY_FILE: &str = "host-pipelines.bin";
+/// The library file of before generations (read once as a seed, then deleted).
+const LEGACY_FILE: &str = "host-pipelines.bin";
+/// Library files kept: the current generation's and the newest other.
+const KEEP_FILES: usize = 2;
+
+/// The library file of the current translator generation in `dir`.
+pub(crate) fn library_file(dir: &Path) -> PathBuf {
+    dir.join(format!("host-pipelines-g{}.bin", xnw_shader::emit::VERSION_BREAKING))
+}
+
+/// The library files in `dir` other than generation `current`'s, newest
+/// first: `(generation, path)`, the legacy file as generation 0.
+fn other_files(dir: &Path, current: u32) -> Vec<(u32, PathBuf)> {
+    let mut v: Vec<(u32, PathBuf)> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| {
+            let e = e.ok()?;
+            let name = e.file_name().into_string().ok()?;
+            let g: u32 = if name == LEGACY_FILE { 0 } else { name.strip_prefix("host-pipelines-g")?.strip_suffix(".bin")?.parse().ok()? };
+            (g != current).then(|| (g, e.path()))
+        })
+        .collect();
+    v.sort_by(|a, b| b.0.cmp(&a.0));
+    v
+}
+
+/// The library bytes to open: the current generation's file, else the newest
+/// other generation's (the seed); the files past [`KEEP_FILES`] deleted.
+fn read_library(dir: &Path) -> Vec<u8> {
+    let current = xnw_shader::emit::VERSION_BREAKING;
+    let others = other_files(dir, current);
+    for (_, p) in others.iter().skip(KEEP_FILES - 1) {
+        xnw_core::info!("d3d12x: pipeline library {} deleted (newest {KEEP_FILES} kept)", p.display());
+        let _ = std::fs::remove_file(p);
+    }
+    if let Ok(bytes) = std::fs::read(library_file(dir)) {
+        return bytes;
+    }
+    match others.first().and_then(|(g, p)| Some((g, std::fs::read(p).ok()?))) {
+        Some((g, bytes)) => {
+            xnw_core::info!("d3d12x: no pipeline library for generation {current}: starting from generation {g}'s ({} bytes)", bytes.len());
+            bytes
+        }
+        None => Vec::new(),
+    }
+}
 /// The pipeline list's file name (not versioned).
 const LIST_FILE: &str = "pipeline-list.txt";
 /// Lists of earlier builds (one per translator version), imported once.
@@ -94,10 +149,7 @@ fn library() -> Option<&'static Mutex<Library>> {
     LIBRARY
         .get_or_init(|| {
             let device = super::super::host::host_device()?.device.cast::<ID3D12Device1>().ok()?;
-            let blob = DIR
-                .get()
-                .and_then(|d| std::fs::read(d.join(LIBRARY_FILE)).ok())
-                .unwrap_or_default();
+            let blob = DIR.get().map(|d| read_library(d)).unwrap_or_default();
             let library = open(&device, blob);
             if library.is_none() {
                 xnw_core::warn!("d3d12x: no host pipeline library: pipelines are not kept");
@@ -566,7 +618,7 @@ fn serialize_library(library: &Mutex<Library>, buf: &mut Vec<u8>) -> Option<(usi
     }
 }
 
-/// Performs the actual snapshot + unlocked disk I/O for `host-pipelines.bin`
+/// Performs the actual snapshot + unlocked disk I/O for `host-pipelines-g<N>.bin`
 /// and `early-pipelines.txt`.
 fn perform_save(dir: &Path, buf: &mut Vec<u8>) {
     let Some(library) = library() else { return };
@@ -591,7 +643,7 @@ fn perform_save(dir: &Path, buf: &mut Vec<u8>) {
     let mut lib_bytes = 0usize;
     let mut ok = true;
     if let Some((len, added)) = serialized {
-        if let Err(e) = write_atomically(&dir.join(LIBRARY_FILE), &buf[..len]) {
+        if let Err(e) = write_atomically(&library_file(dir), &buf[..len]) {
             library.lock().unwrap_or_else(|e| e.into_inner()).added += added;
             LIBRARY_DIRTY.store(true, Ordering::Relaxed);
             xnw_core::warn!("d3d12x: host pipeline library not saved: {e}");

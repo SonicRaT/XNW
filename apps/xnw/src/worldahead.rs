@@ -564,7 +564,7 @@ pub(crate) fn host_geometry(key: &GeomKey) -> Option<HostGeometry> {
             _ => return None,
         }
     };
-    Some(HostGeometry { vertices: Vec::new(), indices, raw_vb: Some(vb) })
+    Some(HostGeometry { vertices: Vec::new(), indices, raw_vb: Some(vb), vb_place: 0 })
 }
 
 /// Counters since the last log line, and totals.

@@ -4,8 +4,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use xnw_world::GeomKey;
@@ -57,6 +56,10 @@ pub fn render_cli(args: &[String]) -> Result<(), String> {
     }
     let t_setup = Instant::now();
     let (host, mut pass) = pass_from_args(args)?;
+    // `headgraph=on` (XNW_WORLD_RENDER, default off; HEAD1): the title's head compute graph first; its table feeds t74/t75 and the strands' slot 7.
+    if let Some(line) = crate::head_graph::prepare(dir, &host) {
+        println!("{line}");
+    }
     // `--jitter`: the projection as captured, the title's TAA jitter kept (default: dropped).
     xnw_world::keep_jitter(args.iter().any(|a| a == "--jitter"));
     // `--bridgeps on|<hash>+<hash>` or `XNW_WORLD_RENDER=...,bridgeps=...`: those rows by the title's own programs in our pass.
@@ -73,9 +76,21 @@ pub fn render_cli(args: &[String]) -> Result<(), String> {
     if let Some(k) = opt("--bridge") {
         return crate::bridge::cli(args, dir, &k, &host, &mut pass);
     }
+    // `--lighting <sink|auto> [--gbuf theirs|ours]`: the title's tiled lighting over one full screen (LIT2).
+    if opt("--lighting").is_some() {
+        return crate::lighting::cli(args, dir, &host, &mut pass);
+    }
     // `--hair-bridge`: the frame's strand draws through the title's vertex program (depth only).
     if args.iter().any(|a| a == "--hair-bridge") {
-        return crate::hair::bridge_cli(args, dir, &host, (pass.width, pass.height));
+        return crate::hair::bridge_cli(args, dir, &host, (pass.width, pass.height)).map(|_| ());
+    }
+    // `hair=on` (XNW_WORLD_RENDER, default off; HAIR2): the title's strand chain and strand draws
+    // first, their pixels painted over our pass's picture where they pass the depth test against our pass's depth (HAIR4).
+    if xnw_world::hair::switch_on(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default()) {
+        let mut a = args.to_vec();
+        a.retain(|x| x != "--out");
+        a.push("--hair-chain".into());
+        crate::hair::set_overlay(crate::hair::bridge_cli(&a, dir, &host, (pass.width, pass.height))?);
     }
     if let Some(side) = opt("--bridge-audit") {
         return crate::bridge::audit_cli(args, dir, &side, &host, &mut pass);
@@ -105,10 +120,12 @@ pub fn render_cli(args: &[String]) -> Result<(), String> {
         for (n, frame) in frames {
             render_one(args, &frame, &out_dir.join(format!("seq-{n:05}.png")), &mut pass, &host.caps.adapter, n)?;
         }
+        layer_report(&pass);
         return Ok(());
     }
     let out = opt("--out").map_or_else(|| dir.join("w4-d3d12.png"), PathBuf::from);
     let r = render_one(args, dir, &out, &mut pass, &host.caps.adapter, 0);
+    layer_report(&pass);
     eprintln!("  total {:.0} ms before teardown", t_setup.elapsed().as_secs_f64() * 1e3);
     r
 }
@@ -133,6 +150,18 @@ pub fn render_one(args: &[String], dir: &std::path::Path, out: &std::path::Path,
         if preskin_gpu {
             println!("  pre-skin pipeline made in {:.0} ms", pass.preskin_prepare()?);
         }
+        // `--gpucull[=check|cpu]`: the instanced rows culled by our compute pass (PERF3); `cpu`: by the reference, drawn from the CPU buffer.
+        let gpucull = args.iter().find(|a| a.starts_with("--gpucull")).cloned();
+        if let Some(g) = &gpucull {
+            let rep = crate::gpucull::fill(dir, &mut list, g != "--gpucull=cpu")?;
+            for l in crate::gpucull::lines(&rep, &list.cull) {
+                println!("  {l}");
+            }
+            println!("  gpu cull pipeline made in {:.0} ms", pass.cull.prepare_on(pass.device().clone())?);
+            if g == "--gpucull=check" {
+                println!("  {}", crate::gpucull::check(pass, &list.cull)?);
+            }
+        }
         list_options(args, &mut list);
         // A v2 frame gives its texels (pack origin or stored bytes) unless
         // `--tex=checker` or `--tex=off`; slots it has none for stay flat.
@@ -151,13 +180,22 @@ pub fn render_one(args: &[String], dir: &std::path::Path, out: &std::path::Path,
         }
         let mut decode = |k: &GeomKey| -> Option<HostGeometry> {
             let (vb, idx) = geoms.get(k)?;
-            Some(HostGeometry { vertices: Vec::new(), indices: idx.clone(), raw_vb: Some(vb.clone()) })
+            Some(HostGeometry { vertices: Vec::new(), indices: idx.clone(), raw_vb: Some(vb.clone()), vb_place: 0 })
         };
+        // `--warm`: the frame once first, its pictures thrown away, so the
+        // timed frame finds uploads, texture reads and pipelines done.
+        if args.iter().any(|a| a == "--warm") {
+            watchdog_arm();
+            pass.draw(&list, &mut decode, false)?;
+            watchdog_disarm();
+            println!("  {}", watch_line(&format!("frame {frame_no} warm-up")));
+        }
         watchdog_arm();
         let t = Instant::now();
         let st = pass.draw(&list, &mut decode, true)?;
         if args.iter().any(|a| a == "--cuts") {
             watchdog_disarm();
+            println!("  {}", watch_line(&format!("frame {frame_no}")));
             let ours = t.elapsed().as_secs_f64() * 1e3;
             println!(
                 "cuts frame {frame_no}: coverage {:.2}{}, upload {:.1} ms ({} geometries, {} KiB, {} pending), textures {:.1} ms, record {:.1} ms, GPU {:.1} ms, ours {ours:.1} ms{}",
@@ -175,11 +213,17 @@ pub fn render_one(args: &[String], dir: &std::path::Path, out: &std::path::Path,
             );
             return Ok(());
         }
-        let rgba = pass.read_rgba()?;
+        let mut rgba = pass.read_rgba()?;
         watchdog_disarm();
+        println!("  {}", watch_line(&format!("frame {frame_no}")));
+        let scene = if crate::hair::overlay_pending() { Some(pass.read_depth()?) } else { None };
+        crate::hair::overlay(&mut rgba, scene.as_deref());
         write_png(out, pass.width, pass.height, &rgba).map_err(|e| e.to_string())?;
         if preskin_gpu {
             println!("  {}", xnw_world::preskin_gpu::line(list.frame, &list.preskin, &pass.preskin_stats()));
+        }
+        if gpucull.is_some() && !list.cull.rows.is_empty() {
+            println!("  {}", xnw_world::gpucull::line(list.frame, &pass.cull_stats()).trim_start_matches("world render: "));
         }
         println!("{} (live list): {} records, {} main view; drawn {} ({} triangles, {} skinned, {} instanced with {} instances, {} without geometry); {} geometries; record {:.1} ms, GPU {:.1} ms -> {}", dir.display(), list.draws.len(), list.main_draws().count(), st.draws, st.triangles, st.skinned, st.instanced, st.instances, st.skipped, geoms.len(), st.record_ms, st.gpu_ms, out.display());
         let ts = std::mem::take(&mut pass.tex.stats);
@@ -287,7 +331,7 @@ pub fn render_one(args: &[String], dir: &std::path::Path, out: &std::path::Path,
     let mut decode = |k: &GeomKey| -> Option<HostGeometry> {
         if raw_path {
             let (vb, idx) = frame.raw.get(&k.mesh_at)?;
-            return Some(HostGeometry { vertices: Vec::new(), indices: idx.clone(), raw_vb: Some(vb.clone()) });
+            return Some(HostGeometry { vertices: Vec::new(), indices: idx.clone(), raw_vb: Some(vb.clone()), vb_place: 0 });
         }
         let base = frame.meshes.get(&k.mesh_at)?;
         let owned = (k.vb_at != 0 && skin_on).then(|| base.skinned(frame.palettes.get(&k.vb_at)?)).flatten();
@@ -301,7 +345,7 @@ pub fn render_one(args: &[String], dir: &std::path::Path, out: &std::path::Path,
             println!("skin {:#x} palette {:#x} ({bones} bones, max index {max_idx}): bind span {:.2} m, skinned span {:.2} m, {} vertices", k.mesh_at, k.vb_at, span(&base.pos), span(&o.pos), o.pos.len());
         }
         let m = owned.as_ref().unwrap_or(base);
-        Some(HostGeometry { vertices: pack_vertices(&m.pos, &m.normal, &m.uv), indices: m.tris.iter().flatten().copied().collect(), raw_vb: None })
+        Some(HostGeometry { vertices: pack_vertices(&m.pos, &m.normal, &m.uv), indices: m.tris.iter().flatten().copied().collect(), raw_vb: None, vb_place: 0 })
     };
     watchdog_arm();
     let first = pass.draw(&list, &mut decode, false)?;
@@ -313,6 +357,7 @@ pub fn render_one(args: &[String], dir: &std::path::Path, out: &std::path::Path,
     }
     let rgba = pass.read_rgba()?;
     watchdog_disarm();
+    println!("  {}", watch_line("probe frame, cached"));
     let skin_meshes = frame.meshes.values().filter(|m| !m.skin.is_empty()).count();
     write_png(out, w, h, &rgba).map_err(|e| e.to_string())?;
     let cam = list.main_camera().map_or(0, |c| c.viewport);
@@ -337,6 +382,16 @@ pub fn render_one(args: &[String], dir: &std::path::Path, out: &std::path::Path,
         out.display()
     );
     Ok(())
+}
+
+/// The validation layer's stored messages (`XNW_GPU_DEBUG=layer[,gbv]`),
+/// one line per message id; `validation layer: 0 messages stored` is clean.
+pub fn layer_report(pass: &xnw_world::Pass) {
+    if std::env::var("XNW_GPU_DEBUG").is_ok_and(|v| v.contains("layer")) {
+        for l in pass.layer_messages() {
+            println!("{l}");
+        }
+    }
 }
 
 /// An RGBA image as PNG (zlib-stored deflate from xnw-formats? no: a minimal
@@ -400,6 +455,8 @@ pub fn list_options(args: &[String], list: &mut xnw_world::FrameList) {
         // The pre-skin's draws follow their rows.
         let kept: Vec<usize> = (0..i).filter(|k| keep.contains(k)).collect();
         list.preskin = crate::preskin_gpu::subset(&list.preskin, &kept);
+        // The device-culled rows follow theirs too.
+        list.cull.rows = list.cull.rows.iter().filter_map(|&(d, b)| Some((kept.iter().position(|k| *k == d as usize)? as u32, b))).collect();
     }
     // `--preskin-bits` bit 3 (live `preskinbits`): ped-flagged rows without a ped remap drawn as skinned props.
     let bits = args.iter().position(|a| a == "--preskin-bits").and_then(|i| args.get(i + 1)).and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok()).unwrap_or(0);
@@ -424,26 +481,34 @@ pub fn list_options(args: &[String], list: &mut xnw_world::FrameList) {
 pub fn pass_from_args(args: &[String]) -> Result<(xnw_gpu::host::Host, xnw_world::Pass), String> {
     let opt = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned();
     // `--adapter hw` draws on the hardware adapter (our own pass and HLSL only,
-    // never the title's programs), under a 1 s per-frame watchdog.
+    // never the title's programs), under the per-submission GPU watchdog.
     let hw = match opt("--adapter").as_deref() {
         Some("warp") => false,
         Some("hw") => true,
-        _ => return Err("world-render: pass --adapter warp (software) or --adapter hw (hardware, 1 s per-frame watchdog)".into()),
+        _ => return Err(format!("world-render: pass --adapter warp (software) or --adapter hw (hardware, {WATCHDOG_MS} ms per-submission GPU watchdog)")),
     };
     // SAFETY: set before any thread of ours reads the environment.
     unsafe { std::env::set_var("XNW_ADAPTER", if hw { "hw" } else { "warp" }) };
     let (w, h) = opt("--size").and_then(|s| s.split_once('x').and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)))).unwrap_or((1280u32, 720u32));
     let t_setup = Instant::now();
-    let host = xnw_gpu::host::Host::new(None).map_err(|e| e.to_string())?;
+    // The hardware adapter takes `XNW_AGILITY` too (shader model 6.6 for
+    // the title's translated programs, as the live device has it).
+    let agility = if hw { std::env::var_os("XNW_AGILITY").filter(|p| !p.is_empty()).map(std::path::PathBuf::from) } else { None };
+    let host = xnw_gpu::host::Host::new(agility.as_deref()).map_err(|e| e.to_string())?;
     let t_device = t_setup.elapsed().as_secs_f64() * 1e3;
     if host.caps.software == hw {
         return Err(format!("asked for the {} adapter, got {}", if hw { "hardware" } else { "software" }, host.caps.adapter));
     }
     if hw {
-        // `--watchdog-ms N`: another limit (tests prove the watchdog with a tiny one).
-        watchdog_start(Duration::from_millis(opt("--watchdog-ms").and_then(|v| v.parse().ok()).unwrap_or(1000)));
+        // `--watchdog-ms N`: another budget (tests prove the watchdog with a tiny one).
+        watchdog_start(Duration::from_millis(opt("--watchdog-ms").and_then(|v| v.parse().ok()).unwrap_or(WATCHDOG_MS)));
+    } else if let Some(ms) = opt("--watchdog-ms").and_then(|v| v.parse().ok()) {
+        // On the software adapter only when asked (WARP's "GPU" is the CPU: a frame takes seconds).
+        watchdog_start(Duration::from_millis(ms));
     }
     let mut pass = xnw_world::Pass::new(&host, w, h)?;
+    // `--chunk N`: N draws per submission, each waited for before the next is sent.
+    pass.chunk = opt("--chunk").and_then(|v| v.parse().ok()).unwrap_or(0);
     eprintln!("  {}: device {t_device:.0} ms, pass (pipelines) {:.0} ms", host.caps.adapter, t_setup.elapsed().as_secs_f64() * 1e3 - t_device);
     // `--shader <file>`: the world pass shader from a file (default: the built-in one).
     if let Some(f) = opt("--shader") {
@@ -500,43 +565,47 @@ pub fn check_shader_table(src: &str) -> Result<(), String> {
 
 // ---- the hardware-adapter watchdog ----
 
-/// The watchdog: (start, limit) once started; `DEADLINE` is the armed
-/// deadline in ms since start (0 = disarmed).
-static WATCH: OnceLock<(Instant, Duration)> = OnceLock::new();
-static DEADLINE: AtomicU64 = AtomicU64::new(0);
+/// The GPU budget of one submission on the hardware adapter (`--watchdog-ms`
+/// changes it): well under the driver's 2 s timeout.
+pub const WATCHDOG_MS: u64 = 500;
 
-/// Starts the watchdog (hardware adapter only): a frame armed for longer
-/// than `limit` exits the process (code 3) before the driver's 2 s timeout.
+/// The frame being timed: its start and, once disarmed, its wall milliseconds.
+static FRAME: Mutex<Option<(Instant, Option<f64>)>> = Mutex::new(None);
+
+/// Starts the watchdog (hardware adapter only): one submission whose GPU
+/// time (ExecuteCommandLists to its fence; `xnw_gpu::gpuwatch`) passes
+/// `limit` exits the process (code 3). CPU work (recording, uploads,
+/// texture reads, pipeline builds) is not timed against it: a cold first
+/// frame's seconds of setup no longer look like a stuck card.
 pub fn watchdog_start(limit: Duration) {
-    if WATCH.set((Instant::now(), limit)).is_err() {
-        return;
-    }
-    std::thread::spawn(|| {
-        let (t0, limit) = *WATCH.get().unwrap();
-        loop {
-            std::thread::sleep(Duration::from_millis(20));
-            let d = DEADLINE.load(Ordering::Acquire);
-            if d != 0 && t0.elapsed().as_millis() as u64 > d {
-                eprintln!("xnw: watchdog: a frame on the hardware adapter took over {} ms: exiting before the driver's timeout", limit.as_millis());
-                std::process::exit(3);
-            }
-        }
-    });
+    xnw_gpu::gpuwatch::start(limit);
 }
 
 /// True once the watchdog runs (the hardware adapter is in use).
 pub fn hw_adapter() -> bool {
-    WATCH.get().is_some()
+    xnw_gpu::gpuwatch::budget().is_some()
 }
 
-/// Arms the watchdog for one frame (no-op on WARP).
+/// Marks a frame's start (either adapter): its submissions are logged from here.
 pub fn watchdog_arm() {
-    if let Some((t0, limit)) = WATCH.get() {
-        DEADLINE.store((t0.elapsed() + *limit).as_millis() as u64, Ordering::Release);
+    let _ = xnw_gpu::gpuwatch::take();
+    if let Ok(mut f) = FRAME.lock() {
+        *f = Some((Instant::now(), None));
     }
 }
 
-/// Disarms it after the frame's readback.
+/// Marks its end (after the readback).
 pub fn watchdog_disarm() {
-    DEADLINE.store(0, Ordering::Release);
+    if let Ok(mut f) = FRAME.lock()
+        && let Some((t, None)) = *f
+    {
+        *f = Some((t, Some(t.elapsed().as_secs_f64() * 1e3)));
+    }
+}
+
+/// The last armed frame's line: its CPU time apart from its submissions'
+/// GPU waits, the longest submission, the budget (`gpu watch: ...`).
+pub fn watch_line(what: &str) -> String {
+    let ms = FRAME.lock().ok().and_then(|f| f.and_then(|(t, d)| Some(d.unwrap_or_else(|| t.elapsed().as_secs_f64() * 1e3)))).unwrap_or(0.0);
+    xnw_gpu::gpuwatch::line(what, ms, &xnw_gpu::gpuwatch::take())
 }

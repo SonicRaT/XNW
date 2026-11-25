@@ -87,6 +87,18 @@ pub struct BatchStats {
     pub merged: u64,
     /// New bytes: large views, small views, textures, root views.
     pub new: [u64; 4],
+    /// `XNW_ZEROCOPY` (ZC2): views bound in place in title memory; on a
+    /// buffer per title address (views, bytes made); rows' views refused one
+    /// for a conflicting byte.
+    pub in_place: u64,
+    pub by_addr: [u64; 3],
+    /// Title spans declared, and their bytes.
+    pub spans: (u64, u64),
+    /// Large views off the spans by why, bytes shadowed and overridden by a
+    /// row's own words ([`bridge::Shared::off_span`], ZC3).
+    pub off_span: [(u64, u64); 4],
+    pub shadowed: u64,
+    pub overrode: u64,
 }
 
 /// The bridged rows of one frame and the pipelines of every frame.
@@ -140,6 +152,9 @@ impl Batch {
         self.items.clear();
         self.by_row.clear();
         self.shared = bridge::Shared::default();
+        if std::env::var("XNW_ZEROCOPY_SPANCHECK").is_ok_and(|v| v == "1") {
+            self.shared.check = Some(Vec::new());
+        }
         (self.rec_used, self.idx_used) = (0, 0);
         let pipelines = (self.stats.pipelines_made, self.stats.pipeline_ms);
         self.stats = BatchStats { pipelines_made: pipelines.0, pipeline_ms: pipelines.1, ..Default::default() };
@@ -160,13 +175,34 @@ impl Batch {
         Ok(())
     }
 
+    /// The title ranges (address, bytes, the view's unit) this frame's rows
+    /// will bind (after [`Batch::begin`]): views inside them share one
+    /// buffer per span of title memory (`XNW_ZEROCOPY`, ZC2), in layers by
+    /// the offsets their units allow ([`bridge::plan_spans`], ZC3).
+    pub fn use_ranges(&mut self, ranges: Vec<(u64, u64, u64)>) {
+        let layers = bridge::plan_spans(ranges);
+        let all = || layers.iter().flatten();
+        self.stats.spans = (all().count() as u64, all().map(|s| s.1 - s.0).sum());
+        let largest = all().map(|s| s.1 - s.0).max().unwrap_or(0);
+        xnw_core::info!("bridgems: title spans {} in {} layers ({} MiB, largest {} MiB)", self.stats.spans.0, layers.len(), self.stats.spans.1 >> 20, largest >> 20);
+        self.shared.use_spans(layers);
+    }
+
     /// Row `row` of the list (its index) drawn by program `prog` with
-    /// binding `b`: put on the device, given its ring segment.
-    pub fn add(&mut self, dev: &ID3D12Device, row: u32, prog: usize, b: &Binding) -> Result<(), String> {
+    /// binding `b`: put on the device, given its ring segment. `addrs`: the
+    /// title address of the binding's buffer bytes, by their address
+    /// ([`bridge::Shared::addrs`]; empty: none known).
+    pub fn add(&mut self, dev: &ID3D12Device, row: u32, prog: usize, b: &Binding, addrs: &[(usize, bridge::TitleView)]) -> Result<(), String> {
         let t = std::time::Instant::now();
         let (_, list) = self.copies.as_ref().ok_or("Batch::add before Batch::begin")?;
         let pr = &self.progs[prog];
+        self.shared.addrs.clear();
+        self.shared.addrs.extend(addrs.iter().cloned());
+        self.shared.row = row;
         let up = bridge::upload(dev, list, b, &pr.pipes, &mut self.shared)?;
+        self.stats.in_place = self.shared.in_place;
+        self.stats.by_addr = [self.shared.by_addr_views, self.shared.by_addr_bytes, self.shared.by_addr_conflicts];
+        (self.stats.off_span, self.stats.shadowed, self.stats.overrode) = (self.shared.off_span, self.shared.shadowed, self.shared.overrode);
         self.stats.heap_slots = self.stats.heap_slots.max(b.views.heap_slots);
         let groups = u64::from(b.groups.max(1));
         let (rec_at, idx_at) = (self.rec_used, self.idx_used);
@@ -192,12 +228,14 @@ impl Batch {
             unsafe {
                 list.Close().map_err(e)?;
                 queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(list).map_err(e)?)]);
+                let sent = xnw_gpu::gpuwatch::begin("bridgems uploads");
                 let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
                 queue.Signal(&fence, 1).map_err(e)?;
                 while fence.GetCompletedValue() < 1 {
                     dev.GetDeviceRemovedReason().map_err(|x| format!("bridgems uploads: {}", e(x)))?;
                     std::thread::yield_now();
                 }
+                xnw_gpu::gpuwatch::end("bridgems uploads", sent, None);
             }
         }
         let (rec, idx) = (self.rec_used.max(SEGMENT_ALIGN), self.idx_used.max(SEGMENT_ALIGN));
@@ -209,6 +247,13 @@ impl Batch {
         self.stats.ring_bytes = self.rec_used + self.idx_used;
         (self.stats.shared_bytes, self.stats.merged, self.stats.new) = (self.shared.saved, self.shared.merged, self.shared.new);
         self.stats.programs = self.items.iter().map(|i| i.prog).collect::<std::collections::HashSet<_>>().len();
+        if self.shared.check.is_some() {
+            let bad = self.shared.span_check();
+            xnw_core::info!("bridgems span check: {} views on spans, {} read bytes not their own", self.shared.check.as_ref().map_or(0, Vec::len), bad.len());
+            for (row, slot, addr, differ, of, at, own) in &bad {
+                xnw_core::info!("bridgems span check: row {row} slot {slot} at {addr:#x}: {differ} of {of} blocks differ, first at +{at:#x} ({})", if *own { "its own words" } else { "its copy" });
+            }
+        }
         self.stats.upload_ms += t.elapsed().as_secs_f64() * 1e3;
         Ok(())
     }
@@ -275,8 +320,12 @@ impl Batch {
 /// Our pass's depth target ([`bridge::Into::depth`], depth-write state)
 /// read back as float rows.
 pub fn read_depth(host: &xnw_gpu::host::Host, depth: &ID3D12Resource, w: u32, h: u32) -> Result<Vec<f32>, String> {
+    read_depth_on(&host.device, &host.queue, depth, w, h)
+}
+
+/// [`read_depth`] on a device and queue (the pass's own: `Pass::read_depth`).
+pub fn read_depth_on(dev: &ID3D12Device, queue: &ID3D12CommandQueue, depth: &ID3D12Resource, w: u32, h: u32) -> Result<Vec<f32>, String> {
     let e = |e: windows::core::Error| e.message().to_string();
-    let dev = &host.device;
     // SAFETY: D3D12 calls on resources that live until the fence says the GPU is done.
     unsafe {
         let desc = depth.GetDesc();
@@ -292,13 +341,15 @@ pub fn read_depth(host: &xnw_gpu::host::Host, depth: &ID3D12Resource, w: u32, h:
         list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
         list.ResourceBarrier(&[transition(depth, D3D12_RESOURCE_STATE_COPY_SOURCE, dw)]);
         list.Close().map_err(e)?;
-        host.queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).map_err(e)?)]);
+        queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).map_err(e)?)]);
+        let sent = xnw_gpu::gpuwatch::begin("bridgems readback");
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
-        host.queue.Signal(&fence, 1).map_err(e)?;
+        queue.Signal(&fence, 1).map_err(e)?;
         while fence.GetCompletedValue() < 1 {
             dev.GetDeviceRemovedReason().map_err(|x| format!("reading the depth target back: {}", e(x)))?;
             std::thread::yield_now();
         }
+        xnw_gpu::gpuwatch::end("bridgems readback", sent, None);
         let mut from = std::ptr::null_mut();
         back.Map(0, None, Some(&mut from)).map_err(e)?;
         let mut out = Vec::with_capacity((w * h) as usize);

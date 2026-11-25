@@ -1164,6 +1164,15 @@ impl State {
             let writes = p.stages.iter().any(|s| s.translated().writes_memory);
             list.defer_bindless(&host_heap, writes);
         }
+        // XNW_SLOT_WATCH: the watched slots as a watched program
+        // binds the heap (direct and indirect dispatches and draws).
+        if descriptor::slotwatch::pipe_watched(&p.name)
+            && self.heaps[0] != 0
+            && let Some(k) = descriptor::slotwatch::dispatch_reported()
+            && let Some(h) = descriptor::heap(self.heaps[0] as This).host_arc()
+        {
+            h.watch_report(&p.name, k);
+        }
         for stage in &p.stages {
             let t = stage.translated();
             let made = if gpu {
@@ -1932,14 +1941,17 @@ impl State {
     /// Hands this draw's binding to the frame pack's tap and the second
     /// draw consumer (tap.rs), each if registered (null mode included:
     /// before any host check).
+    /// An indirect compute dispatch (op INDIRECT_DISPATCH) hands the
+    /// compute roots.
     fn tap(&self, op: u8, count: u32, args: [u32; 4]) {
+        let set = if op == xnw_formats::framepack::op::INDIRECT_DISPATCH { &self.compute } else { &self.graphics };
         if let Some(f) = super::tap::get() {
-            self.tap_roots(f, op, count, [0; 2], args, &self.graphics);
+            self.tap_roots(f, op, count, [0; 2], args, set);
         }
         if let Some((want, f)) = super::tap::draw_tap()
             && want(self.pipeline)
         {
-            self.tap_roots(f, op, count, [0; 2], args, &self.graphics);
+            self.tap_roots(f, op, count, [0; 2], args, set);
         }
     }
 
@@ -2356,7 +2368,12 @@ impl State {
     pub(crate) fn execute_indirect(&mut self, list: &HostList, (kind, stride, max): (u32, u32, u32), arguments: u64, count: Option<u64>) -> bool {
         // The GPU meshlet-cull path's draws arrive here (one capture: 3,523 of
         // 4,149 draws a frame); kind 10 mesh, else draws/dispatches.
-        self.tap(if kind == 10 { xnw_formats::framepack::op::INDIRECT_MESH } else { xnw_formats::framepack::op::INDIRECT }, max, [0; 4]);
+        let op = match kind {
+            10 => xnw_formats::framepack::op::INDIRECT_MESH,
+            2 => xnw_formats::framepack::op::INDIRECT_DISPATCH,
+            _ => xnw_formats::framepack::op::INDIRECT,
+        };
+        self.tap(op, max, [0; 4]);
         const DRAW: u32 = 0;
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;

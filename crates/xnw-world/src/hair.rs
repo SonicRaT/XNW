@@ -35,6 +35,8 @@ pub const STRAND_VS: u128 = 0xf76935e03c6e77f2ab85441f194e4240;
 pub const STRAND_PS: u128 = 0x7e040f4d1d02c04db8e7fb072ebafe27;
 /// The shadow-cascade strand vertex program (no pixel program).
 pub const STRAND_SHADOW_VS: u128 = 0x58f72c1e72ee590a7d84ce1cf6538a49;
+/// `smh_pose_1:CS_PreSkinSimGuides` (HAIR3: [`sim_guide`]).
+pub const SIM_GUIDES: u128 = 0xed403b6d88dab0c1689e31f52fa043cd;
 /// Frame table (root 0) slots the main-view program reads.
 pub const POINTS_SLOT: u32 = 15;
 pub const WORLDS_SLOT: u32 = 18;
@@ -45,6 +47,13 @@ pub const VIEW_SLOT: u32 = 1;
 pub const GROUP_BYTES: usize = 336;
 pub const WORLD_BYTES: usize = 176;
 pub const POINT_BYTES: usize = 16;
+
+/// `hair=on` in an `XNW_WORLD_RENDER` value (default off, HAIR2): the
+/// title's strand chain and strand draws. The replay runs them
+/// (`world-render`); the live path is a stub while the card is frozen.
+pub fn switch_on(v: &str) -> bool {
+    v.split(',').map(str::trim).filter_map(|p| p.strip_prefix("hair=")).last().is_some_and(|s| s != "off")
+}
 
 /// IEEE half to f32.
 pub fn f16(h: u16) -> f32 {
@@ -176,6 +185,57 @@ impl Draw {
     }
 }
 
+/// HAIR3: `CS_PreSkinSimGuides` (ed403b6d, `smh_pose_1`; 0479e16e and
+/// 243b071d the same code) on the CPU, read from its native code (V). One
+/// lane per guide `g` of record `rec`'s asset (heap index rec+0x120; guides
+/// asset+0x58 low half, points a guide asset+0x5c low byte):
+/// - 8 bone bytes at asset[+0x10] + 8g, 8 weight bytes at asset[+0x14] + 8g,
+///   weights w = b/255 / (sum/255 + 1e-6) (0x120-0x2a4);
+/// - the guide's root rest point: f16 x, y, z at asset[+0x44] + 8 P g;
+/// - per bone j: palette bone = remap[rec+0xe4 + bone_j] & 0xfff (16-bit,
+///   `buffer_load_format_x`), M += w_j palette[rec+0xe8 + bone], M' += w_j
+///   palette[rec+0xec + bone] (3x4 row-major, 48 B; loop 0x2d8-0x4ac, two
+///   bones a turn: j and j+4);
+/// - out = M p - (R (M' p) + T), R|T the record's own 3x4 at +0x00
+///   (0x4b0-0x5a4); all three zero unless all three are finite;
+/// - stored as 3 f32 at pool[rec+0x144] + 12 g.
+///
+/// So the output is a displacement, not a position: with the same palette
+/// at +0xe8 and +0xec and R = I it is -T for every guide whatever the bones.
+/// `remap` holds u16 elements. `None` past the guide count.
+pub fn sim_guide(rec: &[u8], asset: &[u8], remap: &[u8], palette: &[u8], g: u32) -> Option<[f32; 3]> {
+    if g >= u32_at(asset, 0x58) & 0xffff {
+        return None;
+    }
+    let points = u32_at(asset, 0x5c) & 0xff;
+    let (bo, wo, ro) = (u32_at(asset, 0x10) as usize, u32_at(asset, 0x14) as usize, u32_at(asset, 0x44) as usize);
+    let byte = |o: usize| asset.get(o).copied().unwrap_or(0);
+    let half = |o: usize| f16(asset.get(o..o + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]])));
+    let g8 = 8 * g as usize;
+    let sum: f32 = (0..8).map(|j| f32::from(byte(wo + g8 + j))).sum();
+    let norm = 1.0 / (sum * (1.0 / 255.0) + 1e-6);
+    let at = ro + 8 * (g * points) as usize;
+    let p = [half(at), half(at + 2), half(at + 4)];
+    let (mut m, mut mp) = ([0f32; 12], [0f32; 12]);
+    let (remap_at, base, prev) = (u32_at(rec, 0xe4) as usize, u32_at(rec, 0xe8) as usize, u32_at(rec, 0xec) as usize);
+    for j in 0..8 {
+        let w = f32::from(byte(wo + g8 + j)) * (1.0 / 255.0) * norm;
+        let e = 2 * (remap_at + byte(bo + g8 + j) as usize);
+        let bone = (remap.get(e..e + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]])) & 0xfff) as usize;
+        for k in 0..12 {
+            m[k] += w * f32_at(palette, 48 * (base + bone) + 4 * k);
+            mp[k] += w * f32_at(palette, 48 * (prev + bone) + 4 * k);
+        }
+    }
+    let apply = |m: &[f32; 12], r: usize| m[4 * r] * p[0] + m[4 * r + 1] * p[1] + m[4 * r + 2] * p[2] + m[4 * r + 3];
+    let (now, before) = ([0, 1, 2].map(|r| apply(&m, r)), [0, 1, 2].map(|r| apply(&mp, r)));
+    let out: [f32; 3] = std::array::from_fn(|r| {
+        let row = |k: usize| f32_at(rec, 16 * r + 4 * k);
+        now[r] - row(3) - (row(0) * before[0] + row(1) * before[1] + row(2) * before[2])
+    });
+    Some(if out.iter().all(|v| v.is_finite()) { out } else { [0.0; 3] })
+}
+
 /// A frame's strand draws, for the census line.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Census {
@@ -230,6 +290,130 @@ mod tests {
         put(0x104, 3);
         put(0x10c, 2);
         r
+    }
+
+    /// A made-up guide record for [`sim_guide`]: one guide of 2 points,
+    /// bones (local 0 weight 3, local 1 weight 1), the remap shifting local
+    /// bones by 5, palettes at bone 10 (now) and 20 (before), R a turn of
+    /// 90 degrees about z and T (1, 2, 3).
+    pub(crate) fn guide_case() -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+        let put = |b: &mut Vec<u8>, o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        let mut rec = vec![0u8; GROUP_BYTES];
+        for (k, v) in [0.0f32, -1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 2.0, 0.0, 0.0, 1.0, 3.0].iter().enumerate() {
+            put(&mut rec, 4 * k, v.to_bits());
+        }
+        put(&mut rec, 0xe4, 1);
+        put(&mut rec, 0xe8, 10);
+        put(&mut rec, 0xec, 20);
+        let mut asset = vec![0u8; 0x200];
+        put(&mut asset, 0x10, 0x100);
+        put(&mut asset, 0x14, 0x140);
+        put(&mut asset, 0x44, 0x180);
+        put(&mut asset, 0x58, 1);
+        put(&mut asset, 0x5c, 2);
+        asset[0x101] = 1;
+        asset[0x140] = 3;
+        asset[0x141] = 1;
+        for (k, v) in [1.0f32, 2.0, 0.5].iter().enumerate() {
+            asset[0x180 + 2 * k..0x182 + 2 * k].copy_from_slice(&h(*v).to_le_bytes());
+        }
+        // Remap element 1 + local: local 0 -> 5, local 1 -> 6.
+        let remap: Vec<u8> = [0u16, 5, 6, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut palette = vec![0u8; 48 * 32];
+        // Now: bone 15 a shift by (10, 0, 0), bone 16 scale 2. Before: bone 25 identity, 26 a shift by (0, 4, 0).
+        for (at, m) in [
+            (15, [1.0f32, 0.0, 0.0, 10.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+            (16, [2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0]),
+            (25, [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+            (26, [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 4.0, 0.0, 0.0, 1.0, 0.0]),
+        ] {
+            for (k, v) in m.iter().enumerate() {
+                put(&mut palette, 48 * at + 4 * k, v.to_bits());
+            }
+        }
+        (rec, asset, remap, palette)
+    }
+
+    /// By hand: p = (1, 2, 0.5); M p = 0.75 (11, 2, 0.5) + 0.25 (2, 4, 1)
+    /// = (8.75, 2.5, 0.625); M' p = 0.75 p + 0.25 (1, 6, 0.5) = (1, 3, 0.5);
+    /// R (1, 3, 0.5) = (-3, 1, 0.5); out = M p - (-3, 1, 0.5) - (1, 2, 3).
+    pub(crate) const GUIDE_EXPECTED: [f32; 3] = [10.75, -0.5, -2.875];
+
+    pub(crate) fn near3(a: [f32; 3], b: [f32; 3]) -> bool {
+        (0..3).all(|k| (a[k] - b[k]).abs() < 2e-3)
+    }
+
+    #[test]
+    fn sim_guide_made_up_case() {
+        let (rec, asset, remap, palette) = guide_case();
+        let got = sim_guide(&rec, &asset, &remap, &palette, 0).unwrap();
+        assert!(near3(got, GUIDE_EXPECTED), "{got:?}");
+        assert_eq!(sim_guide(&rec, &asset, &remap, &palette, 1), None, "past the guide count");
+        // The same palette before and now, R = I: -T whatever the bones (HAIR2's collapse).
+        let mut same = rec.clone();
+        same[0xec..0xf0].copy_from_slice(&10u32.to_le_bytes());
+        for (k, v) in [1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0].iter().enumerate() {
+            let o = 16 * (k / 3) + 4 * (k % 3);
+            same[o..o + 4].copy_from_slice(&v.to_bits().to_le_bytes());
+        }
+        let got = sim_guide(&same, &asset, &remap, &palette, 0).unwrap();
+        assert!(near3(got, [-1.0, -2.0, -3.0]), "{got:?}");
+    }
+
+    /// The translated ed403b6d on the made-up record against [`sim_guide`]
+    /// (HAIR3, rung 2): record 0 in slot 21, the palette in slot 1, the pool
+    /// in slot 36, the asset at heap index 3 (raw) and the remap at 4
+    /// (R16_UINT), root 1 dword 3 the record. Skips without `XNW_TEST_GPU=1`,
+    /// the pack, or an adapter below the program (newer WARP: `XNW_WARP`).
+    #[test]
+    fn translated_sim_guide_made_up_case() {
+        use crate::preskin::{self as ps, Kind, View};
+        if !xnw_gpu::host::device_allowed() {
+            return;
+        }
+        let Some(c) = ps::container(std::path::Path::new(r"game\shaders.rpf"), Some(std::path::Path::new(r"out\cache\pack-index.bin")), SIM_GUIDES) else {
+            eprintln!("hair: no shader pack: skipped");
+            return;
+        };
+        let shader = ps::translate(&c).expect("ed403b6d translates");
+        let wave = ps::wave_size(&c).expect("wave size");
+        let (_gpu, host) = crate::tests::warp_host();
+        if let Some(gap) = ps::adapter_gap(&host.caps, wave) {
+            eprintln!("hair: ed403b6d not run: {gap}");
+            return;
+        }
+        let (mut rec, asset, remap, palette) = guide_case();
+        let put = |b: &mut Vec<u8>, o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        put(&mut rec, 0xe0, 4);
+        put(&mut rec, 0x120, 3);
+        put(&mut rec, 0x144, 0x40);
+        let ud = shader.user_data.iter().find(|u| u.root == xnw_shader::RootType::Table && u.slot == 0).map_or(0, |u| u.index);
+        let d = ps::Dispatch {
+            groups: [1, 1, 1],
+            tables: vec![(ud, vec![
+                (1, View { kind: Kind::Structured(48), bytes: &palette }),
+                (21, View { kind: Kind::Structured(GROUP_BYTES as u32), bytes: &rec }),
+                (36, View { kind: Kind::RawUav { len: 0x100 }, bytes: &[] }),
+            ])],
+            heap: vec![(3, View { kind: Kind::Raw, bytes: &asset }), (4, View { kind: Kind::Typed { format: 57, bytes: 2 }, bytes: &remap })],
+            constants: vec![(1, vec![u32::MAX, 0, 0, 0])],
+            texels: Vec::new(),
+        };
+        let b = ps::bind(&shader, &d).expect("binding");
+        let (outs, _) = ps::run(&host, &shader, wave, &b, d.groups).expect("dispatch");
+        let got: [f32; 3] = std::array::from_fn(|k| f32_at(&outs[0], 0x40 + 4 * k));
+        eprintln!("hair: translated ed403b6d {got:?}, CPU {:?}", sim_guide(&rec, &asset, &remap, &palette, 0));
+        assert!(near3(got, GUIDE_EXPECTED), "translated {got:?} against {GUIDE_EXPECTED:?}");
+        assert!(outs[0][0x4c..].iter().all(|b| *b == 0), "one guide only");
+    }
+
+    #[test]
+    fn hair_switch_default_off() {
+        assert!(!switch_on(""));
+        assert!(!switch_on("gpucull=on,hair=off"));
+        assert!(switch_on("gpucull=on, hair=on"));
+        assert!(!switch_on("hair=on,hair=off"));
+        assert!(!switch_on("hairx=on"));
     }
 
     #[test]

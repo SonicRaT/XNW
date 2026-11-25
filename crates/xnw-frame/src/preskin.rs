@@ -192,7 +192,11 @@ pub fn load(pack: &Pack, d: &PreskinDispatch) -> Result<Loaded, String> {
     .ok_or_else(|| format!("no palette rows at {:#x} + 48 x {cur_base:#x}", pal_view.addr))?;
     let prev = (prev_base != cur_base).then(|| rows(prev_base)).flatten();
     let (b7, palette) = palette_rebase(&d.rec.b7, &cur, prev.as_deref());
-    let second = |slot: u32| pack.slot_bytes(d.sink, 1, slot).map(|x| x.1).unwrap_or_default();
+    // HEAD1 (`headgraph=on`): t74/t75 from the head graph's table where it filled it (t75 = t74: one frame).
+    let second = |slot: u32| match pack.slot_bytes(d.sink, 1, slot) {
+        Ok((v, b)) => if matches!(slot, 0 | 3) { crate::head_graph::table_for(v.addr).unwrap_or(b) } else { b },
+        Err(_) => Vec::new(),
+    };
     Ok(Loaded { b7, vb, remap: remap_elements(&remap_bytes, element), palette, t7: table(9), t71: table(0), t78: table(6), b5: second(7), b6: second(9), t73: second(1), t74: second(0), t75: second(3), t76: second(5) })
 }
 
@@ -484,6 +488,8 @@ pub fn oracle(args: &[String]) -> Result<(), String> {
                 (5, second),
             ],
             heap: vec![(le32(&inp.b7, 0x40), v(ps::Kind::Raw, &inp.vb[..])), (le32(&inp.b7, 0x44), v(ps::Kind::Typed { format: 57, bytes: 2 }, &remap[..]))],
+            constants: Vec::new(),
+            texels: Vec::new(),
         };
         let outs = ps::bind(shader, &dispatch).and_then(|b| ps::run(&host, shader, *wave, &b, dispatch.groups));
         let (outs, seconds) = match outs {

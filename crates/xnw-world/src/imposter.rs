@@ -13,13 +13,13 @@
 //! | desc+0x10 / desc+0x20 | local box min / max (xyz) |
 //! | desc+0x30 | local sphere (centre xyz, radius) |
 //! | T+0x48 | LOD distances D[4] (< 0 absent) |
-//! | T+0x58 | far fade F0, F1 |
+//! | T+0x58 | far fade, F1 |
 //! | 64-B records | rows r0..r2 (rK.xyz the image of model axis K, translation in .w, absolute world); +0x30/+0x38 > 0 or dropped |
 //!
 //! Rule (the LOD rule of the instanced props, applied to the batch's own
 //! table): an instance is a card when its distance d to the camera is at
 //! least the last present D (and the type record's start R+0x58 [I]) and
-//! below F1; it fades out from F0 to F1. The card stands upright on the
+//! below F1; it fades out from to F1. The card stands upright on the
 //! world z axis, turned to face the camera, as wide as the record's box seen
 //! from the camera (the box's axes projected on the card's horizontal) and
 //! as tall as the box's vertical extent. The title's own card is a square of

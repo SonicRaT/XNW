@@ -2,6 +2,10 @@
 // Origin as in lower.rs's header: VIctory crates/victory-shader/src/emit/lower.rs, d2a4bae1f495, and the
 // later VIctory ports named there; GPL-3.0-or-later. Moved out of lower.rs unchanged (XNW BLD2): one stage,
 // one codegen unit.
+// `sv_barycentric` ported from victory-fork crates/victory-shader/src/emit/lower.rs (`barycentric`), commit
+// 578d459c344aa44753e9a61ea6ba10a8c68f6ea6, GPL-3.0-or-later.
+// First halves evaluated as their pair (`interps`) from victory-fork 3bff182, gated as in a26859f,
+// GPL-3.0-or-later.
 use super::*;
 
 impl<'a> Lower<'a> {
@@ -207,7 +211,25 @@ impl<'a> Lower<'a> {
                 .collect(),
             scalar: x.res.scalar.iter().copied().collect(),
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
-            interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
+            interps: {
+                let mut m: HashMap<Site, &Interp> = x.io.interps.iter().map(|(s, i)| (*s, i)).collect();
+                // victory-fork 3bff182, a26859f: a first half whose result is also read as data
+                // (an f16 second half keeps the other half of its dst, PS_DeferredTextured):
+                // evaluated as the pair it starts. Approximate for those other bits (P0 + i P10
+                // on the console); a first half only the second half reads is gone before
+                // lowering. Only in the second translation of a program the first one refused
+                // for it ([`with_first_half_pairs`]).
+                if FIRST_HALF_PAIRS.get() {
+                    for (_, i) in &x.io.interps {
+                        if let Interp::Interpolated { first, .. } = i {
+                            for s in first {
+                                m.entry(*s).or_insert(i);
+                            }
+                        }
+                    }
+                }
+                m
+            },
             handles: HashMap::new(),
             entries: HashMap::new(),
             edges: HashMap::new(),
@@ -502,6 +524,63 @@ impl<'a> Lower<'a> {
             Shape::Prefix(op, src, mask, ident, inclusive) => {
                 (op, src, mask, ident, Some(inclusive))
             }
+            // VIctory 8af04727 (GPL-3.0-or-later), verbatim.
+            Shape::Half(_, src, mask, ident, hi) => {
+                // The high half is a console lane's: compute only.
+                if self.mask_data != MaskData::Console {
+                    return Err("a 16-bit wave reduction outside compute");
+                }
+                let c = self.cur;
+                let &m = self
+                    .x
+                    .st
+                    .masks
+                    .get(&mask)
+                    .ok_or("a wave reduction's untracked mask")?;
+                let on = self.boolean(m, c)?;
+                let x = self.i32_of(src)?;
+                let id = self.s.m.i32(ident);
+                let x = self.s.m.select(c, on, x, id);
+                self.s.flags |= flags::WAVE_OPS;
+                // shortcut: the f16 sum is taken in f32 and rounded once; the
+                // console rounds each step, in its own order.
+                let low = self.s.m.i32(0xFFFF);
+                let h = self.s.m.bin(c, Bin::And, x, low);
+                let f = self
+                    .s
+                    .op(c, "legacyF16ToF32", Attr::ReadNone, self.s.t.f32, 131, &[h]);
+                let (sum, signed) = (self.s.m.i8(0), self.s.m.i8(0));
+                let r = self.s.op(
+                    c,
+                    "waveActiveOp.f32",
+                    Attr::NoUnwind,
+                    self.s.t.f32,
+                    119,
+                    &[f, sum, signed],
+                );
+                let r = self
+                    .s
+                    .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[r]);
+                let r = self.s.m.bin(c, Bin::And, r, low);
+                // Lane `hi` runs the section on the console even where it is
+                // elsewhere on the host; there it holds the identity.
+                let i32t = self.s.t.i32;
+                let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+                let b = self
+                    .s
+                    .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
+                let word = self.s.m.extract(c, b, hi / 32);
+                let (sh, one, z) = (self.s.m.i32(hi % 32), self.s.m.i32(1), self.s.m.i32(0));
+                let bit = self.s.m.bin(c, Bin::LShr, word, sh);
+                let bit = self.s.m.bin(c, Bin::And, bit, one);
+                let there = self.s.m.cmp(c, pred::NE, bit, z);
+                let lane = self.s.m.i32(hi);
+                let at = self.read_lane(x, lane);
+                let top = self.s.m.select(c, there, at, id);
+                let high = self.s.m.i32(0xFFFF_0000);
+                let top = self.s.m.bin(c, Bin::And, top, high);
+                return Ok(self.s.m.bin(c, Bin::Or, top, r));
+            }
         };
         if self.mask_data == MaskData::None {
             return Err("a wave reduction in a mesh shader");
@@ -748,7 +827,7 @@ impl<'a> Lower<'a> {
                     None => Val::Missing("a vertex input the signature lacks"),
                 };
             }
-            Input::Barycentric { .. } => return self.barycentric(),
+            Input::Barycentric { kind, index } => return self.barycentric(kind, index),
             Input::PrimitiveId => return Val::Missing("the primitive id"),
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
             // host's value can be.
@@ -827,11 +906,82 @@ impl<'a> Lower<'a> {
     /// high half of v1 at 0x518, then shifts it out at 0x528). It reads 0.
     /// The host's SV_Barycentrics is no option here: the RX 5700 XT reports
     /// BarycentricsSupported 0 (OPTIONS3).
-    pub(super) fn barycentric(&mut self) -> Val {
+    /// XNW: except in a program with computed barycentrics on a host
+    /// that has them ([`Parts::barycentrics`]): there the reads feed the
+    /// interpolation and are `SV_Barycentrics` (`sv_barycentric`), loaded
+    /// with the other inputs. Changed from victory-fork 578d459, which loads
+    /// them so in every program, lazily on first use: elsewhere the 0 stays
+    /// (the card), and its DXIL with it.
+    pub(super) fn barycentric(&mut self, kind: Barycentric, index: u8) -> Val {
+        if self.x.barycentrics
+            && self.x.io.interps.iter().any(|(_, i)| matches!(i, Interp::Weighted { .. }))
+        {
+            return self.sv_barycentric(kind, index);
+        }
         if self.s.inputs.iter().any(|e| e.kind == 28) {
             return Val::Missing("barycentrics read directly");
         }
         Val::I32(self.s.m.i32(0))
+    }
+
+    /// victory-fork 578d459: barycentric `index` (0 i, 1 j) of `kind` as a
+    /// value: a channel of `SV_Barycentrics` declared with the same
+    /// interpolation mode.
+    ///
+    /// GFX10 interpolates P0 + i (- P0) + j (- P0), so i and j are
+    /// the weights of vertices 1 and 2. The host's weights (x, y, z) are
+    /// those of vertices 0, 1 and 2, vertex 0 being the provoking vertex,
+    /// which is the console's P0 (`v_interp_mov` P0 is lowered to a flat
+    /// input): i is y and j is z.
+    /// shortcut: triangles only; on lines and points the console's i and j
+    /// are not checked against the host's weights.
+    pub(super) fn sv_barycentric(&mut self, kind: Barycentric, index: u8) -> Val {
+        let Some(mode) = super::integer::interp_mode(kind) else {
+            return Val::Missing("pull-model barycentrics");
+        };
+        if index > 1 {
+            return Val::Missing("pull-model barycentrics");
+        }
+        // One element per interpolation mode (the console's own, if its
+        // signature declares one): DXIL allows two.
+        let bary = |e: &SigElement| e.kind == 28;
+        let id = match self
+            .s
+            .inputs
+            .iter()
+            .position(|e| bary(e) && (e.interp == mode || e.usage == 0))
+        {
+            Some(id) => id,
+            None => {
+                let index = self.s.inputs.iter().filter(|e| bary(e)).count() as u32;
+                if index >= 2 {
+                    return Val::Missing("barycentrics of a third interpolation mode");
+                }
+                // A system value the validator wants unpacked (packing
+                // location -1), like other non-packed system values.
+                self.s.inputs.push(SigElement {
+                    name: "SV_Barycentrics".into(),
+                    index,
+                    kind: 28,
+                    comp: 9,
+                    interp: mode,
+                    row: None,
+                    col: 0,
+                    cols: 3,
+                    usage: 0,
+                    half: false,
+                });
+                self.s.inputs.len() - 1
+            }
+        };
+        let e = &mut self.s.inputs[id];
+        if e.col != 0 || e.cols < 3 {
+            return Val::Missing("a console barycentrics element without i and j");
+        }
+        e.row = None;
+        e.interp = mode;
+        self.s.flags |= flags::BARYCENTRICS;
+        self.load_any_input(id, index + 1)
     }
 
     /// A component of a compute thread or group id, read in the entry block.

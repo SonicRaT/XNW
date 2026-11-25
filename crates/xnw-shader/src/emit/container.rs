@@ -46,6 +46,7 @@ impl SigElement {
             18 => 68,
             19 => 67,
             20 => 69,
+            28 => 23, // barycentrics (victory-fork 578d459)
             30 => 25, // cull primitive
             _ => 0,
         }

@@ -46,6 +46,7 @@ fn lower(words: &[u32], layout: Vec<RootParam>, used: Vec<UsedResource>, rsrc2: 
         probe: false,
         loop_counts: None,
         pagetable: false,
+        barycentrics: false,
     })
     .unwrap();
     if let Ok(mut v) = Validator::load(Validator::default_path().as_deref()) {

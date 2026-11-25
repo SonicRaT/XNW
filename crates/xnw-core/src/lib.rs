@@ -3,6 +3,7 @@
 
 pub mod imprec;
 pub mod perf;
+pub mod plaincopy;
 pub mod syscalls;
 pub mod win;
 

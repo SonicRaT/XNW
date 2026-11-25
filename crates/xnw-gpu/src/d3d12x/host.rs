@@ -245,7 +245,7 @@ pub(crate) fn phases_text(n: u64, preparing: u64) -> String {
         "{}; not in a phase {} us; memory system calls per frame (calls/us): {}; host resources made per frame {} in {} us, CPU-visible buffers refused (non-local budget) {}, host copies and buffers not made in null-GPU frames {}",
         parts.join(", "),
         preparing.saturating_sub(sum),
-        xnw_core::syscalls::text(n),
+        xnw_core::syscalls::text(n) + &xnw_core::plaincopy::text(n),
         CREATION[0].swap(0, Ordering::Relaxed) / n,
         CREATION[1].swap(0, Ordering::Relaxed) / n,
         CREATION[2].swap(0, Ordering::Relaxed),
@@ -606,6 +606,8 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         super::crumbs::report(unsafe { host.fence.GetCompletedValue() }, SIGNALLED.load(Ordering::Relaxed));
         // The shader loops that ran longest (`XNW_LOOP_COUNTS=1`).
         super::loopcount::report();
+        // WARP's view heaps: slots a resource read would fault on (`XNW_WARP_SCAN`).
+        super::descriptor::host::warp_scan("host GPU failure");
         // Any failure: the validation layer names an invalid command even
         // when the device survives it (a list that did not close).
         layer_report(&host.device, false);
@@ -1029,6 +1031,10 @@ impl Host {
             lists.push(Some(last));
         }
         SIGNALLED.store(*submitted, Ordering::Relaxed);
+        // Descriptor writes from other threads from here until the wait
+        // below is over are staged, then put in place (`descriptor::gate`):
+        // no slot this submission may read changes while it runs.
+        let flight = super::descriptor::gate::begin();
         // SAFETY: closed lists; the fence and event are ours.
         unsafe {
             if !lists.is_empty() {
@@ -1070,6 +1076,7 @@ impl Host {
                 Err(e) => xnw_core::warn!("d3d12x: host submission not waited for: {e}"),
             }
         }
+        drop(flight);
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         super::counters::submission((prepared - started).as_micros() as u64, snapshots);
@@ -1870,7 +1877,10 @@ pub fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
         // The kernel writes the destination: it must not be guarded.
         super::watch::writing(dst as usize, len);
     }
-    if read(src, dst, len) {
+    // Into host memory: in place first, if asked for (`xnw_core::plaincopy`,
+    // victory-fork 0b0074e); through the kernel if that is off or met a page
+    // that was not there.
+    if (!title_dst && xnw_core::plaincopy::copy(dst, src, len)) || read(src, dst, len) {
         return;
     }
     // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
@@ -1893,7 +1903,9 @@ pub fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     super::watch::reading(src as usize, dst.len());
-    read(src, dst.as_mut_ptr(), dst.len())
+    // In place first, if asked for (`xnw_core::plaincopy`): the destination
+    // is memory of ours, as in `copy_mapped`.
+    xnw_core::plaincopy::copy(dst.as_mut_ptr(), src, dst.len()) || read(src, dst.as_mut_ptr(), dst.len())
 }
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
@@ -2094,6 +2106,38 @@ mod batch {
         // Address 0 is never mapped.
         super::copy_mapped(dst.as_mut_ptr(), std::ptr::null(), 100, false);
         assert!(dst.iter().all(|&b| b == 0));
+    }
+
+    /// A copy across a page that is not there gives the same bytes with
+    /// `XNW_PLAINCOPY=on` (in place, then the kernel's copy after the fault)
+    /// as without it (the kernel's copy only): the page before the hole
+    /// copied, zeros for the hole; `read_into` false either way. Run it
+    /// both ways: `XNW_PLAINCOPY=on cargo test -p xnw-gpu --lib across_a_hole`.
+    #[test]
+    fn copies_across_a_hole_are_the_kernels() {
+        use xnw_core::win::{MEM_COMMIT, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        const PAGE: usize = 4096;
+        // SAFETY: memory of the test's own: two pages reserved, the first committed.
+        let base = unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_NOACCESS);
+            assert!(!base.is_null());
+            assert!(!VirtualAlloc(base, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            base.cast::<u8>()
+        };
+        // SAFETY: the committed page.
+        unsafe { std::slice::from_raw_parts_mut(base, PAGE) }.fill(0xAB);
+        for _ in 0..2 {
+            // (twice: the second meets the block remembered as faulted)
+            let mut dst = vec![1u8; PAGE];
+            super::copy_mapped(dst.as_mut_ptr(), base.wrapping_add(PAGE / 2), PAGE, false);
+            assert!(dst[..PAGE / 2].iter().all(|&b| b == 0xAB), "the bytes before the hole");
+            assert!(dst[PAGE / 2..].iter().all(|&b| b == 0), "zeros for the hole");
+            assert!(!super::read_into(base.wrapping_add(PAGE / 2), &mut dst));
+            assert!(super::read_into(base, &mut dst));
+            assert!(dst.iter().all(|&b| b == 0xAB));
+        }
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(base.cast(), 0, 0x8000) };
     }
 }
 

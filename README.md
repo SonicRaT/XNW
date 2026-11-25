@@ -48,17 +48,22 @@ around and interact with the world. The picture is still incomplete, so it is no
 | 2026-11-25 | The game's own translated pixel shaders reproduce its facades, signs and storefronts on a captured frame, inside our renderer. |
 | 2026-11-25 | Faster frames: the stalls on entering the world are gone, and slow frames fell from 94 to 22 per 150 s run (3,739 frames). |
 | 2026-11-25 | Reading the game's geometry can run on a worker thread, off the frame (a switch, off by default). An optimised build profile (`cargo build --profile fast`) is what timed runs use. |
+| 2026-11-25 | Best run yet on a real GPU: 3,990 frames in 150 s, 8 slow frames (94 at the start of the day), no device errors. The hook that reads the game's draw lists costs 3.2-3.4 us a draw. |
+| 2026-11-25 | Instance culling on the GPU (a switch, `gpucull=on`): our renderer drops hidden instances in a compute pass (0.6 ms of GPU time) before drawing. |
+| 2026-11-25 | The shader translator reaches 25,530 of 25,889 programs, all valid; it follows the rule for non-uniform descriptor-heap indices. |
+| 2026-11-25 | `cargo x burst` replays a burst of the game's draw-list steps outside the game, for timing and checks. |
+| 2026-11-25 | Zero-copy geometry: buffers are used where they sit instead of being copied (a switch, off by default; run on the software adapter only). |
 
 ### Performance so far
 
 | What | Measured |
 |---|---|
-| World on screen, our renderer, real GPU | about **25 frames per second** with characters and vehicles (3,739 frames in a 150 s run, 22 of them slow, no device errors); the game paces itself at 30 |
-| Renderer cost inside each frame | 6-15 ms for our pass, plus 9-17 ms to read the game's draw lists |
+| World on screen, our renderer, real GPU | about **26 frames per second** with characters and vehicles (3,990 frames in a 150 s run, 8 of them slow, no device errors); the game paces itself at 30 |
+| Renderer cost inside each frame | 6-15 ms for our pass, plus 9-17 ms to read the game's draw lists; the draw-list hook costs 3.2-3.4 us a draw; GPU instance culling (a switch, `gpucull=on`, run on the card) 0.6 ms |
 | Texture slots filled with the game's textures | 23,562 of 25,653 at the end of a run (92 %) |
 | Captured frame replayed in the frame lab | **4-7 ms per frame**; a shader edit shows on screen in about half a second |
-| Console GPU programs translated to DXIL | **at least 25,295 of 25,889** (97.7 %) in the test game, all of them valid DXIL; 786 of the 788 that a typical frame uses |
-| Translating the whole program set | about 2.5 minutes on a 6-core machine with 6 threads, validation included; a change is checked against the previous output in seconds |
+| Console GPU programs translated to DXIL | **25,530 of 25,889** (98.6 %) in the test game, all of them valid DXIL; 786 of the 788 that a typical frame uses. Programs that read barycentrics need hardware support for it and are run on the software adapter |
+| Translating the whole program set | about 2.5 minutes on a 6-core machine with 6 threads, validation included; translated programs are cached per translator generation, and a change is checked against the previous output in seconds |
 | The game's own GPU work on real hardware | 1.3-4 s per frame, and not stable yet |
 
 ### In progress

@@ -17,7 +17,7 @@
 //! the state of the title's pipeline cache (slots 57/55), decoded to the
 //! minimum the first frames need ([`GraphicsState::from_cache`],
 //! [`GraphicsState::apply_overrides`]), from five-star-recomp
-//! `docs/pipeline-cache.md` "Fixed-function state" (GPL-3.0) and AMD's
+//! "Fixed-function state" (GPL-3.0) and AMD's
 //! RDNA2 register reference (field layout). From DexNom-VIctory
 //! (ddb7332, GPL-3.0-or-later): blending
 //! dropped on integer render targets

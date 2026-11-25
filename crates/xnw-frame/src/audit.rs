@@ -879,7 +879,7 @@ pub fn run(frames: &[(u64, std::path::PathBuf)], out: &std::path::Path, pass: &m
         list.draws = vec![r];
         list.sky = None;
         list.frame = 1_000_000 + i as u64;
-        let mut decode = |k: &GeomKey| geoms.get(k).map(|(vb, idx)| xnw_world::HostGeometry { vertices: Vec::new(), indices: idx.clone(), raw_vb: Some(vb.clone()) });
+        let mut decode = |k: &GeomKey| geoms.get(k).map(|(vb, idx)| xnw_world::HostGeometry { vertices: Vec::new(), indices: idx.clone(), raw_vb: Some(vb.clone()), vb_place: 0 });
         super::watchdog_arm();
         if pass.draw(&list, &mut decode, true).is_err() {
             super::watchdog_disarm();

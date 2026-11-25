@@ -34,6 +34,10 @@ pub(super) struct Parts {
     /// Geometries whose vertex buffer was read, and the bytes copied.
     pub reads: u32,
     pub bytes: u64,
+    /// `XNW_ZEROCOPY` (ZC2): vertex buffers left in title memory (only
+    /// their header copied), and their bytes.
+    pub in_place: u32,
+    pub in_place_bytes: u64,
 }
 
 impl Parts {
@@ -43,12 +47,15 @@ impl Parts {
         self.decode_ns += o.decode_ns;
         self.reads += o.reads;
         self.bytes += o.bytes;
+        self.in_place += o.in_place;
+        self.in_place_bytes += o.in_place_bytes;
     }
 
     /// `asks A ms, copies C ms (N reads, K KiB), decode D ms`.
     pub fn line(&self) -> String {
         let ms = |ns: u64| ns as f64 / 1e6;
-        format!("asks {:.1} ms, copies {:.1} ms ({} reads, {} KiB), decode {:.1} ms", ms(self.ask_ns), ms(self.copy_ns), self.reads, self.bytes >> 10, ms(self.decode_ns))
+        let zc = if self.in_place > 0 { format!(" (vertex buffers in place {}, {} KiB not copied)", self.in_place, self.in_place_bytes >> 10) } else { String::new() };
+        format!("asks {:.1} ms, copies {:.1} ms ({} reads, {} KiB{zc}), decode {:.1} ms", ms(self.ask_ns), ms(self.copy_ns), self.reads, self.bytes >> 10, ms(self.decode_ns))
     }
 }
 
@@ -76,7 +83,16 @@ fn copy(at: u64, len: usize, direct: bool) -> Option<Vec<u8>> {
 /// not-ready reads used up) its indices. Err is the SKIP_* reason.
 pub(super) fn read(key: &GeomKey, direct: bool, capped: bool, p: &mut Parts) -> Result<HostGeometry, u8> {
     let t = Instant::now();
-    let vb = copy(key.vb_at, key.vb_len.min(64 << 20) as usize, direct);
+    let len = key.vb_len.min(64 << 20);
+    // `XNW_ZEROCOPY` (ZC2): a vertex buffer whose page window is open is
+    // drawn in place; only its header is copied (`vb_ready`, the decoder's
+    // stream words). An address lookup, no copy of the rest.
+    let place = (xnw_gpu::shared::world_part(xnw_gpu::shared::WORLD_GEOM) && len > VB_HEADER && xnw_gpu::shared::world_ready(key.vb_at, len & !3, 16)).then_some(len & !3);
+    let vb = copy(key.vb_at, if place.is_some() { VB_HEADER as usize } else { len as usize }, direct);
+    if let Some(n) = place {
+        p.in_place += 1;
+        p.in_place_bytes += n;
+    }
     p.copy_ns += since(t);
     p.reads += 1;
     p.bytes += vb.as_ref().map_or(0, Vec::len) as u64;
@@ -107,8 +123,11 @@ pub(super) fn read(key: &GeomKey, direct: bool, capped: bool, p: &mut Parts) -> 
         _ => None,
     };
     p.decode_ns += since(t);
-    Ok(HostGeometry { vertices: Vec::new(), indices: indices.ok_or(SKIP_INDICES)?, raw_vb: Some(vb) })
+    Ok(HostGeometry { vertices: Vec::new(), indices: indices.ok_or(SKIP_INDICES)?, raw_vb: Some(vb), vb_place: place.unwrap_or(0) })
 }
+
+/// The vertex header the reader copies of a vertex buffer read in place.
+const VB_HEADER: u64 = 0x80;
 
 /// What one frame's geometry step did.
 #[derive(Default)]
@@ -127,6 +146,7 @@ pub(super) struct Taken {
 
 fn note_bones(skinlog: bool, key: &GeomKey, g: &HostGeometry) {
     if skinlog
+        && g.vb_place == 0
         && let Some(vb) = &g.raw_vb
         && let Ok(mut m) = super::BONES.lock()
     {
@@ -259,7 +279,7 @@ struct Reader {
 }
 
 /// The reader's parts since the last [`stats`].
-static STATS: Mutex<Parts> = Mutex::new(Parts { ask_ns: 0, copy_ns: 0, decode_ns: 0, reads: 0, bytes: 0 });
+static STATS: Mutex<Parts> = Mutex::new(Parts { ask_ns: 0, copy_ns: 0, decode_ns: 0, reads: 0, bytes: 0, in_place: 0, in_place_bytes: 0 });
 
 /// The reader's parts since the last call, and the keys in flight.
 pub(super) fn stats() -> (Parts, usize) {
@@ -303,52 +323,53 @@ fn reader() -> &'static Reader {
     })
 }
 
+/// Meshlets (the layout `expand_meshlets` reads) holding the triangles
+/// `idx` (vertex-buffer indices below 65,536): at most 128 vertices and
+/// 128 triangles a meshlet. Tests and `xnw burst` (captures keep expanded
+/// indices, not the title's meshlets) make title-like meshlets with it.
+pub(super) fn meshlets(idx: &[u32]) -> Vec<u8> {
+    let (mut heads, mut prims, mut verts) = (Vec::<[u32; 4]>::new(), Vec::<u32>::new(), Vec::<u16>::new());
+    let (mut local, mut np) = (Vec::<u32>::new(), 0u32);
+    let flush = |local: &mut Vec<u32>, np: &mut u32, heads: &mut Vec<[u32; 4]>, verts: &mut Vec<u16>, prims_len: usize| {
+        if *np == 0 {
+            return;
+        }
+        let (fv, fp) = (verts.len() as u32, (prims_len as u32) - *np);
+        let h0 = (local.len() as u32 - 1) | (*np - 1) << 7 | (fv >> 16 & 1) << 14 | (fp >> 16 & 1) << 15;
+        heads.push([h0, fv & 0xFFFF | (fp & 0xFFFF) << 16, 0, 0]);
+        verts.extend(local.iter().map(|v| *v as u16));
+        local.clear();
+        *np = 0;
+    };
+    for t in idx.chunks_exact(3) {
+        let fresh = t.iter().filter(|v| !local.contains(v)).count();
+        if local.len() + fresh > 128 || np == 128 {
+            flush(&mut local, &mut np, &mut heads, &mut verts, prims.len());
+        }
+        let mut w = 0u32;
+        for (k, v) in t.iter().enumerate() {
+            let i = local.iter().position(|x| x == v).unwrap_or_else(|| {
+                local.push(*v);
+                local.len() - 1
+            });
+            w |= (i as u32) << (7 * k);
+        }
+        prims.push(w);
+        np += 1;
+    }
+    flush(&mut local, &mut np, &mut heads, &mut verts, prims.len());
+    let mut b = Vec::new();
+    for w in [heads.len() as u32, prims.len() as u32, 0] {
+        b.extend_from_slice(&w.to_le_bytes());
+    }
+    heads.iter().flatten().chain(&prims).for_each(|w| b.extend_from_slice(&w.to_le_bytes()));
+    verts.iter().for_each(|v| b.extend_from_slice(&v.to_le_bytes()));
+    b
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Meshlets (the layout `expand_meshlets` reads) holding the triangles
-    /// `idx` (vertex-buffer indices below 65,536): at most 128 vertices and
-    /// 128 triangles a meshlet.
-    fn meshlets(idx: &[u32]) -> Vec<u8> {
-        let (mut heads, mut prims, mut verts) = (Vec::<[u32; 4]>::new(), Vec::<u32>::new(), Vec::<u16>::new());
-        let (mut local, mut np) = (Vec::<u32>::new(), 0u32);
-        let flush = |local: &mut Vec<u32>, np: &mut u32, heads: &mut Vec<[u32; 4]>, verts: &mut Vec<u16>, prims_len: usize| {
-            if *np == 0 {
-                return;
-            }
-            let (fv, fp) = (verts.len() as u32, (prims_len as u32) - *np);
-            let h0 = (local.len() as u32 - 1) | (*np - 1) << 7 | (fv >> 16 & 1) << 14 | (fp >> 16 & 1) << 15;
-            heads.push([h0, fv & 0xFFFF | (fp & 0xFFFF) << 16, 0, 0]);
-            verts.extend(local.iter().map(|v| *v as u16));
-            local.clear();
-            *np = 0;
-        };
-        for t in idx.chunks_exact(3) {
-            let fresh = t.iter().filter(|v| !local.contains(v)).count();
-            if local.len() + fresh > 128 || np == 128 {
-                flush(&mut local, &mut np, &mut heads, &mut verts, prims.len());
-            }
-            let mut w = 0u32;
-            for (k, v) in t.iter().enumerate() {
-                let i = local.iter().position(|x| x == v).unwrap_or_else(|| {
-                    local.push(*v);
-                    local.len() - 1
-                });
-                w |= (i as u32) << (7 * k);
-            }
-            prims.push(w);
-            np += 1;
-        }
-        flush(&mut local, &mut np, &mut heads, &mut verts, prims.len());
-        let mut b = Vec::new();
-        for w in [heads.len() as u32, prims.len() as u32, 0] {
-            b.extend_from_slice(&w.to_le_bytes());
-        }
-        heads.iter().flatten().chain(&prims).for_each(|w| b.extend_from_slice(&w.to_le_bytes()));
-        verts.iter().for_each(|v| b.extend_from_slice(&v.to_le_bytes()));
-        b
-    }
 
     #[test]
     fn meshlet_encoder_round_trips() {

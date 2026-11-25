@@ -428,7 +428,7 @@ impl<'a> Lower<'a> {
         let z = self.legacy_zero(a, b);
         // `+0 + addend`: the addend, except -0 gives +0. XNW: written as a
         // select, because the host compiler folds `0.0 + x` to `x` (measured:
-        // -0 came back); XCL reports +0 on the console (I).
+        // -0 came back); another runtime reports +0 on the console (I).
         let ai = self.as_int(addend);
         let neg0 = self.s.m.i32(0x8000_0000);
         let is_neg0 = self.s.m.cmp(c, pred::EQ, ai, neg0);

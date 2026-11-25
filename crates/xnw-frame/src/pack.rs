@@ -41,7 +41,7 @@ impl Pack {
         (hash != 0).then(|| FramePack::blob(&self.dir, hash)).flatten()
     }
 
-    fn bytes_of(&self, r: &Ref) -> Option<Vec<u8>> {
+    pub(crate) fn bytes_of(&self, r: &Ref) -> Option<Vec<u8>> {
         reason::has_bytes(r.reason).then(|| self.blob(r.hash)).flatten()
     }
 
@@ -93,7 +93,7 @@ impl Pack {
     /// (kind 3), with the slot's view. `Err` names why there are none.
     pub fn slot_bytes(&self, sink: u32, root: u16, slot: u32) -> Result<(SlotView, Vec<u8>), String> {
         let view = self.tables(sink).into_iter().find(|t| t.0 == root).ok_or_else(|| format!("sink {sink}: no table at root {root}"))?.2.into_iter().find(|v| v.slot == slot).ok_or_else(|| format!("sink {sink} root {root}: slot {slot} empty"))?;
-        let at = (u32::from(root) * 96 + slot) as u16;
+        let at = fp::table_slot(u32::from(root), slot);
         let r = self.data.refs_of(sink).find(|r| (r.kind == kind::BUFFER || r.kind == kind::CBV) && r.slot == at).ok_or_else(|| format!("sink {sink} root {root} slot {slot}: no bytes record (view kind {})", view.kind))?;
         let b = self.bytes_of(r).ok_or_else(|| format!("sink {sink} root {root} slot {slot}: reason {}", r.reason))?;
         Ok((view, b))
@@ -225,7 +225,7 @@ impl Pack {
         let by_word: HashMap<u32, u32> = self.dispatches().iter().filter(|d| d.rec.flags & fp::B7_FOUND != 0).map(|d| (d.rec.word & fp::RANGE_MASK, d.sink)).collect();
         let mut pipes: HashMap<u64, bool> = HashMap::new();
         let mut out = Vec::new();
-        for s in self.data.sinks.iter().filter(|s| s.op != fp::op::DISPATCH) {
+        for s in self.data.sinks.iter().filter(|s| !fp::op::is_dispatch(s.op)) {
             let ped = *pipes.entry(s.pipeline).or_insert_with(|| self.data.programs.iter().any(|p| p.pipeline == s.pipeline && (p.stage == "mesh" || p.stage == "vertex") && is_preskin(p.container)));
             if !ped {
                 continue;
@@ -423,7 +423,7 @@ fn from_origin(origin: &str) -> Option<xnw_world::textures::Provided> {
     let span = t.read_span(&mut f, tex.addr, tex.span, tables.as_ref()).ok()?;
     let chain = ttpf::chain(&tex, tex.mips).ok()?;
     let (width, height, rows, row_bytes, row_count) = linear_mip(&chain, &span, tex.width, tex.height, tex.format)?;
-    Some(xnw_world::textures::Provided { width, height, format: tex.format, rows, row_bytes, row_count })
+    Some(xnw_world::textures::Provided { width, height, format: tex.format, rows, row_bytes, row_count, dim: xnw_world::textures::TEX_2D, depth: 1 })
 }
 
 /// A texture's finest mip (capped) from its stored resident bytes.
@@ -447,7 +447,7 @@ fn from_texels(v: &SlotView, tiled: &[u8]) -> Option<xnw_world::textures::Provid
         tiled
     };
     let (width, height, rows, row_bytes, row_count) = linear_mip(layout, tiled, v.width as u32, height, v.format)?;
-    Some(xnw_world::textures::Provided { width, height, format: v.format, rows, row_bytes, row_count })
+    Some(xnw_world::textures::Provided { width, height, format: v.format, rows, row_bytes, row_count, dim: xnw_world::textures::TEX_2D, depth: 1 })
 }
 
 impl Pack {

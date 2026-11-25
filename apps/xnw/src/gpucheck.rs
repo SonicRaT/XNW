@@ -161,7 +161,7 @@ pub fn run(args: &[String]) -> Res<()> {
         println!("warp       {m}");
     }
     println!("shader model {}.{}   wave lanes {}..{}", c.shader_model.0, c.shader_model.1, c.wave_lanes.0, c.wave_lanes.1);
-    println!("mesh shaders {}   ray tracing {}   double ops {}", c.mesh_shaders, c.ray_tracing, c.double_ops);
+    println!("mesh shaders {}   ray tracing {}   double ops {}   barycentrics {}", c.mesh_shaders, c.ray_tracing, c.double_ops, c.barycentrics);
     println!(
         "software {}   feature level {:#x}   resource binding tier {}   tiled resources tier {}   int64 atomics typed {} heap {}   enhanced barriers {}",
         c.software, c.feature_level, c.binding_tier, c.tiled_tier, c.int64_typed, c.int64_heap, c.enhanced_barriers

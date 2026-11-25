@@ -1113,6 +1113,58 @@ pub fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     resource(this).host().cloned()
 }
 
+/// `flags` (the title's, as the host takes them: render target 1, depth 2,
+/// unordered access 4) without the uses the host refuses `format` for, given
+/// its `D3D12_FORMAT_SUPPORT1` and `SUPPORT2` words. A typeless format has no
+/// support of its own (its views name a typed format): kept as asked.
+/// Origin of the check: VIctory issues #2725, #2719 (no code taken).
+fn refused_flags(flags: u32, support1: u32, support2: u32) -> u32 {
+    const RENDER_TARGET: u32 = 1;
+    const DEPTH: u32 = 2;
+    const UNORDERED: u32 = 4;
+    use windows::Win32::Graphics::Direct3D12::*;
+    const SUPPORT1_RENDER_TARGET: u32 = D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 as u32;
+    const SUPPORT1_DEPTH_STENCIL: u32 = D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL.0 as u32;
+    const SUPPORT1_TYPED_UAV: u32 = D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 as u32;
+    const SUPPORT2_UAV_TYPED_STORE: u32 = D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0 as u32;
+    let mut kept = flags;
+    if support1 & SUPPORT1_RENDER_TARGET == 0 {
+        kept &= !RENDER_TARGET;
+    }
+    if support1 & SUPPORT1_DEPTH_STENCIL == 0 {
+        kept &= !DEPTH;
+    }
+    if support1 & SUPPORT1_TYPED_UAV == 0 || support2 & SUPPORT2_UAV_TYPED_STORE == 0 {
+        kept &= !UNORDERED;
+    }
+    kept
+}
+
+/// `flags` for a host texture of `format` without the uses the host device
+/// refuses it for (`CheckFeatureSupport` FORMAT_SUPPORT, answered once per
+/// format). Logs each format once.
+fn refused_uses_dropped(device: &windows::Win32::Graphics::Direct3D12::ID3D12Device, format: u32, flags: u32) -> u32 {
+    static SEEN: std::sync::Mutex<Vec<(u32, u32, u32)>> = std::sync::Mutex::new(Vec::new());
+    if flags & 7 == 0 || format == 0 || is_typeless(format) {
+        return flags;
+    }
+    let cached = SEEN.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|e| e.0 == format).map(|e| (e.1, e.2));
+    let (s1, s2) = cached.unwrap_or_else(|| {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let init = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(format as i32), ..Default::default() };
+        // A query that fails keeps the uses: only a refusal drops one.
+        let (s1, s2) = xnw_device::feature(device, D3D12_FEATURE_FORMAT_SUPPORT, init)
+            .map_or((u32::MAX, u32::MAX), |f| (f.Support1.0 as u32, f.Support2.0 as u32));
+        SEEN.lock().unwrap_or_else(|e| e.into_inner()).push((format, s1, s2));
+        (s1, s2)
+    });
+    let kept = refused_flags(flags, s1, s2);
+    if kept != flags {
+        xnw_core::warn!("d3d12x: host refuses format {format} flags {:#x}: made with {:#x}", flags & 7, kept & 7);
+    }
+    kept
+}
+
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags.
 fn host_texture(
@@ -1175,6 +1227,10 @@ fn host_texture(
     if packed16_fallback {
         d.format = R16_TYPELESS;
     }
+    // The host refuses some uses of some formats (RTX 5070 Ti, VIctory
+    // and #2719: B4G4R4A4 as render target, B5G5R5A1 as UAV), and a resource
+    // made anyway removes the device. Ask the host; a use it refuses is dropped.
+    d.flags = refused_uses_dropped(&host.device, d.format, d.flags);
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
     let clear_value = (!clear.is_null()).then(|| {
@@ -1353,8 +1409,9 @@ pub(crate) fn room_nonlocal(need: u64) -> bool {
     info.CurrentUsage + need <= info.Budget / 10 * 9
 }
 
-/// "video memory local U of B MiB, non-local U of B MiB" now.
-pub(crate) fn video_memory_text() -> String {
+/// "video memory local U of B MiB, non-local U of B MiB" now (the
+/// burst's and bridgems' device-memory lines, ZC2).
+pub fn video_memory_text() -> String {
     use windows::Win32::Graphics::Dxgi::{DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL};
     let one = |g| {
         let a = adapter()?;
@@ -2994,6 +3051,7 @@ pub(crate) fn frame_presented(frame: u64) {
         return;
     }
     xnw_core::info!("{}", memory_line(frame));
+    super::descriptor::host::warp_scan(&format!("frame {frame}"));
 }
 
 fn memory_line(frame: u64) -> String {
@@ -3012,7 +3070,7 @@ fn memory_line(frame: u64) -> String {
     use windows::Win32::Graphics::Dxgi::{DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL};
     let unknown = || "unknown".to_string();
     format!(
-        "memory at frame {frame}: commit {} MiB, working set {} MiB; video memory local {}, non-local {}; host textures {} ({} MiB), placed {} ({} MiB, {} released), texture objects made {} released {}, staging {} MiB, demoted for video memory {} ({} MiB; {} demotions, {} returns, peak local {} MiB); title memory copies {} MiB; views of released resources made null {}, last references put off {}, heap slots of released views made null {}, free targets held elsewhere (not taken back) {}, slots over released shared windows made null {}, stale slots nulled by XNW_GPU_CHECK {}; host creations failed so far: {}",
+        "memory at frame {frame}: commit {} MiB, working set {} MiB; video memory local {}, non-local {}; host textures {} ({} MiB), placed {} ({} MiB, {} released), texture objects made {} released {}, staging {} MiB, demoted for video memory {} ({} MiB; {} demotions, {} returns, peak local {} MiB); title memory copies {} MiB; views of released resources made null {}, last references put off {}, heap slots of released views made null {}, free targets held elsewhere (not taken back) {}, slots over released shared windows made null {}, stale slots nulled by XNW_GPU_CHECK {}, null UAVs made as SRV nulls (XNW_NULL_SRV) {}; host creations failed so far: {}",
         counters.pagefile_usage as u64 / MIB,
         counters.working_set_size as u64 / MIB,
         video(DXGI_MEMORY_SEGMENT_GROUP_LOCAL).unwrap_or_else(unknown),
@@ -3037,6 +3095,7 @@ fn memory_line(frame: u64) -> String {
         HELD_COUNTS[HC_POOL_HELD].load(Relaxed),
         HELD_COUNTS[HC_WINDOW_NULLED].load(Relaxed),
         HELD_COUNTS[HC_CHECK_NULLED].load(Relaxed),
+        super::descriptor::host::NULL_UAV_AS_SRV.load(Relaxed),
         xnw_core::syscalls::failed_text()
     )
 }
@@ -3066,6 +3125,54 @@ fn adapter() -> Option<&'static windows::Win32::Graphics::Dxgi::IDXGIAdapter3> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The host's refusals drop the use, not the resource (VIctory,
+    /// #2719): on the device, a flag survives exactly when the host supports
+    /// it. Run: `XNW_TEST_GPU=1 XNW_ADAPTER=warp XNW_WARP=<dir>
+    /// XNW_AGILITY=<dir> cargo test -p xnw-gpu --lib refused_uses`.
+    #[test]
+    fn refused_uses_follow_the_hosts_support() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        // Pure part: no support at all drops every use, full support none.
+        assert_eq!(refused_flags(7, 0, 0), 0);
+        assert_eq!(refused_flags(7, u32::MAX, u32::MAX), 7);
+        assert_eq!(refused_flags(5, D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 as u32, 0), 1);
+        if std::env::var_os("XNW_AGILITY").is_none_or(|d| d.is_empty()) {
+            println!("SKIPPED: set XNW_AGILITY to the Agility SDK folder to run on the host GPU");
+            return;
+        }
+        let host = host::host().expect("a host GPU");
+        for format in [86u32, 115, 28, 87, 41, 11] {
+            let init = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: DXGI_FORMAT(format as i32), ..Default::default() };
+            let f = xnw_device::feature(&host.device, D3D12_FEATURE_FORMAT_SUPPORT, init).expect("support");
+            let (s1, s2) = (f.Support1.0 as u32, f.Support2.0 as u32);
+            let kept = refused_uses_dropped(&host.device, format, 5);
+            println!("format {format}: support1 {s1:#x} support2 {s2:#x}: flags 5 -> {kept}");
+            assert_eq!(kept & 1 != 0, s1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 as u32 != 0, "render target {format}");
+            assert_eq!(
+                kept & 4 != 0,
+                s1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 as u32 != 0 && s2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0 as u32 != 0,
+                "unordered access {format}"
+            );
+            // What is kept is made: a resource with the kept flags exists.
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 16,
+                Height: 16,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT(format as i32),
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: D3D12_RESOURCE_FLAGS((kept & 5) as i32),
+                ..Default::default()
+            };
+            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            let mut r: Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> = None;
+            // SAFETY: plain creation.
+            unsafe { host.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut r) }.expect("kept flags are made");
+        }
+    }
 
     /// The slot at `offset` of one of our objects (tests know the signatures).
     fn slot<F: Copy>(object: This, offset: usize) -> F {

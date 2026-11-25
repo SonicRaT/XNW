@@ -94,6 +94,33 @@ pub mod kind {
     /// v2.6: the bytes of STRAND_VIEW `slot`'s range (buffers <= 16 MB,
     /// constant buffers <= 64 KB; an unordered view: reason 10, address only).
     pub const STRAND_BYTES: u16 = 53;
+    /// v2.7, frame scope: a pipeline's targets once per frame (addr = the
+    /// pipeline): `TARGETS_BYTES`, u32 count, 8 render-target DXGI formats,
+    /// the depth format.
+    pub const TARGETS: u16 = 54;
+    /// v2.7, frame scope: the CPU scene-light array at the frame's first
+    /// lighting dispatch (slot 0: `LIGHT_ARRAY_BYTES` at addr; slot 1: 8 B,
+    /// the buffer index and the light count, addr = the count's address).
+    pub const LIGHTS: u16 = 55;
+    /// v2.8, hook side (owner HOOK | draw), `hookin=1`: the hook's inputs
+    /// for a replay of the hook: `HookIn` parts (see `HOOKIN_PARTS`).
+    pub const HOOKIN: u16 = 56;
+    /// v2.8, frame scope: the hook's globals, 10 B: u16 matrix slot word,
+    /// u64 palette base (addr = the slot word's address).
+    pub const HOOK_GLOBALS: u16 = 57;
+    /// v2.9, strand-hair input sink: per group record r the palette bones
+    /// it names (root 0 slot 1, 48 B a bone): slot 2r = from base rec+0xe8,
+    /// 2r+1 = from base rec+0xec (the previous frame's); bones = the
+    /// largest remap entry (rec+0xe4 .. +256, & 0xfff) + 1; addr = the
+    /// palette view's address + 48 * base. CUT at the view's end.
+    pub const STRAND_PALETTE: u16 = 58;
+    /// v2.9, strand-hair input sink: per group record r the collision
+    /// shapes `CS_UpdatePosePosition` loops over in root 0 slot 22: byte
+    /// offset rec+0xf8, count rec+0xa8 >> 24, `STRAND_SHAPE` bytes each;
+    /// slot r, addr = slot 22's view address + offset. 1 = count 0.
+    pub const STRAND_SPAN: u16 = 59;
+    /// v2.9, any dispatch sink: 12 B, the x, y, z group counts.
+    pub const GROUPS: u16 = 60;
 
     pub fn name(k: u16) -> &'static str {
         match k {
@@ -130,6 +157,13 @@ pub mod kind {
             DRAW_ARGS => "drawargs",
             STRAND_VIEW => "strandview",
             STRAND_BYTES => "strandbytes",
+            TARGETS => "targets",
+            LIGHTS => "lights",
+            HOOKIN => "hookin",
+            HOOK_GLOBALS => "hookglobals",
+            STRAND_PALETTE => "strandpal",
+            STRAND_SPAN => "strandspan",
+            GROUPS => "groups",
             _ => "other",
         }
     }
@@ -322,6 +356,14 @@ pub mod op {
     /// A direct compute Dispatch (count = x groups; y, z in its
     /// DISPATCH record). Not a draw: never paired with a hook draw.
     pub const DISPATCH: u8 = 7;
+    /// v2.9: ExecuteIndirect of compute dispatches (count = max commands),
+    /// with the compute roots (before: op INDIRECT with the graphics roots).
+    /// Not a draw: never paired with a hook draw.
+    pub const INDIRECT_DISPATCH: u8 = 8;
+    /// A compute dispatch, direct or indirect (no draw).
+    pub fn is_dispatch(o: u8) -> bool {
+        o == DISPATCH || o == INDIRECT_DISPATCH
+    }
     pub fn name(o: u8) -> &'static str {
         match o {
             MESH => "mesh",
@@ -331,11 +373,12 @@ pub mod op {
             INDIRECT_MESH => "indirect_mesh",
             INDIRECT => "indirect",
             DISPATCH => "dispatch",
+            INDIRECT_DISPATCH => "indirect_dispatch",
             _ => "?",
         }
     }
     pub fn parse(s: &str) -> u8 {
-        [MESH, MESH_X, INDEXED, DRAW, INDIRECT_MESH, INDIRECT, DISPATCH].into_iter().find(|&o| name(o) == s).unwrap_or(0)
+        [MESH, MESH_X, INDEXED, DRAW, INDIRECT_MESH, INDIRECT, DISPATCH, INDIRECT_DISPATCH].into_iter().find(|&o| name(o) == s).unwrap_or(0)
     }
 }
 
@@ -514,10 +557,67 @@ impl ImpInstances {
 
 /// The bytes a DRAW_WORDS slot 0 record holds (16 u32).
 pub const DRAW_WORDS_BYTES: usize = 64;
+/// Table slots per root in a ref's slot (`root * TABLE_ROW + slot`);
+/// v2.7: slots TABLE_ROW..2*TABLE_ROW of a root (the frame table's upper
+/// half) are `UPPER | (root * TABLE_ROW + slot - TABLE_ROW)`.
+pub const TABLE_ROW: u32 = 96;
+pub const UPPER: u16 = 0x8000;
+
+/// The ref slot of table root `root` slot `slot` (kinds CBV, BUFFER).
+pub fn table_slot(root: u32, slot: u32) -> u16 {
+    if slot < TABLE_ROW { (root * TABLE_ROW + slot) as u16 } else { UPPER | (root * TABLE_ROW + slot - TABLE_ROW) as u16 }
+}
+
+/// The (root, slot) of a ref slot made by [`table_slot`].
+pub fn table_slot_of(at: u16) -> (u32, u32) {
+    let v = u32::from(at & !UPPER);
+    (v / TABLE_ROW, v % TABLE_ROW + if at & UPPER != 0 { TABLE_ROW } else { 0 })
+}
+
+/// v2.8 HOOKIN blob: u32 part count n, then n x (u64 address, u32 length,
+/// u32 1 if read), then the parts' bytes in order (zeros where not read).
+/// Parts (k: what, bytes): 0 TLS+0x950 stage 4; 1 TLS+0x1110 4; 2 TLS+0x1294
+/// 1; 3 TLS+0x11D8 0xF0 (drawable .. technique); 4 the geometry (rcx) 0x48;
+/// 5 *(g+8) vb desc 0x20; 6 *(g+0x10) ib desc 0x20; 7 **(g+0x40) meshlet
+/// desc 0x20; 8 ctx+0x40+8*slot 8 (bound); 9 ctx+0x6200+2*slot 2 (lazy);
+/// 10 ctx+0x12190 4 (matrix index i); 11 ctx+0x12328 8; 12 ctx+0x12360
+/// 0x1A; 13 bound 0x80; 14 matrix cache + 128*i 0x80; 15 viewport 0xC0;
+/// 16 viewport+0x708 8; 17 model 0x38; 18 palette + 48 * model[0x33] 48.
+/// ctx = TLS+0x12A8, viewport = TLS+0x12B8, model = TLS+0x1208, palette =
+/// TLS+0x11E8, slot = (matrix slot word) >> 2.
+pub const HOOKIN_PARTS: usize = 19;
+
+/// One HOOKIN part: (address, length, read, bytes).
+pub fn decode_hookin(b: &[u8]) -> Option<Vec<(u64, u32, bool, Vec<u8>)>> {
+    let n = u32::from_le_bytes(b.get(..4)?.try_into().ok()?) as usize;
+    let mut at = 4 + 16 * n;
+    let mut out = Vec::with_capacity(n);
+    for k in 0..n {
+        let h = b.get(4 + 16 * k..20 + 16 * k)?;
+        let addr = u64::from_le_bytes(h[..8].try_into().ok()?);
+        let len = u32::from_le_bytes(h[8..12].try_into().ok()?);
+        let ok = u32::from_le_bytes(h[12..16].try_into().ok()?) != 0;
+        out.push((addr, len, ok, b.get(at..at + len as usize)?.to_vec()));
+        at += len as usize;
+    }
+    Some(out)
+}
+
+/// v2.7 TARGETS blob size.
+pub const TARGETS_BYTES: usize = 40;
+/// v2.7 the scene-light array's bytes per buffer (0x1487BAF40 + 374784 *
+/// index [V ]).
+pub const LIGHT_ARRAY_BYTES: usize = 374_784;
+
 /// v2.6 `DRAW_ARGS`: instances, first vertex or index, base vertex, first instance.
 pub const DRAW_ARGS_BYTES: usize = 16;
 /// v2.6 strand group record (root 0 slot 21 of the `smh_*` programs).
 pub const STRAND_RECORD: usize = 336;
+/// v2.9: one collision shape of root 0 slot 22 (`CS_UpdatePosePosition`
+/// steps 0x50 per shape, bc6245e7 0x97c-0x9a0) [V read].
+pub const STRAND_SHAPE: usize = 0x50;
+/// v2.9: the bytes of one palette bone (3x4 f32).
+pub const BONE_BYTES: usize = 48;
 /// v2.6: the record words holding view heap indices, in STRAND_VIEW slot
 /// order k = 0..: +0xe0 (bone remap), +0x120 (asset buffer) [V the programs read],
 /// +0x114, +0x11c, +0x124, +0x128, +0x12c [I].
@@ -1025,10 +1125,10 @@ impl Coverage {
     /// `named(container hash)` names a program (the pack join).
     pub fn of(p: &FramePack, named: &dyn Fn(u128) -> bool) -> Coverage {
         // Dispatch sinks are not draws.
-        let mut c = Coverage { sinks: p.sinks.iter().filter(|s| s.op != op::DISPATCH).count() as u32, ..Coverage::default() };
+        let mut c = Coverage { sinks: p.sinks.iter().filter(|s| !op::is_dispatch(s.op)).count() as u32, ..Coverage::default() };
         c.paired = p.sinks.iter().filter(|s| s.hook_draw.is_some()).count() as u32;
         let stage_named = |pipe: u64, pixel: bool| p.programs.iter().any(|g| g.pipeline == pipe && (g.stage == "pixel" || g.stage == "PS") == pixel && g.reason == 0 && named(g.container));
-        c.both_named = p.sinks.iter().filter(|s| s.op != op::DISPATCH).filter(|s| stage_named(s.pipeline, false) && stage_named(s.pipeline, true)).count() as u32;
+        c.both_named = p.sinks.iter().filter(|s| !op::is_dispatch(s.op)).filter(|s| stage_named(s.pipeline, false) && stage_named(s.pipeline, true)).count() as u32;
         c.textures = p.textures.len() as u32;
         c.textures_held = p.textures.iter().filter(|t| t.texels != 0 || t.origin.is_some()).count() as u32;
         // Distinct objects only (pk1: summing every reference declared 99.9 GB
@@ -1062,6 +1162,16 @@ impl Coverage {
 
 #[cfg(test)]
 mod tests {
+    /// v2.7: slots past one row (the frame table's upper half) keep their own
+    /// ref slots, apart from the next root's; lower slots as before.
+    #[test]
+    fn table_slots_past_one_row() {
+        assert_eq!((table_slot(4, 1), table_slot(0, 95), table_slot(0, 96), table_slot(0, 181), table_slot(1, 0)), (4 * 96 + 1, 95, UPPER, UPPER | 85, 96));
+        for (root, slot) in [(0, 0), (0, 95), (0, 96), (0, 191), (5, 8), (31, 95), (3, 150)] {
+            assert_eq!(table_slot_of(table_slot(root, slot)), (root, slot));
+        }
+    }
+
     use super::*;
 
     fn tmp(name: &str) -> PathBuf {

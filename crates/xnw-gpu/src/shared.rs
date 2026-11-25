@@ -271,6 +271,17 @@ impl SharedMemory {
     /// of the region at `base` (`region`). Their memory is unpinned; the
     /// caller must know the GPU no longer reads them (phase 1: nothing does).
     pub fn release(&self, key: usize, region: bool) {
+        // A page window may be read by a frame of the world pass in flight
+        // (`XNW_ZEROCOPY`): released only between its frames (ZC2), and the
+        // pass hears of it before it records again. Never called on the
+        // pass's own thread.
+        let started = std::time::Instant::now();
+        let _between = (!region && world_on()).then(|| WORLD_FRAME.write().unwrap_or_else(|e| e.into_inner()));
+        if _between.is_some() {
+            let us = started.elapsed().as_micros() as u64;
+            WORLD_WAITS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            WORLD_WAITS[1].fetch_max(us, std::sync::atomic::Ordering::Relaxed);
+        }
         let mut gone = Vec::new();
         let mut gone_ids = Vec::new();
         let mut heaps = self.heaps.lock().unwrap_or_else(|e| e.into_inner());
@@ -291,6 +302,9 @@ impl SharedMemory {
         // Page-table entries over these windows read nothing from here on.
         for id in gone_ids {
             crate::d3d12x::page_table_window_gone(id);
+        }
+        if _between.is_some() {
+            WORLD_CHANGES.lock().unwrap_or_else(|e| e.into_inner()).gone.extend(gone.iter().copied());
         }
         // Slots made in place there are made null before the
         // next submission; the memory is the title's to free from here on.
@@ -341,6 +355,7 @@ pub static RESOLVE_COUNTS: [std::sync::atomic::AtomicU64; 2] = [const { std::syn
 /// resolved ranges over its regions go.
 pub fn remapped(at: usize, len: usize) {
     REMAPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    world_remapped(at, len);
     crate::d3d12x::page_table_remapped(at as u64, len as u64);
     let end = at.saturating_add(len.max(1));
     let mut c = RESOLVED.lock().unwrap_or_else(|e| e.into_inner());
@@ -488,6 +503,7 @@ fn open_later(key: (usize, usize)) {
 /// A page section is gone (all its pages freed): its window heaps go.
 pub fn section_gone(section: usize) {
     SECTIONS_GONE.fetch_add(1, std::sync::atomic::Ordering::Release);
+    WORLD_ASKED.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| k.0 != section);
     if HEAPS.load(std::sync::atomic::Ordering::Relaxed) > 0
         && let Some(s) = shared()
     {
@@ -533,10 +549,17 @@ pub fn page_table_on() -> bool {
 pub(crate) static PAGE_TABLE_TEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The most bytes of title memory heaps may pin with the page table on
-/// (`XNW_PAGETABLE_PIN_MB`, default 24,576 MiB); none without it.
+/// (`XNW_PAGETABLE_PIN_MB`, default 24,576 MiB), or with `XNW_ZEROCOPY`
+/// (`XNW_ZEROCOPY_PIN_MB`, default 12,288 MiB of window bytes: windows
+/// overlap, so a page counts at most twice); none without either.
 fn pin_cap() -> Option<u64> {
     static CAP: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| std::env::var("XNW_PAGETABLE_PIN_MB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(24_576) << 20);
-    page_table_on().then_some(*CAP)
+    static WORLD_CAP: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| std::env::var("XNW_ZEROCOPY_PIN_MB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(12_288) << 20);
+    if page_table_on() {
+        Some(*CAP)
+    } else {
+        world_on().then_some(*WORLD_CAP)
+    }
 }
 
 /// Heaps not opened for the pin cap.
@@ -610,6 +633,232 @@ pub fn window_id(buffer: &ID3D12Resource) -> u32 {
     let mut ids = IDS.lock().unwrap_or_else(|e| e.into_inner());
     let n = ids.len() as u32;
     *ids.entry(buffer.as_raw() as usize).or_insert(n)
+}
+
+// ---- Our world pass reading title memory in place (ZC1, ZC2) ----------
+//
+// `XNW_ZEROCOPY=on` (default off; `geom` or `bridge` for one part): the
+// world pass and the bridge bind a title range through the heap over its
+// page window instead of copying it into a buffer of their own. Independent
+// of `XNW_SHARED` (the title's own GPU path, nulled). ZC2, the card risk
+// list:
+// - a frame never opens a heap: a window not open yet is asked of the
+//   opener thread and the range stays a copy this frame; windows are asked
+//   for as the title maps pages (`world_mapped`, `XNW_ZEROCOPY_PREWARM=0`
+//   turns that off);
+// - only page windows: title regions stay copies (2-19 KiB a frame in ZC1's
+//   census; a heap over a region makes the title's VirtualFree fail);
+// - pinned window bytes capped (`XNW_ZEROCOPY_PIN_MB`, default 12,288);
+// - a window heap is released only between the pass's frames
+//   ([`world_frame`] is held from record to fence), and the pass hears of
+//   it ([`world_changes`]) before it records again;
+// - title remappings over in-place ranges reach the pass the same way: a
+//   view made before one reads the section's old page.
+
+/// `XNW_ZEROCOPY` parts.
+pub const WORLD_GEOM: u8 = 1;
+pub const WORLD_BRIDGE: u8 = 2;
+
+fn world_mode() -> u8 {
+    static MODE: std::sync::LazyLock<u8> = std::sync::LazyLock::new(|| match std::env::var("XNW_ZEROCOPY").as_deref().map(str::trim) {
+        Ok("on") => WORLD_GEOM | WORLD_BRIDGE,
+        Ok("geom") => WORLD_GEOM,
+        Ok("bridge") => WORLD_BRIDGE,
+        _ => 0,
+    });
+    *MODE
+}
+
+/// Whether `XNW_ZEROCOPY` is on for any part.
+pub fn world_on() -> bool {
+    world_mode() != 0 || WORLD_TEST.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether `XNW_ZEROCOPY` is on for part `p` ([`WORLD_GEOM`], [`WORLD_BRIDGE`]).
+pub fn world_part(p: u8) -> bool {
+    world_mode() & p != 0 || WORLD_TEST.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Tests (and the burst) turn it on without the environment.
+pub static WORLD_TEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// In place: ranges, bytes; refused: ranges, bytes (since the last
+/// [`world_text`]).
+static WORLD: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// Why refused: the [`Miss`] kinds, then a title region, then the pin cap.
+static WORLD_WHY: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
+const WORLD_WHY_REGION: usize = 9;
+const WORLD_WHY_PIN: usize = 10;
+const WORLD_WHY_NAMES: [&str; 11] = ["unknown", "not contiguous", "crosses window", "uncommitted", "too large", "failed", "partly mapped", "past a region end", "window opening", "title region (copied)", "pin cap"];
+
+/// With `XNW_ZEROCOPY` on, the buffer over title memory
+/// `[address, address + len)` and the offset there, for the world pass, if
+/// its page window is open; None (counted, with why) otherwise. A window
+/// not open yet is asked of the opener thread (never opened here: 52 ms
+/// a heap on WARP). The caller binds no more than `len` bytes from the offset.
+pub fn world_range(address: u64, len: u64) -> Option<SharedRange> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !world_on() || len < WORLD_MIN {
+        return None;
+    }
+    let r = world_lookup(address, len, true);
+    let i = usize::from(r.is_err()) * 2;
+    WORLD[i].fetch_add(1, Relaxed);
+    WORLD[i + 1].fetch_add(len, Relaxed);
+    if let Err(m) = &r {
+        WORLD_WHY[*m].fetch_add(1, Relaxed);
+    }
+    r.ok()
+}
+
+/// Whether [`world_range`] would bind `[address, address + len)` in place
+/// now, at an offset that is a multiple of `align` (not counted; asks for
+/// the window like it). The geometry reader asks before it skips a copy.
+pub fn world_ready(address: u64, len: u64, align: u64) -> bool {
+    world_on() && len >= WORLD_MIN && world_lookup(address, len, true).is_ok_and(|r| r.offset.is_multiple_of(align))
+}
+
+fn world_lookup(address: u64, len: u64, ask: bool) -> std::result::Result<SharedRange, usize> {
+    let s = shared().ok_or(Miss::Unknown as usize)?;
+    let (key, offset) = resolve_cached(address as usize, len as usize, || s.resolve(address as usize, len as usize)).map_err(|m| m as usize)?;
+    if key.1 == usize::MAX {
+        return Err(WORLD_WHY_REGION);
+    }
+    if let Some((_, buf, bytes)) = s.heaps.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        // View bounds: the range lies wholly in the window's buffer.
+        return if offset as usize + len as usize <= *bytes { Ok(SharedRange { buffer: buf.clone(), offset, len: len as usize }) } else { Err(Miss::CrossesWindow as usize) };
+    }
+    if pin_cap().is_some_and(|cap| PINNED.load(std::sync::atomic::Ordering::Relaxed) + WINDOW as u64 > cap) {
+        return Err(WORLD_WHY_PIN);
+    }
+    if ask {
+        if !s.background {
+            // Tests: no opener thread.
+            let (at, bytes) = (s.window)(key.0, key.1).ok_or(Miss::Failed as usize)?;
+            let buffer = s.open(key, at, bytes, None).map_err(|m| m as usize)?;
+            return if offset as usize + len as usize <= bytes { Ok(SharedRange { buffer, offset, len: len as usize }) } else { Err(Miss::CrossesWindow as usize) };
+        }
+        open_later(key);
+    }
+    Err(Miss::Opening as usize)
+}
+
+/// Opens the page window's heap over `[address, address + len)` now,
+/// inline (the burst loading its memory, as a runtime does when the title
+/// maps pages), unless the range is under [`WORLD_MIN`] or a title region.
+/// Whether it is open.
+pub fn world_open(address: u64, len: u64) -> bool {
+    if !world_on() || len < WORLD_MIN {
+        return false;
+    }
+    let Some(s) = shared() else { return false };
+    let Ok((key, _)) = s.resolve(address as usize, len as usize) else { return false };
+    if key.1 == usize::MAX {
+        return false;
+    }
+    (s.window)(key.0, key.1).is_some_and(|(at, bytes)| s.open(key, at, bytes, None).is_ok())
+}
+
+/// The title mapped bytes `[offset, offset + len)` of page section
+/// `section` (xmem's map): with `XNW_ZEROCOPY` on, the windows over them
+/// are asked of the opener thread, once each, so a frame finds them open.
+pub fn world_mapped(section: usize, offset: usize, len: usize) {
+    static PREWARM: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("XNW_ZEROCOPY_PREWARM").map_or(true, |v| v.trim() != "0"));
+    if !world_on() || !*PREWARM || WORLD_OPENS_INLINE.load(std::sync::atomic::Ordering::Relaxed) || len == 0 || MEMORY.get().is_none() {
+        return;
+    }
+    let mut asked = WORLD_ASKED.lock().unwrap_or_else(|e| e.into_inner());
+    for w in offset / WINDOW_STRIDE..=(offset + len - 1) / WINDOW_STRIDE {
+        if pin_cap().is_some_and(|cap| PINNED.load(std::sync::atomic::Ordering::Relaxed) + WINDOW as u64 > cap) {
+            return;
+        }
+        if asked.insert((section, w)) {
+            open_later((section, w));
+        }
+    }
+}
+/// Set by a caller that opens its windows itself ([`world_open`]: the
+/// burst, loading its memory): maps ask the opener thread for nothing.
+pub static WORLD_OPENS_INLINE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Windows asked for at map time (forgotten when their section goes).
+static WORLD_ASKED: std::sync::Mutex<std::collections::BTreeSet<(usize, usize)>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Held by the world pass from the start of a frame's recording to its
+/// fence: a window heap is released only between frames.
+static WORLD_FRAME: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// A frame of the world pass in flight (see [`world_frame`]).
+pub struct WorldFrame(#[allow(dead_code)] Option<std::sync::RwLockReadGuard<'static, ()>>);
+
+/// The world pass starts a frame: held until its fence has passed. A
+/// release of a window heap waits for it (the title thread freeing the
+/// section's last pages waits at most one frame).
+pub fn world_frame() -> WorldFrame {
+    WorldFrame(world_on().then(|| WORLD_FRAME.read().unwrap_or_else(|e| e.into_inner())))
+}
+
+/// Since the last call: window buffers released (GPU address, bytes), title
+/// ranges remapped (address, bytes), and whether more remappings came than
+/// were kept (then every in-place range is to be made again).
+#[derive(Default)]
+pub struct WorldChanges {
+    pub gone: Vec<(u64, u64)>,
+    pub remapped: Vec<(u64, u64)>,
+    pub overflow: bool,
+}
+static WORLD_CHANGES: std::sync::Mutex<WorldChanges> = std::sync::Mutex::new(WorldChanges { gone: Vec::new(), remapped: Vec::new(), overflow: false });
+const WORLD_REMAPS_KEPT: usize = 1 << 16;
+
+/// Takes [`WorldChanges`] (the pass, at the start of a frame, holding
+/// [`world_frame`]).
+pub fn world_changes() -> WorldChanges {
+    std::mem::take(&mut *WORLD_CHANGES.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+fn world_remapped(at: usize, len: usize) {
+    if !world_on() {
+        return;
+    }
+    let mut c = WORLD_CHANGES.lock().unwrap_or_else(|e| e.into_inner());
+    if c.remapped.len() < WORLD_REMAPS_KEPT {
+        c.remapped.push((at as u64, len as u64));
+    } else {
+        c.overflow = true;
+    }
+}
+
+/// Ranges under this many bytes stay copies: a copy of a few hundred
+/// bytes costs less than the heap it would pin (a 256-byte constant
+/// buffer in a 1.2 GiB region pins the region).
+pub const WORLD_MIN: u64 = 4096;
+
+/// Window releases that waited for a frame of the world pass, and the
+/// longest wait (us).
+static WORLD_WAITS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// The world pass's in-place line since the last call, zeroing:
+/// `in place N ranges (K KiB), refused M (L KiB) [why], heaps H, pinned P MiB`.
+pub fn world_text() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let w: Vec<u64> = WORLD.iter().map(|c| c.swap(0, Relaxed)).collect();
+    let why: Vec<String> = WORLD_WHY_NAMES.iter().zip(&WORLD_WHY).filter_map(|(n, c)| Some(c.swap(0, Relaxed)).filter(|&v| v > 0).map(|v| format!("{n} {v}"))).collect();
+    let opened = (OPENED[0].load(Relaxed), OPENED[1].load(Relaxed));
+    format!(
+        "in place {} ranges ({} KiB), refused {} ({} KiB){}; heaps {} (opened so far {} in {:.1} ms, off the frame), pinned {} MiB (cap {} MiB, refused {}); releases waiting on a frame {} (longest {:.1} ms)",
+        w[0],
+        w[1] >> 10,
+        w[2],
+        w[3] >> 10,
+        if why.is_empty() { String::new() } else { format!(" [{}]", why.join(", ")) },
+        HEAPS.load(Relaxed),
+        opened.0,
+        opened.1 as f64 / 1e3,
+        PINNED.load(Relaxed) >> 20,
+        pin_cap().map_or(0, |c| c >> 20),
+        PIN_REFUSED.load(Relaxed),
+        WORLD_WAITS[0].load(Relaxed),
+        WORLD_WAITS[1].load(Relaxed) as f64 / 1e3
+    )
 }
 
 /// With `XNW_SHARED=2`, the shared buffer over `[address, address + len)`,
@@ -2388,6 +2637,46 @@ mod zero_copy_tests {
         assert_eq!(alloc_class(0x1040_0000), AL_POOL);
         assert_eq!(alloc_class(0x2000_8000), AL_ARENA);
         *ALLOCATORS.lock().unwrap() = None;
+    }
+
+    /// ZC2, card risk 3: a window heap is released only between the world
+    /// pass's frames (the release waits for the frame held), the pass hears
+    /// of it and of remappings, and a range never opens on the frame
+    /// (a test SharedMemory opens inline: only the process's has the opener).
+    /// Needs a device: run with `XNW_ADAPTER=warp`; skipped without one.
+    #[test]
+    fn window_released_only_between_frames() {
+        let Ok(host) = Host::new(None) else {
+            eprintln!("no host device: skipped");
+            return;
+        };
+        WORLD_TEST.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = world_changes();
+        let block = Block::new(1 << 20, 0).expect("1 MiB");
+        let s: &'static SharedMemory = Box::leak(Box::new(SharedMemory::new(host.device.clone(), |_, _| Err(Miss::Unknown), |_, _| None)));
+        let key = (0x7_7000, 0);
+        s.open(key, block.p as usize, 1 << 20, None).expect("heap over our block");
+        let frame = world_frame();
+        let t = std::thread::spawn(move || {
+            let t0 = std::time::Instant::now();
+            s.release(key.0, false);
+            t0.elapsed()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!t.is_finished(), "the release waits for the frame in flight");
+        assert!(world_changes().gone.is_empty(), "nothing gone while the frame is in flight");
+        drop(frame);
+        let waited = t.join().unwrap();
+        assert!(waited >= std::time::Duration::from_millis(150), "waited {waited:?}");
+        let c = world_changes();
+        assert_eq!(c.gone.len(), 1);
+        assert_eq!(c.gone[0].1, 1 << 20);
+        remapped(0x1234_0000, 0x1_0000);
+        let c = world_changes();
+        assert_eq!(c.remapped, vec![(0x1234_0000, 0x1_0000)]);
+        assert!(s.heaps.lock().unwrap().is_empty());
+        WORLD_TEST.store(false, std::sync::atomic::Ordering::Relaxed);
+        drop(block);
     }
 
     /// A page's class from how it resolves.

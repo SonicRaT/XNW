@@ -141,9 +141,41 @@ const KEEP_FRAMES: u64 = 600;
 type Samplers = (u64, HashMap<usize, Option<Arc<Vec<(u32, SamplerDesc)>>>>);
 static SAMPLERS: Mutex<Option<Samplers>> = Mutex::new(None);
 
-/// Bytes read since the last call.
-pub fn take_read_bytes() -> u64 {
-    READ_BYTES.swap(0, Ordering::Relaxed)
+/// Bytes since the last line: [frame tables (once a frame), constant
+/// buffers (each frame), kept views read anew, kept views not read again].
+static READ_SPLIT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Bytes read since the last call, and their split ([`READ_SPLIT`]).
+pub fn take_read_bytes() -> (u64, [u64; 4]) {
+    (READ_BYTES.swap(0, Ordering::Relaxed), std::array::from_fn(|k| READ_SPLIT[k].swap(0, Ordering::Relaxed)))
+}
+
+/// The reads line (the live list build every 60 frames, `xnw burst` every
+/// frame): `rows` bridged rows, the bytes read since the last line.
+pub fn reads_line(frame: u64, rows: usize) -> String {
+    let (read, split) = take_read_bytes();
+    format!(
+        "world render: frame {frame}: bridgeps reads: {rows} rows, {} KiB read from title memory since the last line (frame tables {} KiB, constant buffers {} KiB, kept views {} KiB new; kept views not read again {} KiB)",
+        read >> 10,
+        split[0] >> 10,
+        split[1] >> 10,
+        split[2] >> 10,
+        split[3] >> 10
+    )
+}
+
+/// A sample of a view's bytes that tells whether it changed: the first
+/// and the last 256 bytes and eight 64-byte pieces between (`None`: not readable).
+fn sample(addr: u64, len: u64) -> Option<u128> {
+    if len <= 1024 {
+        return read(addr, len).map(|b| xnw_core::hash128(&[&b]));
+    }
+    let mut parts = vec![read(addr, 256)?, read(addr + len - 256, 256)?];
+    for k in 1..=8 {
+        parts.push(read(addr + (len - 64) * k / 9 / 4 * 4, 64)?);
+    }
+    let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+    Some(xnw_core::hash128(&refs))
 }
 
 fn frame_read(frame: u64, addr: u64, len: u64) -> Option<Arc<Vec<u8>>> {
@@ -160,6 +192,7 @@ fn frame_read(frame: u64, addr: u64, len: u64) -> Option<Arc<Vec<u8>>> {
     // Read outside the lock: other title threads' sinks do not wait on it.
     let b = Arc::new(read(addr, len)?);
     READ_BYTES.fetch_add(len, Ordering::Relaxed);
+    READ_SPLIT[0].fetch_add(len, Ordering::Relaxed);
     let mut g = lock(&VIEWS);
     if let Some(v) = g.as_mut().filter(|v| v.0 == frame) {
         v.1.insert((addr, len), b.clone());
@@ -167,19 +200,24 @@ fn frame_read(frame: u64, addr: u64, len: u64) -> Option<Arc<Vec<u8>>> {
     Some(b)
 }
 
+/// A view kept across frames: the same bytes (the same `Arc`, which our
+/// pass keeps on the device) while its sample ([`sample`]) is unchanged.
 fn kept_read(frame: u64, addr: u64, len: u64) -> Option<Arc<Vec<u8>>> {
-    let head = read(addr, len.min(256))?;
-    let h = xnw_core::hash128(&[&head]);
+    let h = sample(addr, len)?;
     {
         let mut g = lock(&KEPT);
         let m = g.get_or_insert_with(HashMap::new);
         if let Some(e) = m.get_mut(&(addr, len)).filter(|e| e.0 == h) {
+            if e.2 != frame {
+                READ_SPLIT[3].fetch_add(len, Ordering::Relaxed);
+            }
             e.2 = frame;
             return Some(e.1.clone());
         }
     }
     let b = Arc::new(read(addr, len)?);
     READ_BYTES.fetch_add(len, Ordering::Relaxed);
+    READ_SPLIT[2].fetch_add(len, Ordering::Relaxed);
     let mut g = lock(&KEPT);
     let m = g.get_or_insert_with(HashMap::new);
     if m.len() > 4096 || frame.is_multiple_of(60) {
@@ -222,8 +260,21 @@ impl Source for Title<'_> {
         }
     }
 
-    fn bytes(&self, _: u16, _: u32, v: &SrcView) -> Option<Arc<Vec<u8>>> {
-        frame_read(self.frame, v.addr, v.bytes.min(VIEW_MAX))
+    /// The frame table's views (root 0) once a frame for every row;
+    /// a draw's constant buffers each frame; its other views kept across
+    /// frames while their sample holds ([`kept_read`]).
+    fn bytes(&self, root: u16, _: u32, v: &SrcView) -> Option<Arc<Vec<u8>>> {
+        let len = v.bytes.min(VIEW_MAX);
+        if root == 0 {
+            return frame_read(self.frame, v.addr, len);
+        }
+        if v.kind == view::CONSTANT || (len as usize) < bridge::KEEP_MIN {
+            let b = read(v.addr, len)?;
+            READ_BYTES.fetch_add(len, Ordering::Relaxed);
+            READ_SPLIT[1].fetch_add(len, Ordering::Relaxed);
+            return Some(Arc::new(b));
+        }
+        kept_read(self.frame, v.addr, len)
     }
 
     fn root_view(&self, _: u16, addr: u64) -> Option<Arc<Vec<u8>>> {
@@ -318,5 +369,18 @@ mod tests {
         // A new frame reads afresh.
         let z = frame_read(1_000_002, a, 4096).expect("next frame");
         assert!(!Arc::ptr_eq(&x, &z));
+    }
+
+    #[test]
+    fn kept_views_are_the_same_bytes_until_their_sample_changes() {
+        let mut buf = vec![3u8; 8192];
+        let a = buf.as_ptr() as u64;
+        let x = kept_read(2_000_001, a, 8192).expect("read");
+        let y = kept_read(2_000_002, a, 8192).expect("next frame, same bytes");
+        assert!(Arc::ptr_eq(&x, &y), "kept across frames");
+        // A change the sample sees (the last 256 bytes) reads the view anew.
+        buf[8000] = 4;
+        let z = kept_read(2_000_003, a, 8192).expect("changed");
+        assert!(!Arc::ptr_eq(&x, &z) && z[8000] == 4);
     }
 }

@@ -10,6 +10,7 @@
 //!   xnw pack-info <frame dir> [--pack <rpf>]  coverage of a frame pack v2
 //!   xnw translate <rpf> [--stage ..] [--validate] [--pipelines N] [--fma exact|fast]  pack to DXIL
 //!   xnw prebuild [--jobs N] [--shaders-only]  listed shaders and pipelines into the cache
+//!   xnw shader-warm [--drawn|--all]          the shaders only, for the drawn list (default) or all listed
 //!   xnw movie-info <movies.rpf> [--list] [--entry I --frame N --out f.bmp]  Bink movies, CPU decode
 //!   xnw texture-info <ttpf|dir|rpf> [--census] [--list N] [--dump N] [--sample K]  texture page files
 //!   xnw texture-pack <ttpf|dir|rpf> [--out DIR] [--drop-mips N] [--only-trace LOG] [--threads K]  host texture packs
@@ -28,6 +29,7 @@ mod watch;
 mod worldahead;
 mod worldprobe;
 mod worldterrain;
+mod worldwater;
 mod worldtex;
 mod shaderinfo;
 mod smoke;
@@ -50,10 +52,12 @@ const USAGE: &str = "usage: xnw inspect <exe|dll> [--imports]
        xnw shader-info <rpf> [--census] [--disasm <name-or-hash>]
        xnw shader-match <rpf> <census dir>
        xnw pack-info <frame dir> [--pack <rpf>]
+       xnw burst <capture dir> --adapter hw|warp [--from N] [--frames K] [--switches a,b=c] [--png DIR] [--png-at N,..]
        xnw texture-info <ttpf|dir|rpf> [--census] [--list N] [--dump N] [--only HASH] [--sample K] [--out DIR]
        xnw texture-info --trace <dstorage log>
        xnw texture-pack <ttpf|dir|rpf> [--out DIR] [--drop-mips N] [--only-trace LOG] [--threads K] [--plan] [--verify N] [--dds N]
        xnw translate <rpf> [--stage vs|ps|cs|ms|gs] [--validate] [--pipelines N] [--fma exact|fast] [--jobs N] [--dump DIR]
+       xnw shader-warm [--drawn|--all] [--jobs N] [--pack <shaders.rpf>]
        xnw prebuild [--jobs N] [--shaders-only] [--pack <shaders.rpf>] [--list-slow] [--only P,..] [--skip P,..|@file] [--from N] [--to M] [--timeout S] [--retry-suspects]";
 
 fn main() -> ExitCode {
@@ -75,6 +79,7 @@ fn main() -> ExitCode {
         Some("shader-info") => shaderinfo::run(&args[1..]),
         Some("translate") => translate::run(&args[1..]),
         Some("prebuild") => prebuild::run(&args[1..]),
+        Some("shader-warm") => prebuild::warm(&args[1..]),
         Some("shader-match") => shadermatch::run(&args[1..]),
         Some("pack-info") => packinfo::run(&args[1..]),
         Some("movie-info") => movie::run(&args[1..]),
@@ -83,6 +88,7 @@ fn main() -> ExitCode {
         Some("texture-pack") => texturepack::run(&args[1..]),
         Some("world-probe-decode") => xnw_frame::decode_cli(&args[1..]).map_err(Into::into),
         Some("world-render") => xnw_frame::render_cli(&args[1..]).map_err(Into::into),
+        Some("burst") => worldprobe::burst::run(&args[1..]).map_err(Into::into),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);

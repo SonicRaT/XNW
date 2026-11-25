@@ -128,6 +128,15 @@ pub struct Binding<'a> {
 /// placed once, and each stage's user-data dword of it holds its first
 /// slot times 32. `Err` names the first input the record lacks.
 pub fn bind<'a>(ms: &HostShader, ps: &HostShader, d: &Draw<'a>) -> Result<Binding<'a>, String> {
+    bind_at(ms, ps, d, 0)
+}
+
+/// [`bind`] with the draw's view heap slots starting at slot `base` of a
+/// heap shared by many draws (`bridged`): every slot, table offset, raw
+/// twin, guard and the heap bound move by `base`; the draw's heap-picked
+/// views (`d.heap`, by word) too. The stride table's entries are for
+/// slots `base..`: the caller puts them there in one table of the whole heap.
+pub fn bind_at<'a>(ms: &HostShader, ps: &HostShader, d: &Draw<'a>, base: u32) -> Result<Binding<'a>, String> {
     let stages = [("mesh", ms), ("pixel", ps)];
     for (name, s) in stages {
         if !s.root_uavs.is_empty() || s.address_map || s.descriptor_words {
@@ -142,7 +151,7 @@ pub fn bind<'a>(ms: &HostShader, ps: &HostShader, d: &Draw<'a>) -> Result<Bindin
         Slot::Buffer(v) => *v,
         Slot::Texture(_) | Slot::Handle(_) => View { kind: Kind::Raw, bytes: &[] },
     };
-    let mut dispatch = preskin::Dispatch { groups: [d.groups, 1, 1], tables: Vec::new(), heap: d.heap.iter().map(|(k, s)| (*k, lay(s))).collect() };
+    let mut dispatch = preskin::Dispatch { groups: [d.groups, 1, 1], tables: Vec::new(), heap: d.heap.iter().map(|(k, s)| (*k, lay(s))).collect(), constants: Vec::new(), texels: Vec::new() };
     for &r in &tables {
         let Some(Root::Table(views)) = d.roots.get(usize::from(r)) else {
             return Err(format!("the record has no table at root {r}"));
@@ -152,15 +161,31 @@ pub fn bind<'a>(ms: &HostShader, ps: &HostShader, d: &Draw<'a>) -> Result<Bindin
     let user_data = tables.iter().map(|&r| emit::UserData { index: u32::from(r), slot: r, root: RootType::Table, dword: 0 }).collect();
     let layout = HostShader { stage: HwStage::Cs, dxil: Vec::new(), user_data, samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: Vec::new(), root_srvs: Vec::new(), root_uavs: Vec::new(), address_map: false, descriptor_words: false };
     let mut views = preskin::bind(&layout, &dispatch)?;
+    if base > 0 {
+        for &r in &tables {
+            views.constants[usize::from(r)] += 32 * base;
+        }
+        for s in &mut views.slots {
+            s.0 += base;
+        }
+        for w in &mut views.strides {
+            if w[1] & emit::StrideEntry::RAW_SLOTS != 0 {
+                w[1] += base;
+            }
+        }
+        for g in &mut views.bounds[..6] {
+            *g += base;
+        }
+    }
     let first: Vec<u32> = views.constants.iter().map(|c| c / 32).collect();
-    let mut textures: Vec<(u32, &Provided)> = d.heap.iter().filter_map(|(k, s)| if let Slot::Texture(t) = s { Some((*k, *t)) } else { None }).collect();
+    let mut textures: Vec<(u32, &Provided)> = d.heap.iter().filter_map(|(k, s)| if let Slot::Texture(t) = s { Some((base + *k, *t)) } else { None }).collect();
     for &r in &tables {
         if let Some(Root::Table(v)) = d.roots.get(usize::from(r)) {
             textures.extend(v.iter().filter_map(|(k, s)| if let Slot::Texture(t) = s { Some((first[usize::from(r)] + k, *t)) } else { None }));
         }
     }
     textures.sort_by_key(|t| t.0);
-    let mut handles: Vec<(u32, u64)> = d.heap.iter().filter_map(|(k, s)| if let Slot::Handle(h) = s { Some((*k, *h)) } else { None }).collect();
+    let mut handles: Vec<(u32, u64)> = d.heap.iter().filter_map(|(k, s)| if let Slot::Handle(h) = s { Some((base + *k, *h)) } else { None }).collect();
     for &r in &tables {
         if let Some(Root::Table(v)) = d.roots.get(usize::from(r)) {
             handles.extend(v.iter().filter_map(|(k, s)| if let Slot::Handle(h) = s { Some((first[usize::from(r)] + k, *h)) } else { None }));
@@ -191,7 +216,7 @@ pub fn bind<'a>(ms: &HostShader, ps: &HostShader, d: &Draw<'a>) -> Result<Bindin
     };
     let (mesh, pixel) = (stage("mesh", ms)?, stage("pixel", ps)?);
     // A shader-visible sampler heap holds at most 2048 entries (heap
-    // creation fails past it; VIctory#2451): entries past it are left
+    // creation fails past it; VIctory): entries past it are left
     // out, and the heap bound sends their indices to the bound's guard.
     let sampler_slots = d.samplers.iter().map(|s| s.0 + 1).max().unwrap_or(0).max(d.sampler_slots).clamp(1, SAMPLER_HEAP_MAX);
     views.bounds[6] = sampler_slots;
@@ -205,11 +230,13 @@ pub mod feature {
     pub const DOUBLE_EXTENSIONS: u64 = 1 << 5;
     pub const WAVE_OPS: u64 = 1 << 14;
     pub const INT64_OPS: u64 = 1 << 15;
+    /// SM 6.1 barycentrics (computed barycentrics in pixel programs).
+    pub const BARYCENTRICS: u64 = 1 << 17;
     pub const ATOMIC64_TYPED: u64 = 1 << 22;
     pub const VIEW_HEAP_INDEXING: u64 = 1 << 25;
     pub const SAMPLER_HEAP_INDEXING: u64 = 1 << 26;
     pub const ATOMIC64_HEAP: u64 = 1 << 28;
-    pub const NAMES: [(u64, &str); 8] = [(DOUBLES, "doubles"), (DOUBLE_EXTENSIONS, "11.1 double extensions"), (WAVE_OPS, "wave ops"), (INT64_OPS, "64-bit integers"), (ATOMIC64_TYPED, "64-bit atomics on typed resources"), (VIEW_HEAP_INDEXING, "view heap indexing"), (SAMPLER_HEAP_INDEXING, "sampler heap indexing"), (ATOMIC64_HEAP, "64-bit atomics on heap resources")];
+    pub const NAMES: [(u64, &str); 9] = [(DOUBLES, "doubles"), (DOUBLE_EXTENSIONS, "11.1 double extensions"), (WAVE_OPS, "wave ops"), (INT64_OPS, "64-bit integers"), (BARYCENTRICS, "barycentrics"), (ATOMIC64_TYPED, "64-bit atomics on typed resources"), (VIEW_HEAP_INDEXING, "view heap indexing"), (SAMPLER_HEAP_INDEXING, "sampler heap indexing"), (ATOMIC64_HEAP, "64-bit atomics on heap resources")];
 }
 
 /// What one emitted program asks of an adapter.
@@ -275,7 +302,7 @@ pub fn gap(caps: &xnw_gpu::host::Caps, needs: &[Needs]) -> Option<String> {
         }
     }
     let all = needs.iter().fold(0, |a, n| a | n.features);
-    for (bit, has, what) in [(feature::DOUBLES, caps.double_ops, "no double ops"), (feature::ATOMIC64_TYPED, caps.int64_typed, "no 64-bit atomics on typed resources"), (feature::ATOMIC64_HEAP, caps.int64_heap, "no 64-bit atomics on heap resources")] {
+    for (bit, has, what) in [(feature::DOUBLES, caps.double_ops, "no double ops"), (feature::ATOMIC64_TYPED, caps.int64_typed, "no 64-bit atomics on typed resources"), (feature::ATOMIC64_HEAP, caps.int64_heap, "no 64-bit atomics on heap resources"), (feature::BARYCENTRICS, caps.barycentrics, "no barycentrics")] {
         if all & bit != 0 && !has {
             gap.push(what.into());
         }
@@ -399,7 +426,7 @@ pub struct Frame {
 
 /// Our pass's targets to draw into instead of the run's own (`bridgeps`):
 /// its colour target (RGBA8, render-target state) and depth
-/// target (D32, depth-write state). Target 0 of the pixel program goes to
+/// target (depth-write state). Target 0 of the pixel program goes to
 /// the colour target; its other targets are not bound (their outputs are
 /// dropped). The depth test is GREATER_EQUAL against the pass's depth,
 /// without writing it: the title's surface lies 5e-6 nearer than ours,
@@ -428,7 +455,7 @@ fn barrier(r: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOU
 
 /// The validation layer's stored errors, newest first (at most 4), as a
 /// tail for a failure text; empty without the layer.
-fn layer_errors(dev: &ID3D12Device) -> String {
+pub(crate) fn layer_errors(dev: &ID3D12Device) -> String {
     use windows::core::Interface;
     let Ok(queue) = dev.cast::<ID3D12InfoQueue>() else { return String::new() };
     let mut out = String::new();
@@ -575,6 +602,158 @@ pub struct Shared {
     /// New bytes by kind: large buffer views (not merged), small buffer
     /// views, textures, root views.
     pub new: [u64; 4],
+    /// `XNW_ZEROCOPY` (ZC2): the title address of a view's bytes, by the
+    /// bytes' address (the caller's, per row). A view with one is bound in
+    /// place in title memory where its page window is open, else on one
+    /// buffer per title address that every row's view of it shares (each
+    /// row's own words written into it: the title's memory holds them all
+    /// at once). Views of a row without an entry take the paths above.
+    pub addrs: HashMap<usize, TitleView>,
+    /// The frame's title spans (start, end) in layers and their buffers by
+    /// (layer, start).
+    spans: Vec<Vec<(u64, u64)>>,
+    by_addr: HashMap<(usize, u64), AtAddr>,
+    /// Views bound in place in title memory, on a buffer per title address
+    /// (and its bytes), rows refused one for a byte two rows set
+    /// differently, buffers made again larger.
+    pub in_place: u64,
+    pub by_addr_views: u64,
+    pub by_addr_bytes: u64,
+    pub by_addr_conflicts: u64,
+    /// Large views (at least [`KEEP_MIN`], not constants) not on a span, by
+    /// why (count, bytes): no title address, outside every span, a byte
+    /// another row holds differently, the span offset not a multiple of the
+    /// view's unit (ZC3).
+    pub off_span: [(u64, u64); 4],
+    /// Bytes of a row's copy another row's own words shadow on its span
+    /// (its view reads theirs there), and bytes a row's own words wrote over
+    /// other rows' copies.
+    pub shadowed: u64,
+    pub overrode: u64,
+    /// `XNW_ZEROCOPY_SPANCHECK=1`: every view on a span (row `row` set by the
+    /// caller, slot, span, offset, 4 KiB block hashes of its title bytes),
+    /// compared with the spans' final bytes by [`Shared::span_check`].
+    pub check: Option<Vec<SpanView>>,
+    pub row: u32,
+}
+
+/// What of a view's bytes is title memory ([`Shared::addrs`], ZC3): the
+/// title address of byte 0, the bytes copied from there (`captured`, from
+/// byte 0), and the ranges `load` wrote over or past the copy (the row's own
+/// bones, draw words, bone mask words: `overlays`). Every other byte is
+/// padding: zero in the row's copy and no one's title memory, so it is not
+/// written to a span and does not conflict (ZC2 wrote it: a row's padding
+/// zeros patched over another row's bones, 8 rows of pk3 f1241 drew nothing).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TitleView {
+    pub addr: u64,
+    pub captured: usize,
+    pub overlays: Vec<(usize, usize)>,
+}
+
+impl TitleView {
+    /// The view's title bytes in `len`: (start, end, own words) in order,
+    /// disjoint; own words win where they lie over the copy.
+    pub fn parts(&self, len: usize) -> Vec<(usize, usize, bool)> {
+        let mut own: Vec<(usize, usize)> = self.overlays.iter().map(|&(a, b)| (a.min(len), b.min(len))).filter(|r| r.0 < r.1).collect();
+        own.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::new();
+        for r in own {
+            match merged.last_mut() {
+                Some(l) if r.0 <= l.1 => l.1 = l.1.max(r.1),
+                _ => merged.push(r),
+            }
+        }
+        let (mut out, mut at, cap) = (Vec::new(), 0, self.captured.min(len));
+        for &(a, b) in &merged {
+            if at < a.min(cap) {
+                out.push((at, a.min(cap), false));
+            }
+            out.push((a, b, true));
+            at = b;
+        }
+        if at < cap {
+            out.push((at, cap, false));
+        }
+        out
+    }
+}
+
+/// Title spans for `ranges` (address, bytes, the view's unit), in layers:
+/// overlapping ranges share a span whose start puts every range at an
+/// offset that is a multiple of its unit (and of 16 for raw and
+/// structured views, which may have a raw twin); a range no start of the
+/// span it overlaps can hold so goes to the next layer (ZC3: pk3 f1241's
+/// raw views at addresses 4 mod 16 and 48-byte structured views).
+pub fn plan_spans(mut ranges: Vec<(u64, u64, u64)>) -> Vec<Vec<(u64, u64)>> {
+    // Congruence x = r (mod m) joined with x = r2 (mod m2), if any solves both.
+    fn join(r: u64, m: u64, r2: u64, m2: u64) -> Option<(u64, u64)> {
+        let l = m / gcd(m, m2) * m2;
+        if l > 1 << 16 {
+            return None;
+        }
+        (0..m2 / gcd(m, m2)).map(|k| r + k * m).find(|x| x % m2 == r2).map(|x| (x % l, l))
+    }
+    ranges.sort_unstable();
+    let mut layers = Vec::new();
+    while !ranges.is_empty() {
+        // (first address, end, residue, modulus)
+        let mut spans: Vec<(u64, u64, u64, u64)> = Vec::new();
+        let mut next = Vec::new();
+        for (a, n, unit) in ranges {
+            let u = if unit.is_multiple_of(16) || unit < 4 { unit.max(1) } else { unit / gcd(unit, 16) * 16 };
+            // Room for a view's extent rounding past its bytes.
+            let e = a + n.next_multiple_of(unit.max(1)) + 256;
+            match spans.last_mut() {
+                Some(l) if a <= l.1 => match join(l.2, l.3, a % u, u) {
+                    Some((r, m)) => (l.1, l.2, l.3) = (l.1.max(e), r, m),
+                    None => next.push((a, n, unit)),
+                },
+                _ => spans.push((a, e, a % u, u)),
+            }
+        }
+        layers.push(spans.iter().map(|&(lo, hi, r, m)| (lo - (lo + m - r) % m, hi)).collect());
+        ranges = next;
+    }
+    layers
+}
+
+/// One view on a span buffer, for [`Shared::span_check`].
+pub struct SpanView {
+    pub row: u32,
+    pub slot: u32,
+    pub addr: u64,
+    start: (usize, u64),
+    off: usize,
+    parts: Vec<(usize, usize, bool)>,
+    blocks: Vec<u64>,
+}
+
+/// One title span's buffer ([`Shared::addrs`]): the bytes now, which bytes
+/// a row wrote and which of them are a row's own words, the buffer (mapped).
+struct AtAddr {
+    now: Vec<u8>,
+    written: Vec<u64>,
+    own: Vec<u64>,
+    res: ID3D12Resource,
+    mapped: *mut u8,
+}
+
+/// 4 KiB block hashes of `parts` of `b` (a word sum: a diagnostic, not a key).
+fn block_hashes(b: &[u8], parts: &[(usize, usize, bool)]) -> Vec<u64> {
+    let mut out = Vec::new();
+    for &(s, e, _) in parts {
+        for c in b[s..e].chunks(4096) {
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
+            for w in c.chunks(8) {
+                let mut x = [0u8; 8];
+                x[..w.len()].copy_from_slice(w);
+                h = (h ^ u64::from_le_bytes(x)).wrapping_mul(0x0100_0000_01b3).rotate_left(29);
+            }
+            out.push(h);
+        }
+    }
+    out
 }
 
 struct Merged {
@@ -634,6 +813,164 @@ impl Shared {
     }
 }
 
+impl Shared {
+    /// Declares the title spans this frame's rows read, in layers (each
+    /// sorted and disjoint; `bridge_ms` gathers them first): a view inside
+    /// one is bound on that span's one buffer, at its title offset.
+    pub fn use_spans(&mut self, layers: Vec<Vec<(u64, u64)>>) {
+        self.spans = layers;
+    }
+
+    /// The span buffer holding title range `[addr, addr + size)` and the
+    /// view's offset there (a multiple of `unit`: the first layer whose span
+    /// holds the range at such an offset and no byte of it differently),
+    /// with this row's title bytes ([`TitleView::parts`]) written where no
+    /// row wrote yet (None: outside every span, or a byte another row holds
+    /// differently, a conflict one buffer cannot hold: the row keeps a
+    /// buffer of its own). A row's own words win over another row's copy
+    /// there (`shadowed`, `overrode`); padding is never written, so every row
+    /// reads its own title bytes. Whether the buffer was made now.
+    fn at_addr(&mut self, dev: &ID3D12Device, tv: &TitleView, bytes: &[u8], size: u64, slot: u32, unit: u64) -> Result<Option<(ID3D12Resource, u64, bool)>, String> {
+        let addr = tv.addr;
+        let (mut misaligned, mut conflict) = (None, false);
+        for layer in 0..self.spans.len() {
+            let spans = &self.spans[layer];
+            let i = spans.partition_point(|s| s.0 <= addr);
+            let Some(&(start, end)) = i.checked_sub(1).and_then(|i| spans.get(i)) else { continue };
+            if addr + size > end {
+                continue;
+            }
+            if !(addr - start).is_multiple_of(unit) {
+                misaligned.get_or_insert(addr - start);
+                continue;
+            }
+            match self.on_span(dev, (layer, start), end, tv, bytes, slot)? {
+                Some(r) => return Ok(Some(r)),
+                None => conflict = true,
+            }
+        }
+        let why = if conflict {
+            self.by_addr_conflicts += 1;
+            2
+        } else if let Some(off) = misaligned {
+            if self.check.is_some() {
+                xnw_core::info!("bridgems span check: row {} heap slot {slot} at {addr:#x} ({} B): offset {off:#x} on the span, unit {unit}", self.row, bytes.len());
+            }
+            3
+        } else {
+            1
+        };
+        self.off_span[why].0 += 1;
+        self.off_span[why].1 += size;
+        Ok(None)
+    }
+
+    /// [`Shared::at_addr`] on span `key` (layer, start) ending at `end`.
+    fn on_span(&mut self, dev: &ID3D12Device, key: (usize, u64), end: u64, tv: &TitleView, bytes: &[u8], slot: u32) -> Result<Option<(ID3D12Resource, u64, bool)>, String> {
+        let (addr, start) = (tv.addr, key.1);
+        let parts = tv.parts(bytes.len());
+        let made = !self.by_addr.contains_key(&key);
+        if made {
+            let len = (end - start) as usize;
+            let res = buffer(dev, len as u64, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ)?;
+            let mut mapped = std::ptr::null_mut();
+            // SAFETY: an upload buffer stays mapped for its life.
+            unsafe { res.Map(0, None, Some(&mut mapped)) }.map_err(|e| e.message().to_string())?;
+            let bits = len.div_ceil(64);
+            self.by_addr.insert(key, AtAddr { now: vec![0; len], written: vec![0; bits], own: vec![0; bits], res, mapped: mapped.cast() });
+        }
+        let m = self.by_addr.get_mut(&key).expect("made above");
+        let off = (addr - start) as usize;
+        let bit = |v: &[u64], x: usize| v[x / 64] >> (x % 64) & 1 == 1;
+        // Pass 1: any byte another row holds differently where neither or
+        // both are own words is a conflict; nothing is written then.
+        let (mut shadowed, mut overrode) = (0u64, 0u64);
+        for &(s, e, own) in &parts {
+            for (k, chunk) in bytes[s..e].chunks(64).enumerate() {
+                let at = off + s + 64 * k;
+                if at % 64 == 0 && chunk.len() == 64 && m.written[at / 64] == u64::MAX && m.now[at..at + 64] == *chunk {
+                    continue;
+                }
+                for (j, &new) in chunk.iter().enumerate() {
+                    let x = at + j;
+                    if !bit(&m.written, x) || m.now[x] == new {
+                        continue;
+                    }
+                    match (bit(&m.own, x), own) {
+                        (true, false) => shadowed += 1,
+                        (false, true) => overrode += 1,
+                        _ => {
+                            if self.check.is_some() {
+                                xnw_core::info!("bridgems span check: row {} heap slot {slot} at {addr:#x} ({} B): byte +{:#x} is {:#x} here, {:#x} on the span (layer {})", self.row, bytes.len(), x - off, new, m.now[x], key.0);
+                            }
+                            return Ok(None);
+                        }
+                    }
+                }
+            }
+        }
+        // Pass 2: write.
+        for &(s, e, own) in &parts {
+            for (k, chunk) in bytes[s..e].chunks(64).enumerate() {
+                let at = off + s + 64 * k;
+                if !own && at % 64 == 0 && chunk.len() == 64 && m.written[at / 64] == u64::MAX && m.now[at..at + 64] == *chunk {
+                    continue;
+                }
+                for (j, &new) in chunk.iter().enumerate() {
+                let x = at + j;
+                let fresh = !bit(&m.written, x);
+                if !fresh && (m.now[x] == new || (bit(&m.own, x) && !own)) {
+                    if own {
+                        m.own[x / 64] |= 1 << (x % 64);
+                    }
+                    continue;
+                }
+                m.written[x / 64] |= 1 << (x % 64);
+                if own {
+                    m.own[x / 64] |= 1 << (x % 64);
+                }
+                m.now[x] = new;
+                // SAFETY: inside the mapped upload buffer (`x` < its size).
+                unsafe { *m.mapped.add(x) = new };
+                }
+            }
+        }
+        self.shadowed += shadowed;
+        self.overrode += overrode;
+        if let Some(c) = self.check.as_mut() {
+            c.push(SpanView { row: self.row, slot, addr, start: key, off, blocks: block_hashes(bytes, &parts), parts });
+        }
+        Ok(Some((m.res.clone(), off as u64, made)))
+    }
+
+    /// `XNW_ZEROCOPY_SPANCHECK=1`: the views whose title bytes on their span
+    /// are not their own at the end of the frame: (row, slot, title address,
+    /// blocks differing of all, first differing byte, whether in the row's
+    /// own words).
+    pub fn span_check(&self) -> Vec<(u32, u32, u64, usize, usize, usize, bool)> {
+        let mut out = Vec::new();
+        for v in self.check.iter().flatten() {
+            let Some(m) = self.by_addr.get(&v.start) else { continue };
+            let now = block_hashes(&m.now[v.off..], &v.parts);
+            let differ: Vec<usize> = now.iter().zip(&v.blocks).enumerate().filter(|(_, (a, b))| a != b).map(|(i, _)| i).collect();
+            if let Some(&first) = differ.first() {
+                // Block `first` -> its byte in the view.
+                let (mut i, mut at, mut own) = (first, 0, false);
+                for &(s, e, o) in &v.parts {
+                    let n = (e - s).div_ceil(4096);
+                    if i < n {
+                        (at, own) = (s + 4096 * i, o);
+                        break;
+                    }
+                    i -= n;
+                }
+                out.push((v.row, v.slot, v.addr, differ.len(), v.blocks.len(), at, own));
+            }
+        }
+        out
+    }
+}
+
 fn content(bytes: &[u8]) -> u64 {
     use std::hash::Hasher;
     let mut h = std::hash::DefaultHasher::new();
@@ -681,7 +1018,8 @@ pub fn upload(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, b: &Binding,
         let samplers = heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, b.sampler_slots, visible)?;
         let step = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
         let at = |slot: u32| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: views.GetCPUDescriptorHandleForHeapStart().ptr + slot as usize * step };
-        let srv = |format, n: u32, stride: u32, flags| D3D12_SHADER_RESOURCE_VIEW_DESC { Format: format, ViewDimension: D3D12_SRV_DIMENSION_BUFFER, Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Buffer: D3D12_BUFFER_SRV { FirstElement: 0, NumElements: n, StructureByteStride: stride, Flags: flags } } };
+        let srv_at = |first: u64, format, n: u32, stride: u32, flags| D3D12_SHADER_RESOURCE_VIEW_DESC { Format: format, ViewDimension: D3D12_SRV_DIMENSION_BUFFER, Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Buffer: D3D12_BUFFER_SRV { FirstElement: first, NumElements: n, StructureByteStride: stride, Flags: flags } } };
+        let srv = |format, n: u32, stride: u32, flags| srv_at(0, format, n, stride, flags);
         let tex2d = |format| D3D12_SHADER_RESOURCE_VIEW_DESC { Format: format, ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D, Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() } } };
         // Typed nulls everywhere (raw buffers), the guards' kinds, then the views.
         for s in 0..b.views.heap_slots {
@@ -701,6 +1039,55 @@ pub fn upload(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, b: &Binding,
                 continue;
             }
             let Some((size, n)) = v.kind.extent(v.bytes.len() as u64) else { continue };
+            // `XNW_ZEROCOPY` (ZC2): a view of title memory, by its address.
+            // Constant buffers stay copies (hot data: every lane reads them).
+            let large = v.kind != Kind::Cbv && size >= KEEP_MIN as u64 && xnw_gpu::shared::world_part(xnw_gpu::shared::WORLD_BRIDGE);
+            let tv = if large { shared.addrs.get(&(v.bytes.as_ptr() as usize)).cloned() } else { None };
+            if large && tv.is_none() {
+                shared.off_span[0].0 += 1;
+                shared.off_span[0].1 += size;
+                if shared.check.is_some() {
+                    xnw_core::info!("bridgems span check: row {} heap slot {s}: {:?} {} B at {:#x} without a title address", shared.row, v.kind, v.bytes.len(), v.bytes.as_ptr() as usize);
+                }
+            }
+            let addr = tv.as_ref().map(|t| t.addr);
+            if let Some(a) = addr
+                && let Some(t) = xnw_gpu::shared::world_range(a, size).filter(|t| t.offset.is_multiple_of(unit(v.kind)))
+            {
+                let first = t.offset / unit(v.kind);
+                match v.kind {
+                    Kind::Raw => dev.CreateShaderResourceView(&t.buffer, Some(&srv_at(t.offset / 4, DXGI_FORMAT_R32_TYPELESS, n, 0, D3D12_BUFFER_SRV_FLAG_RAW)), at(s)),
+                    Kind::Structured(stride) => dev.CreateShaderResourceView(&t.buffer, Some(&srv_at(t.offset / u64::from(stride.max(4)), DXGI_FORMAT_UNKNOWN, n, stride.max(4), D3D12_BUFFER_SRV_FLAG_NONE)), at(s)),
+                    Kind::Typed { format, .. } => dev.CreateShaderResourceView(&t.buffer, Some(&srv_at(first, DXGI_FORMAT(format), n, 0, D3D12_BUFFER_SRV_FLAG_NONE)), at(s)),
+                    Kind::Cbv | Kind::RawUav { .. } => {}
+                }
+                shared.in_place += 1;
+                keep.push(t.buffer);
+                continue;
+            }
+            let by_addr = match &tv {
+                Some(t) => shared.at_addr(dev, t, v.bytes, size, s, unit(v.kind))?,
+                None => None,
+            };
+            if let Some((r, off, made)) = by_addr {
+                if made {
+                    let span = r.GetDesc().Width;
+                    bytes += span;
+                    shared.new[0] += span;
+                    shared.by_addr_bytes += span;
+                }
+                shared.saved += size;
+                shared.by_addr_views += 1;
+                let first = off / unit(v.kind);
+                match v.kind {
+                    Kind::Raw => dev.CreateShaderResourceView(&r, Some(&srv_at(off / 4, DXGI_FORMAT_R32_TYPELESS, n, 0, D3D12_BUFFER_SRV_FLAG_RAW)), at(s)),
+                    Kind::Structured(stride) => dev.CreateShaderResourceView(&r, Some(&srv_at(off / u64::from(stride.max(4)), DXGI_FORMAT_UNKNOWN, n, stride.max(4), D3D12_BUFFER_SRV_FLAG_NONE)), at(s)),
+                    Kind::Typed { format, .. } => dev.CreateShaderResourceView(&r, Some(&srv_at(first, DXGI_FORMAT(format), n, 0, D3D12_BUFFER_SRV_FLAG_NONE)), at(s)),
+                    Kind::Cbv | Kind::RawUav { .. } => {}
+                }
+                keep.push(r);
+                continue;
+            }
             let r = if v.bytes.len() >= MERGE_BYTES {
                 let (r, old) = shared.merge(dev, v.bytes, size)?;
                 if old {
@@ -748,34 +1135,73 @@ pub fn upload(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, b: &Binding,
         }
         // Textures: one mip each, copied from an upload buffer.
         let shader_read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        // A 1D or 3D texture (the compute runner's outputs) gets its own
+        // view dimension; the shared key keeps the dimension apart.
+        let view_of = |tx: &Provided| {
+            let mut d = tex2d(DXGI_FORMAT(tx.format as i32));
+            match tx.dim {
+                crate::textures::TEX_1D => {
+                    d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
+                    d.Anonymous.Texture1D = D3D12_TEX1D_SRV { MipLevels: 1, ..Default::default() };
+                }
+                crate::textures::TEX_3D => {
+                    d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+                    d.Anonymous.Texture3D = D3D12_TEX3D_SRV { MipLevels: 1, ..Default::default() };
+                }
+                crate::textures::TEX_2D_ARRAY => {
+                    d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+                    d.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV { MipLevels: 1, ArraySize: tx.depth.max(1), ..Default::default() };
+                }
+                _ => {}
+            }
+            d
+        };
         for &(s, tx) in &b.textures {
-            let key = (content(&tx.rows), tx.width, tx.height, tx.format);
+            let key = (content(&tx.rows), tx.width, tx.height * tx.depth.max(1), tx.format | u32::from(tx.dim) << 24);
             if let Some(r) = shared.texs.get(&key) {
                 shared.saved += tx.rows.len() as u64;
-                dev.CreateShaderResourceView(r, Some(&tex2d(DXGI_FORMAT(tx.format as i32))), at(s));
+                dev.CreateShaderResourceView(r, Some(&view_of(tx)), at(s));
                 continue;
             }
-            let desc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: u64::from(tx.width), Height: tx.height, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT(tx.format as i32), SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() };
+            let (dimension, height, depth) = match tx.dim {
+                crate::textures::TEX_1D => (D3D12_RESOURCE_DIMENSION_TEXTURE1D, 1, 1),
+                crate::textures::TEX_3D | crate::textures::TEX_2D_ARRAY => (if tx.dim == crate::textures::TEX_3D { D3D12_RESOURCE_DIMENSION_TEXTURE3D } else { D3D12_RESOURCE_DIMENSION_TEXTURE2D }, tx.height, tx.depth.clamp(1, u32::from(u16::MAX)) as u16),
+                _ => (D3D12_RESOURCE_DIMENSION_TEXTURE2D, tx.height, 1),
+            };
+            let desc = D3D12_RESOURCE_DESC { Dimension: dimension, Width: u64::from(tx.width), Height: height, DepthOrArraySize: depth, MipLevels: 1, Format: DXGI_FORMAT(tx.format as i32), SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() };
             let r = committed(dev, &desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST, None)?;
-            let (mut fp, mut rows, mut row_size, mut total) = (D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(), 0u32, 0u64, 0u64);
-            dev.GetCopyableFootprints(&desc, 0, 1, 0, Some(&mut fp), Some(&mut rows), Some(&mut row_size), Some(&mut total));
+            // One subresource, or one per slice of a 2D array (LIT5).
+            let subs = if tx.dim == crate::textures::TEX_2D_ARRAY { u32::from(depth) } else { 1 };
+            let mut fps = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); subs as usize];
+            let (mut rows, mut row_size, mut total) = (vec![0u32; subs as usize], vec![0u64; subs as usize], 0u64);
+            dev.GetCopyableFootprints(&desc, 0, subs, 0, Some(fps.as_mut_ptr()), Some(rows.as_mut_ptr()), Some(row_size.as_mut_ptr()), Some(&mut total));
             let up = buffer(dev, total, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ)?;
             bytes += total;
             shared.new[2] += total;
             let mut to = std::ptr::null_mut();
             up.Map(0, None, Some(&mut to)).map_err(e)?;
-            let n = (row_size as usize).min(tx.row_bytes as usize);
-            for y in 0..rows.min(tx.row_count) as usize {
-                if let Some(row) = tx.rows.get(y * tx.row_bytes as usize..y * tx.row_bytes as usize + n) {
-                    std::ptr::copy_nonoverlapping(row.as_ptr(), to.cast::<u8>().add(fp.Offset as usize + y * fp.Footprint.RowPitch as usize), n);
+            // 3D: `depth` slices of `rows` rows each, slice after slice; an
+            // array's slices follow one another in `rows` the same way.
+            let mut first = 0usize;
+            for (i, fp) in fps.iter().enumerate() {
+                let n = (row_size[i] as usize).min(tx.row_bytes as usize);
+                let slices = fp.Footprint.Depth as usize;
+                for y in 0..(rows[i] as usize * slices).min((tx.row_count as usize).saturating_sub(first)) {
+                    let at_row = (first + y) * tx.row_bytes as usize;
+                    if let Some(row) = tx.rows.get(at_row..at_row + n) {
+                        std::ptr::copy_nonoverlapping(row.as_ptr(), to.cast::<u8>().add(fp.Offset as usize + y * fp.Footprint.RowPitch as usize), n);
+                    }
                 }
+                first += rows[i] as usize * slices;
             }
             up.Unmap(0, None);
-            let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
-            let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&up), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
-            list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+            for (i, fp) in fps.iter().enumerate() {
+                let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: i as u32 } };
+                let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&up), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *fp } };
+                list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+            }
             list.ResourceBarrier(&[barrier(&r, D3D12_RESOURCE_STATE_COPY_DEST, shader_read)]);
-            dev.CreateShaderResourceView(&r, Some(&tex2d(DXGI_FORMAT(tx.format as i32))), at(s));
+            dev.CreateShaderResourceView(&r, Some(&view_of(tx)), at(s));
             shared.texs.insert(key, r.clone());
             keep.extend([r, up]);
         }
@@ -1009,6 +1435,7 @@ fn submit(host: &xnw_gpu::host::Host, p: &Programs, b: &Binding, t: &Target, int
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).map_err(e)?;
         let t0 = std::time::Instant::now();
         queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).map_err(e)?)]);
+        let sent = xnw_gpu::gpuwatch::begin("bridge");
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
         queue.Signal(&fence, 1).map_err(e)?;
         while fence.GetCompletedValue() < 1 {
@@ -1018,6 +1445,7 @@ fn submit(host: &xnw_gpu::host::Host, p: &Programs, b: &Binding, t: &Target, int
             }
             std::thread::yield_now();
         }
+        xnw_gpu::gpuwatch::end("bridge", sent, None);
         let seconds = t0.elapsed().as_secs_f64();
         let mut from = std::ptr::null_mut();
         back.Map(0, None, Some(&mut from)).map_err(e)?;
@@ -1086,12 +1514,14 @@ pub fn read_colour(host: &xnw_gpu::host::Host, colour: &ID3D12Resource, w: u32, 
         list.Close().map_err(e)?;
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).map_err(e)?;
         queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).map_err(e)?)]);
+        let sent = xnw_gpu::gpuwatch::begin("bridge readback");
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
         queue.Signal(&fence, 1).map_err(e)?;
         while fence.GetCompletedValue() < 1 {
             dev.GetDeviceRemovedReason().map_err(|x| format!("reading the colour target back: {}", e(x)))?;
             std::thread::yield_now();
         }
+        xnw_gpu::gpuwatch::end("bridge readback", sent, None);
         let mut from = std::ptr::null_mut();
         back.Map(0, None, Some(&mut from)).map_err(e)?;
         let mut out = Vec::with_capacity((4 * w * h) as usize);
@@ -1120,12 +1550,226 @@ pub fn compare(ours: &[u8], mask: &[bool], theirs: &[[f32; 4]]) -> (usize, f64) 
     (n, if n == 0 { 0.0 } else { sum / n as f64 })
 }
 
+/// The translation options of the title's programs in the bridge: the
+/// device's, as the live pipelines have them (`xnw_gpu::d3d12x::pipeline`
+/// `options_for`;: computed barycentrics only on a device that has
+/// them; none before a device is made).
+pub fn options() -> emit::Options {
+    // The heap-uniformity switches and adapter, as `runtime_options`.
+    let (keep_uniform_heap, masked_lanes) = emit::heap_uniformity();
+    emit::Options { barycentrics: xnw_gpu::host::host_barycentrics().unwrap_or(false), keep_uniform_heap, masked_lanes, ..emit::Options::default() }
+}
+
+/// One frame's upload memory: every distinct buffer once, each at an
+/// offset its view can start at (`unit`: the element size; 256 for
+/// constant buffers and root views). `parts`: (offset, bytes' address,
+/// bytes, padded size) to copy, the rest of each part zeros.
+#[derive(Default)]
+pub struct Arena {
+    at: HashMap<(usize, usize, u64, u64), u64>,
+    pub parts: Vec<(u64, usize, usize, u64)>,
+    pub end: u64,
+}
+
+impl Arena {
+    pub fn place(&mut self, bytes: &[u8], size: u64, unit: u64) -> u64 {
+        let k = (bytes.as_ptr() as usize, bytes.len(), size, unit);
+        if let Some(&o) = self.at.get(&k) {
+            return o;
+        }
+        let o = self.end.next_multiple_of(align(unit));
+        self.end = o + size.max(16);
+        self.at.insert(k, o);
+        self.parts.push((o, bytes.as_ptr() as usize, bytes.len().min(size as usize), size));
+        o
+    }
+}
+
+/// The start a buffer of element size `unit` needs: 256 and the unit both divide it.
+pub fn align(unit: u64) -> u64 {
+    let unit = unit.max(4);
+    256 * unit / gcd(256, unit)
+}
+
+fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
+/// A view kind's element size in upload memory (its start must be a multiple).
+pub fn unit(kind: Kind) -> u64 {
+    match kind {
+        Kind::Raw | Kind::RawUav { .. } => 16,
+        Kind::Structured(s) => u64::from(s.max(4)),
+        Kind::Typed { bytes, .. } => u64::from(bytes.max(1)),
+        Kind::Cbv => 256,
+    }
+}
+
+/// Inputs this long or longer are kept on the device once seen on two frames.
+pub const KEEP_MIN: usize = 4096;
+/// Frames an input seen once is remembered, and a kept one stays unused, before it goes.
+const SEEN_FRAMES: u64 = 8;
+const KEPT_FRAMES: u64 = 600;
+/// The kept buffer's least and largest size.
+pub const KEPT_LEAST: u64 = 64 << 20;
+const KEPT_MOST: u64 = 1 << 30;
+
+/// Where an input lies: in the frame's upload memory, the kept buffer,
+/// (`XNW_ZEROCOPY=on`, ZC1) in title memory: entry `n` of the frame's list
+/// of in-place ranges, or (`bridged`) in the small inputs' upload
+/// buffer, placed by content at an offset that stays across frames.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum At {
+    Frame(u64),
+    Kept(u64),
+    Shared(u32),
+    Small(u64),
+}
+
+/// Inputs kept on the device across frames (pure bookkeeping; `bridged`
+/// for bridgeps, open to bridgems): an input the source hands over as the
+/// same bytes (`Arc`) on a later frame is placed once in one default-heap
+/// buffer of `size` bytes (filled up to `used`) and copied there once;
+/// every other input goes with the frame ([`Arena`]). The bytes of every
+/// placed or seen input are held, so their address names them alone. A
+/// frame whose new inputs do not fit asks for a new buffer (`restart`:
+/// twice the frame's kept bytes); until then they go with the frame.
+#[derive(Default)]
+pub struct Kept {
+    pub size: u64,
+    pub used: u64,
+    at: HashMap<(usize, usize, u64), u64>,
+    /// Address -> the bytes and the last frame they were placed or seen.
+    held: HashMap<usize, (std::sync::Arc<Vec<u8>>, u64)>,
+    frame: u64,
+    frame_bytes: u64,
+    pub restart: Option<u64>,
+}
+
+impl Kept {
+    /// A new frame: inputs seen once long ago, and kept ones long unused, go.
+    pub fn next_frame(&mut self) {
+        self.frame += 1;
+        self.frame_bytes = 0;
+        let f = self.frame;
+        let kept: std::collections::HashSet<usize> = self.at.keys().map(|k| k.0).collect();
+        self.held.retain(|p, e| f.saturating_sub(e.1) <= if kept.contains(p) { KEPT_FRAMES } else { SEEN_FRAMES });
+        let held = &self.held;
+        self.at.retain(|k, _| held.contains_key(&k.0));
+    }
+
+    /// Starts again empty with `size` bytes (the caller makes the new buffer).
+    pub fn start(&mut self, size: u64) {
+        self.size = size;
+        self.used = 0;
+        self.at.clear();
+        self.restart = None;
+    }
+
+    /// Where `bytes` (`size` padded, element size `unit`) go: `arc` (their
+    /// holder; None: not kept) seen on an earlier frame is kept (`true`:
+    /// copy it there this frame); anything else goes to `arena`.
+    pub fn place(&mut self, arena: &mut Arena, bytes: &[u8], size: u64, unit: u64, arc: Option<&std::sync::Arc<Vec<u8>>>) -> (At, bool) {
+        let p = bytes.as_ptr() as usize;
+        let Some(arc) = arc.filter(|a| bytes.len() >= KEEP_MIN && a[..].as_ptr() as usize == p) else {
+            return (At::Frame(arena.place(bytes, size, unit)), false);
+        };
+        let key = (p, bytes.len(), unit);
+        if let Some(&o) = self.at.get(&key) {
+            if let Some(e) = self.held.get_mut(&p) {
+                if e.1 != self.frame {
+                    self.frame_bytes += size;
+                }
+                e.1 = self.frame;
+            }
+            return (At::Kept(o), false);
+        }
+        let seen = self.held.get(&p).is_some_and(|e| e.1 < self.frame);
+        if !seen {
+            self.held.entry(p).or_insert_with(|| (arc.clone(), self.frame)).1 = self.frame;
+            return (At::Frame(arena.place(bytes, size, unit)), false);
+        }
+        let o = self.used.next_multiple_of(align(unit));
+        if o + size.max(16) > self.size {
+            let want = (2 * (self.frame_bytes + size)).next_power_of_two().clamp(KEPT_LEAST, KEPT_MOST);
+            self.restart = Some(want.max(self.size));
+            return (At::Frame(arena.place(bytes, size, unit)), false);
+        }
+        self.used = o + size.max(16);
+        self.frame_bytes += size;
+        self.at.insert(key, o);
+        self.held.insert(p, (arc.clone(), self.frame));
+        (At::Kept(o), true)
+    }
+}
+
+/// The validation layer's stored messages (`XNW_GPU_DEBUG=layer`), one
+/// line per message id with its count and its first text; for errors also
+/// the next three texts.
+pub fn layer_messages(dev: &ID3D12Device) -> Vec<String> {
+    use windows::core::Interface;
+    let mut out = Vec::new();
+    let Ok(queue) = dev.cast::<ID3D12InfoQueue>() else { return out };
+    let mut by: std::collections::BTreeMap<(i32, i32), (u32, String)> = Default::default();
+    // SAFETY: plain queries into buffers of the size the queue asked for.
+    unsafe {
+        let n = queue.GetNumStoredMessages();
+        for i in 0..n {
+            let mut len = 0usize;
+            if queue.GetMessage(i, None, &mut len).is_err() || len == 0 {
+                continue;
+            }
+            let mut buffer = vec![0u64; len.div_ceil(8)];
+            let m = buffer.as_mut_ptr().cast::<D3D12_MESSAGE>();
+            if queue.GetMessage(i, Some(m), &mut len).is_err() {
+                continue;
+            }
+            let text = std::slice::from_raw_parts((*m).pDescription, (*m).DescriptionByteLength.saturating_sub(1));
+            let e = by.entry(((*m).Severity.0, (*m).ID.0)).or_insert_with(|| (0, String::from_utf8_lossy(text).chars().take(1600).collect()));
+            e.0 += 1;
+            // Errors (corruption, error): up to 4 texts each, whole (they name the draw, root parameter and shader).
+            if (*m).Severity.0 <= 1 && (2..=4).contains(&e.0) {
+                out.push(format!("layer severity {} id {} #{}: {}", (*m).Severity.0, (*m).ID.0, e.0, String::from_utf8_lossy(text).chars().take(1600).collect::<String>()));
+            }
+        }
+        out.push(format!("validation layer: {n} messages stored"));
+    }
+    for ((sev, id), (n, text)) in by {
+        out.push(format!("layer severity {sev} id {id} x{n}: {text}"));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn shader(stage: HwStage, user: &[(u32, u8, RootType, u32)], srvs: &[u8]) -> HostShader {
         HostShader { stage, dxil: Vec::new(), user_data: user.iter().map(|&(index, slot, root, dword)| emit::UserData { index, slot, root, dword }).collect(), samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: Vec::new(), root_srvs: srvs.to_vec(), root_uavs: Vec::new(), address_map: false, descriptor_words: false }
+    }
+
+    /// Spans (ZC3): overlapping ranges share one whose start suits every
+    /// unit; a raw view at 4 mod 16 next to one at 0 mod 16 goes to a layer of its own.
+    #[test]
+    fn spans_start_where_every_unit_fits() {
+        let layers = plan_spans(vec![(0x1010, 0x100, 16), (0x1080, 0x40, 48), (0x5000, 0x10, 16), (0x1084, 0x20, 16)]);
+        assert_eq!(layers.len(), 2);
+        let (s, e) = layers[0][0];
+        assert!(s <= 0x1010 && e >= 0x1110 && (0x1010 - s) % 16 == 0 && (0x1080 - s) % 48 == 0, "{s:#x}");
+        assert_eq!(layers[0].len(), 2);
+        assert!(layers[1][0].0 <= 0x1084 && (0x1084 - layers[1][0].0) % 16 == 0);
+    }
+
+    /// A view's title bytes (ZC3): the copy, the row's own words over and
+    /// past it, no padding between them.
+    #[test]
+    fn title_view_parts_skip_padding() {
+        let tv = TitleView { addr: 0x1000, captured: 100, overlays: vec![(150, 200), (90, 120), (190, 210)] };
+        assert_eq!(tv.parts(300), vec![(0, 90, false), (90, 120, true), (150, 210, true)]);
+        assert_eq!(tv.parts(160), vec![(0, 90, false), (90, 120, true), (150, 160, true)]);
+        let stand_in = TitleView { addr: 0, captured: 0, overlays: vec![(64, 128)] };
+        assert_eq!(stand_in.parts(128), vec![(64, 128, true)]);
+        assert_eq!(TitleView { addr: 0, captured: 50, overlays: Vec::new() }.parts(50), vec![(0, 50, false)]);
     }
 
     /// A made-up draw in the shape of a captured one: root 0 a frame table
@@ -1137,7 +1781,7 @@ mod tests {
     fn binding_of_a_made_up_draw() {
         use RootType::{Constants, Table};
         let (cb, words, rec, lets, mat, vb) = ([1u8; 48], [2u8; 64], [3u8; 128], [4u8; 32], [5u8; 256], [6u8; 100]);
-        let tex = Provided { width: 4, height: 4, format: 28, rows: vec![7; 64], row_bytes: 16, row_count: 4 };
+        let tex = Provided { width: 4, height: 4, format: 28, rows: vec![7; 64], row_bytes: 16, row_count: 4, dim: crate::textures::TEX_2D, depth: 1 };
         let v = |kind, bytes| Slot::Buffer(View { kind, bytes });
         let d = Draw {
             roots: vec![
@@ -1163,6 +1807,15 @@ mod tests {
         assert_eq!((b.views.heap_slots, b.views.bounds), (109, [109, 104, 105, 106, 107, 108, 6, 0]));
         assert_eq!((b.mesh.views.clone(), b.mesh.lengths.clone()), (vec![(3u8, true, &vb[..])], vec![100]));
         assert!(b.pixel.views.is_empty() && b.samplers.iter().map(|s| (s.0, s.1.MaxAnisotropy)).eq([(5, 4)]) && b.groups == 3);
+        // At slot 1000 of a shared heap: every slot, table, twin, guard and bound moves by 1000.
+        let a = bind_at(&ms, &ps, &d, 1000).unwrap();
+        assert_eq!(a.mesh.constants, vec![0, 0, 1010 * 32, 1097 * 32, 0, 7, 0, 0]);
+        assert_eq!(a.pixel.constants, vec![1010 * 32, 1100 * 32, 0, 0, 0, 0, 0x40, 0]);
+        assert_eq!(a.views.slots.iter().map(|s| s.0).collect::<Vec<_>>(), vec![1011, 1096, 1097, 1099, 1100]);
+        assert_eq!(a.textures.iter().map(|t| t.0).collect::<Vec<_>>(), vec![1009, 1103]);
+        assert_eq!((a.views.heap_slots, a.views.bounds), (109, [1109, 1104, 1105, 1106, 1107, 1108, 6, 0]));
+        let raw = |w: &[[u32; 2]]| w.iter().map(|e| e[1] & emit::StrideEntry::RAW_SLOTS).collect::<Vec<_>>();
+        assert_eq!(raw(&a.views.strides), raw(&b.views.strides).iter().map(|&r| if r == 0 { 0 } else { r + 1000 }).collect::<Vec<_>>());
         // Sampler entries past the 2048 a shader-visible heap holds are left out.
         let mut wide = d.clone();
         wide.samplers.push((4095, SamplerDesc::default()));
@@ -1204,7 +1857,7 @@ mod tests {
         assert_eq!(n, Needs { stage: "cs", model: (6, 6), features: 0x200_0001, wave: Some(32) });
         assert_eq!(n.text(), "cs_6_6, WaveSize(32), features 0x2000001 (doubles, view heap indexing)");
         assert!(needs(b"not a container", None).is_none());
-        let caps = |model, lanes, doubles| xnw_gpu::host::Caps { adapter: "A".into(), vram_bytes: 0, shader_model: model, wave_lanes: lanes, mesh_shaders: false, ray_tracing: false, double_ops: doubles, agility: None, software: true, feature_level: 0, binding_tier: 0, tiled_tier: 0, int64_typed: false, int64_heap: false, enhanced_barriers: false, warp_module: None };
+        let caps = |model, lanes, doubles| xnw_gpu::host::Caps { adapter: "A".into(), vram_bytes: 0, shader_model: model, wave_lanes: lanes, mesh_shaders: false, ray_tracing: false, double_ops: doubles, agility: None, software: true, feature_level: 0, binding_tier: 0, tiled_tier: 0, int64_typed: false, int64_heap: false, enhanced_barriers: false, barycentrics: false, warp_module: None };
         assert_eq!(gap(&caps((6, 2), (4, 4), true), std::slice::from_ref(&n)).unwrap(), "A: shader model 6.2 < 6.6 (cs), wave lanes 4..4 lack 32");
         assert_eq!(gap(&caps((6, 6), (4, 64), false), std::slice::from_ref(&n)).unwrap(), "A: no double ops");
         assert_eq!(gap(&caps((6, 8), (32, 32), true), &[n]), None);
@@ -1246,5 +1899,49 @@ mod tests {
         let (n, d) = compare(&ours, &[true, true, false], &theirs);
         assert_eq!(n, 1);
         assert!((d - 0.1).abs() < 1e-6, "{d}");
+    }
+    #[test]
+    fn arena_places_each_buffer_once_at_its_unit() {
+        let (x, y) = (vec![1u8; 40], vec![2u8; 8]);
+        let mut a = Arena::default();
+        let o1 = a.place(&x, 40, 256);
+        let o2 = a.place(&y, 12, 12);
+        assert_eq!((o1, o2), (0, 768));
+        assert_eq!(a.place(&x, 40, 256), 0);
+        assert_eq!(a.place(&y, 16, 16) % 256, 0);
+        assert_eq!(a.parts.len(), 3);
+    }
+
+
+    #[test]
+    fn kept_inputs_go_to_the_device_on_their_second_frame_and_once() {
+        let big = std::sync::Arc::new(vec![5u8; 8192]);
+        let small = std::sync::Arc::new(vec![6u8; 64]);
+        let other = std::sync::Arc::new(vec![7u8; 8192]);
+        let mut k = Kept::default();
+        k.start(KEPT_LEAST);
+        let frame = |k: &mut Kept| {
+            k.next_frame();
+            let mut a = Arena::default();
+            let x = k.place(&mut a, &big, 8192, 16, Some(&big));
+            let y = k.place(&mut a, &small, 64, 16, Some(&small));
+            // Bytes not handed over as their holder are never kept.
+            let z = k.place(&mut a, &other, 8192, 16, None);
+            (x, y, z, a.parts.len())
+        };
+        // Seen first: with the frame; then kept and copied once; then kept as it is.
+        assert!(matches!(frame(&mut k), ((At::Frame(0), false), (At::Frame(_), false), (At::Frame(_), false), 3)), "first frame");
+        assert!(matches!(frame(&mut k), ((At::Kept(0), true), (At::Frame(_), false), (At::Frame(_), false), 2)), "second frame");
+        assert!(matches!(frame(&mut k), ((At::Kept(0), false), _, _, 2)), "third frame");
+        assert_eq!(k.used, 8192);
+        // A kept buffer too small asks to start again, twice the frame's kept bytes.
+        let mut t = Kept::default();
+        t.start(4096);
+        let mut a = Arena::default();
+        t.next_frame();
+        t.place(&mut a, &big, 8192, 16, Some(&big));
+        t.next_frame();
+        assert!(matches!(t.place(&mut a, &big, 8192, 16, Some(&big)), (At::Frame(_), false)));
+        assert_eq!(t.restart, Some(KEPT_LEAST));
     }
 }

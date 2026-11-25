@@ -28,6 +28,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::object::{self, DESCRIPTOR_HEAP, Done, E_INVALIDARG, HRESULT, Iid, Object, Slot, Table, This, guid};
 use super::resource::{Memory, PAGEABLE_IIDS};
 
+pub(crate) mod gate;
+pub mod slotwatch;
 pub mod host;
 
 const HEAP_IIDS: [Iid; 4] = [

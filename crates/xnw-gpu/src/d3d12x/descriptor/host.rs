@@ -31,7 +31,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use xnw_shader::emit::StrideEntry;
 
 use crate::d3d12x;
-use super::{VIEW_TAG, View, stale_views, view_at};
+use super::{VIEW_TAG, View, gate, stale_views, view_at};
 use d3d12x::host::host;
 
 pub(crate) struct HostHeap {
@@ -554,7 +554,7 @@ static DYNAMIC_COUNTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static DYNAMIC_IN_USE: AtomicU64 = AtomicU64::new(0);
 
 /// The title heap's areas, by slot. Five-star-recomp measured the
-/// same 1,245,184-slot heap (five-star-recomp docs/d3d12x-shim.md 196-205):
+/// same 1,245,184-slot heap (five-star-recomp 196-205):
 /// persistent views 0-327,679 (written through the device's view calls),
 /// then a gap, and from 360,448 the title's per-draw ring (tables the title
 /// copies records into, mixed with other data). Ours has the same slot
@@ -776,7 +776,7 @@ fn forget_committed(at: u64, end: u64) {
 
 /// Whether `[address, address + len)` is committed, from [`COMMITTED`]
 /// where it can.
-fn committed(address: u64, len: u64) -> bool {
+pub(super) fn committed(address: u64, len: u64) -> bool {
     let end = address.saturating_add(len.max(1));
     let epoch;
     {
@@ -1112,11 +1112,87 @@ fn merged(
 
 impl Drop for HostHeap {
     fn drop(&mut self) {
+        SCAN_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).retain(|h| h.0 != self.cpu);
+        gate::forget(self.cpu);
+        super::slotwatch::forget(self.cpu);
         if let Ok(mut kept) = self.kept.lock() {
             for res in kept.drain(..).flatten() {
                 d3d12x::host::retire(res);
             }
         }
+    }
+}
+
+/// View heaps for [`warp_scan`]: (CPU start, slots, bytes per slot, title slots).
+static SCAN_HEAPS: Mutex<Vec<(usize, u32, u32, u32)>> = Mutex::new(Vec::new());
+
+/// `XNW_WARP_SCAN=1` (report) or `fix`, on the software adapter only: WARP's
+/// shader-visible descriptors are CPU memory, 64 bytes each (`xnw-shader` test `null_kinds` with `XNW_NK_BYTES=1`): the top nibble of
+/// the last qword is the kind (0 never written, 1 UAV, 2 SRV, 3 CBV) and the
+/// third qword the pointer a shader-resource read goes through (null for a
+/// slot never written and for a null UAV; a null SRV points it at zeros). A
+/// shader reading such a slot as a resource reads address 0 + offset and
+/// WARP removes the device (the title's `reading address 0x388`). The scan
+/// counts those slots per heap; `fix` makes them null SRVs (which read zeros
+/// and drop writes under every kind).
+fn warp_scan_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("XNW_WARP_SCAN").as_deref().map(str::trim) {
+        Ok("1") if xnw_device::warp() => 1,
+        Ok("fix") if xnw_device::warp() => 2,
+        _ => 0,
+    })
+}
+
+/// Slots made null SRVs by `XNW_WARP_SCAN=fix`.
+static SCAN_FIXED: AtomicU64 = AtomicU64::new(0);
+
+/// See [`warp_scan_mode`]: one line per view heap (`why` names the moment).
+pub(crate) fn warp_scan(why: &str) {
+    let mode = warp_scan_mode();
+    if mode == 0 {
+        return;
+    }
+    let heaps = SCAN_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    for (cpu, slots, step, title) in heaps {
+        if step < 64 {
+            continue;
+        }
+        let started = std::time::Instant::now();
+        // never written, null UAV, SRV without a read pointer, CBV; title or dynamic.
+        let mut n = [[0u32; 2]; 4];
+        let mut first: Vec<String> = Vec::new();
+        let mut fixed = 0u64;
+        for i in 0..slots {
+            let at = cpu + i as usize * step as usize;
+            // SAFETY: a slot of a live heap (WARP: CPU memory); racing writers
+            // only make the report approximate.
+            let (q0, q2, q7) = unsafe { (std::ptr::read_volatile(at as *const u64), std::ptr::read_volatile((at + 16) as *const u64), std::ptr::read_volatile((at + 56) as *const u64)) };
+            let kind = (q7 >> 60) as usize;
+            let class = match kind {
+                0 if q2 == 0 => 0,
+                1 if q2 == 0 => 1,
+                2 if q2 == 0 => 2,
+                3 => 3,
+                _ => continue,
+            };
+            n[class][usize::from(i >= title)] += 1;
+            if class < 3 && first.len() < 12 {
+                first.push(format!("{i}:{}{}", ["unwritten", "null-uav", "srv-no-ptr"][class], if q0 != 0 { "(live)" } else { "" }));
+            }
+            if mode == 2 && class < 2 && q0 == 0 {
+                null_view(D3D12_CPU_DESCRIPTOR_HANDLE { ptr: at });
+                fixed += 1;
+            }
+        }
+        SCAN_FIXED.fetch_add(fixed, Ordering::Relaxed);
+        xnw_core::info!(
+            "warp scan ({why}): heap of {slots} slots ({title} title): never written {}+{} (title+dynamic), null UAV {}+{}, SRV without a read pointer {}+{}, CBV {}+{}; first {}; made null SRV {fixed} (total {}); {} ms",
+            n[0][0], n[0][1], n[1][0], n[1][1], n[2][0], n[2][1], n[3][0], n[3][1],
+            if first.is_empty() { "-".to_string() } else { first.join(" ") },
+            SCAN_FIXED.load(Ordering::Relaxed),
+            started.elapsed().as_millis()
+        );
     }
 }
 
@@ -1263,6 +1339,13 @@ impl HostHeap {
             xnw_core::warn!("d3d12x: host descriptor heap not made null: {e}");
         }
         h.make_guards();
+        // From here on the heap may be read by submissions: writes into it
+        // while one runs are staged (`gate`).
+        gate::register(&h.heap, kind, count + extra, step);
+        if !sampler {
+            SCAN_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).push((h.cpu, count + extra, h.step, count));
+            super::slotwatch::register(h.cpu, gpu, count + extra, h.step, count, title_start);
+        }
         xnw_core::info!(
             "d3d12x: host {} heap: {count} title slots + {extra} dynamic, made null in {} ms",
             if sampler { "sampler" } else { "view" },
@@ -1344,7 +1427,7 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         ..Default::default()
     };
     // SAFETY: a slot of a sampler heap of ours.
-    unsafe { host.device.CreateSampler(&desc, at) };
+    unsafe { gate::sampler(&host.device, &desc, at) };
 }
 
 impl HostHeap {
@@ -1385,7 +1468,7 @@ impl HostHeap {
         null_uav_view(self.cpu(g[3]));
         if let Some(host) = host() {
             // SAFETY: a slot of our heap; a zero location makes a null CBV.
-            unsafe { host.device.CreateConstantBufferView(Some(&D3D12_CONSTANT_BUFFER_VIEW_DESC::default()), self.cpu(g[4])) };
+            unsafe { gate::cbv(&host.device, Some(&D3D12_CONSTANT_BUFFER_VIEW_DESC::default()), self.cpu(g[4])) };
         }
     }
 
@@ -1538,8 +1621,8 @@ impl HostHeap {
         };
         // SAFETY: two slots of our heap and a live buffer.
         unsafe {
-            host.device.CreateShaderResourceView(buffer, Some(&srv), self.cpu(index));
-            host.device.CreateUnorderedAccessView(buffer, None, Some(&uav), self.cpu(index + 1));
+            gate::srv(&host.device, buffer, Some(&srv), self.cpu(index));
+            gate::uav(&host.device, buffer, None, Some(&uav), self.cpu(index + 1));
         }
         for i in [index, index + 1] {
             self.keep(i, Some(buffer.clone()));
@@ -1557,7 +1640,7 @@ impl HostHeap {
             return;
         }
         // SAFETY: `n` slots of our heap from `first` and `n` views at `src`.
-        unsafe { host.device.CopyDescriptorsSimple(n, self.cpu(first), src, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
+        unsafe { gate::copy(&host.device, n, self.cpu(first), src, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
         for i in first..first + n {
             self.keep(i, None);
             self.write_words(i, [0; 8]);
@@ -1579,7 +1662,7 @@ impl HostHeap {
             },
         };
         // SAFETY: a slot of our heap; a live buffer covering the range.
-        unsafe { host.device.CreateShaderResourceView(buffer, Some(&desc), self.cpu(index)) };
+        unsafe { gate::srv(&host.device, buffer, Some(&desc), self.cpu(index)) };
         self.keep(index, Some(buffer.clone()));
         self.set_stride(index, 0);
     }
@@ -1621,10 +1704,14 @@ impl HostHeap {
                 if let Some(host) = host() {
                     let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
                     // SAFETY: a slot of our heap; zero location makes a null CBV.
-                    unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
+                    unsafe { gate::cbv(&host.device, Some(&desc), at) };
                 }
             }
             xnw_shader::ResourceType::Srv if dwords == 4 => null_buffer_view(at),
+            xnw_shader::ResourceType::Uav if null_srv() => {
+                NULL_UAV_AS_SRV.fetch_add(1, Ordering::Relaxed);
+                if dwords == 4 { null_buffer_view(at) } else { null_view(at) }
+            }
             xnw_shader::ResourceType::Uav => {
                 if let Some(host) = host() {
                     let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
@@ -1638,7 +1725,7 @@ impl HostHeap {
                     };
                     // SAFETY: a slot of our heap; null resource makes a null UAV.
                     unsafe {
-                        host.device.CreateUnorderedAccessView(
+                        gate::uav(&host.device,
                             None::<&ID3D12Resource>,
                             None::<&ID3D12Resource>,
                             Some(&desc),
@@ -1856,8 +1943,8 @@ impl HostHeap {
         };
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
-            host.device
-                .CreateConstantBufferView(Some(&desc), self.cpu(index))
+            gate::cbv(&host.device,
+                Some(&desc), self.cpu(index))
         };
     }
 
@@ -2376,7 +2463,7 @@ impl HostHeap {
             if made[index as usize] != key || bounce_active {
                 let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC { BufferLocation: shared_va(&r), SizeInBytes: aligned };
                 // SAFETY: a slot of our heap; the range lies in the shared buffer.
-                unsafe { host.device.CreateConstantBufferView(Some(&desc), self.cpu(index)) };
+                unsafe { gate::cbv(&host.device, Some(&desc), self.cpu(index)) };
                 made[index as usize] = key;
                 made.link(index);
                 self.made_by(index, "plan constant");
@@ -2406,8 +2493,8 @@ impl HostHeap {
                     };
                     // SAFETY: a slot of our heap; `shadow` covers the range.
                     unsafe {
-                        host.device
-                            .CreateConstantBufferView(Some(&desc), self.cpu(index))
+                        gate::cbv(&host.device,
+                            Some(&desc), self.cpu(index))
                     };
                     made[index as usize] = key;
                     made.link(index);
@@ -2442,8 +2529,8 @@ impl HostHeap {
                 };
                 // SAFETY: a slot of our heap; `gpu` is 256-byte aligned in `res`.
                 unsafe {
-                    host.device
-                        .CreateConstantBufferView(Some(&desc), self.cpu(index))
+                    gate::cbv(&host.device,
+                        Some(&desc), self.cpu(index))
                 };
                 made[index as usize] = key;
                 made.link(index);
@@ -3137,10 +3224,34 @@ impl HostHeap {
         Some(slot)
     }
 
+    /// `XNW_SLOT_WATCH`: at dispatch `k` of the watched program
+    /// `name`, each watched slot of this heap: the view it was made from,
+    /// the title's record there, the runtime stride-table entry (stride 0:
+    /// heap-picked scalar loads read the slot as a constant buffer), and on
+    /// WARP the descriptor's words.
+    pub(crate) fn watch_report(&self, name: &str, k: u32) {
+        for &slot in super::slotwatch::slots() {
+            if slot >= self.count + self.dynamic {
+                continue;
+            }
+            let stride = self.strides.as_ref().filter(|t| slot < t.len).map_or_else(
+                || "none".to_string(),
+                // SAFETY: `t.ptr` is a live mapped upload buffer of `t.len` entries of two dwords.
+                |t| format!("{:08x?}", unsafe { (t.ptr as *const [u32; 2]).add(slot as usize).read() }),
+            );
+            let title_start = self.bindless.lock().unwrap_or_else(|e| e.into_inner()).title_start;
+            xnw_core::info!(
+                "slot watch: dispatch {k} of {name}: slot {slot} made from {}; stride entry {stride}; {}; title record {}",
+                self.describe_slot(slot).unwrap_or_else(|| "- (dynamic)".into()),
+                super::slotwatch::warp_words(self.cpu(slot).ptr, self.step),
+                super::slotwatch::title_record(title_start, slot, self.count)
+            );
+        }
+    }
+
     /// The view host slot `index` was made from, in a few words, with the
     /// title and host addresses of a buffer view (diagnostics). "null" for
     /// a slot never made or left null.
-    #[allow(dead_code)] // the device-removed report (base draw.rs 615-620), diagnostics left out
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
         let key = *self
             .made
@@ -3420,7 +3531,7 @@ fn buffer_srv(
         {
             buffer.FirstElement = r.offset / element;
             // SAFETY: a live buffer and a slot of our heap; the view lies in it.
-            unsafe { host()?.device.CreateShaderResourceView(&r.buffer, Some(&desc), at) };
+            unsafe { gate::srv(&host()?.device, &r.buffer, Some(&desc), at) };
             return Some(Some(r.buffer));
         }
     }
@@ -3450,8 +3561,8 @@ fn buffer_srv(
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
-        host.device
-            .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
+        gate::srv(&host.device,
+            &shadow.buffer, Some(&desc), at)
     };
     Some(Some(shadow.buffer.clone()))
 }
@@ -3477,7 +3588,7 @@ fn buffer_uav(
             buffer.FirstElement = r.offset / element;
             buffer.CounterOffsetInBytes = 0;
             // SAFETY: a live buffer and a slot of our heap; the view lies in it.
-            unsafe { host()?.device.CreateUnorderedAccessView(&r.buffer, None::<&ID3D12Resource>, Some(&desc), at) };
+            unsafe { gate::uav(&host()?.device, &r.buffer, None::<&ID3D12Resource>, Some(&desc), at) };
             return Some(Some(r.buffer));
         }
     }
@@ -3522,7 +3633,7 @@ fn buffer_uav(
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
-        host.device.CreateUnorderedAccessView(
+        gate::uav(&host.device,
             &shadow.buffer,
             None::<&ID3D12Resource>,
             Some(&desc),
@@ -3803,7 +3914,7 @@ fn depth_scratch(
     }
     // SAFETY: a live scratch texture and a slot of our heap.
     unsafe {
-        device.CreateUnorderedAccessView(&scratch, None::<&ID3D12Resource>, Some(&uav), at);
+        gate::uav(device, &scratch, None::<&ID3D12Resource>, Some(&uav), at);
     }
     Some(Some(scratch))
 }
@@ -3838,7 +3949,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             if let Some(r) = view_in_place(view) {
                 let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC { BufferLocation: shared_va(&r), SizeInBytes: capped.next_multiple_of(256) };
                 // SAFETY: a slot of our heap; the range lies in the shared buffer.
-                unsafe { device.CreateConstantBufferView(Some(&desc), at) };
+                unsafe { gate::cbv(device, Some(&desc), at) };
                 return Some(Some(r.buffer));
             }
             let shadow = d3d12x::shadow::find(address, u64::from(capped))?;
@@ -3852,7 +3963,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 SizeInBytes: capped.next_multiple_of(256),
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
-            unsafe { device.CreateConstantBufferView(Some(&desc), at) };
+            unsafe { gate::cbv(device, Some(&desc), at) };
             Some(Some(shadow.buffer.clone()))
         }
         View::Shader(resource, desc) => {
@@ -3882,7 +3993,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
-                    device.CreateShaderResourceView(
+                    gate::srv(device,
                         texture,
                         desc.as_ref().map(std::ptr::from_ref),
                         at,
@@ -3922,7 +4033,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             // SAFETY: a live texture and a slot of our heap.
             unsafe {
-                device.CreateUnorderedAccessView(
+                gate::uav(device,
                     texture,
                     None::<&ID3D12Resource>,
                     desc.as_ref().map(std::ptr::from_ref),
@@ -3939,13 +4050,13 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     .read_unaligned()
             };
             // SAFETY: a slot of our sampler heap.
-            unsafe { device.CreateSampler(&desc, at) };
+            unsafe { gate::sampler(device, &desc, at) };
             Some(None)
         }
         View::ConsoleSampler(words) => {
             let desc = crate::d3d12x::sampler::console(words);
             // SAFETY: a slot of our sampler heap.
-            unsafe { device.CreateSampler(&desc, at) };
+            unsafe { gate::sampler(device, &desc, at) };
             Some(None)
         }
         View::Placed(unordered, resource, desc) => {
@@ -4155,7 +4266,7 @@ pub(crate) fn own_window(bytes: u64) -> Option<(u64, ID3D12Resource)> {
         },
     };
     // SAFETY: a live buffer and a slot of our heap.
-    unsafe { host.device.CreateShaderResourceView(&r, Some(&srv), h.cpu(index)) };
+    unsafe { gate::srv(&host.device, &r, Some(&srv), h.cpu(index)) };
     h.keep(index, Some(r.clone()));
     own.push((p as u64, bytes, index));
     xnw_core::info!("d3d12x: GPU-side descriptors: heap memory of {bytes} bytes at {:#x} read in place (slot {index})", p as u64);
@@ -4184,7 +4295,7 @@ fn window_view(t: &Tables, h: &HostHeap, buffer: &ID3D12Resource) -> Option<u32>
         };
         if let Some(host) = host() {
             // SAFETY: a live buffer and a slot of our heap.
-            unsafe { host.device.CreateShaderResourceView(r, Some(&desc), h.cpu(index)) };
+            unsafe { gate::srv(&host.device, r, Some(&desc), h.cpu(index)) };
         }
         h.keep(index, Some(r.clone()));
     }
@@ -4308,7 +4419,7 @@ impl HostHeap {
                     },
                 };
                 // SAFETY: a live window buffer and a slot of our heap.
-                unsafe { host.device.CreateShaderResourceView(&r.buffer, Some(&desc), at) };
+                unsafe { gate::srv(&host.device, &r.buffer, Some(&desc), at) };
                 Some(r.buffer)
             });
         RAW_CONSTANTS[usize::from(made.is_none())].fetch_add(1, Ordering::Relaxed);
@@ -4326,7 +4437,7 @@ impl HostHeap {
             KIND_CBV => {
                 if let Some(host) = host() {
                     // SAFETY: a slot of our heap; a zero location is a null CBV.
-                    unsafe { host.device.CreateConstantBufferView(Some(&D3D12_CONSTANT_BUFFER_VIEW_DESC::default()), at) };
+                    unsafe { gate::cbv(&host.device, Some(&D3D12_CONSTANT_BUFFER_VIEW_DESC::default()), at) };
                 }
             }
             0 | KIND_SRV_RAW | KIND_SRV_TYPED | KIND_SRV_STRUCTURED => null_buffer_view(at),
@@ -4454,7 +4565,7 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         View::Constant(..) => {
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
             // SAFETY: a slot of our heap; a zero location makes a null view.
-            unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
+            unsafe { gate::cbv(&host.device, Some(&desc), at) };
         }
         _ => null_view(at),
     }
@@ -4478,6 +4589,10 @@ fn null_uav_dimension(word: u32) -> D3D12_UAV_DIMENSION {
 /// An unordered access view that safely drops writes and reads zeros, matching
 /// the title's dimension from `words` (1D, 2D, arrays, 3D, buffer).
 fn null_uav_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    if null_srv() {
+        NULL_UAV_AS_SRV.fetch_add(1, Ordering::Relaxed);
+        return null_like(words, at);
+    }
     let Some(host) = host() else { return };
     let dim = null_uav_dimension(words[1]);
     let desc = match dim {
@@ -4537,7 +4652,7 @@ fn null_uav_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
     unsafe {
-        host.device.CreateUnorderedAccessView(
+        gate::uav(&host.device,
             None::<&ID3D12Resource>,
             None::<&ID3D12Resource>,
             Some(&desc),
@@ -4546,8 +4661,97 @@ fn null_uav_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
 }
 
+/// `XNW_NULL_SRV=1`: every null view we make for a view or unordered-access
+/// slot is a shader-resource null. WARP 1.0.22 removes the device when a
+/// shader reads a null unordered-access view (or a constant buffer view, or
+/// a slot never written) as a resource, while a shader-resource null of any
+/// dimension reads zeros and drops stores and atomics under every view kind
+/// (`xnw-shader` test `null_kinds`, 13 slot kinds x 10 reads on
+/// another machine). The title reads one descriptor under several kinds, as
+/// the console's descriptors have one format. Off by default.
+pub(crate) fn null_srv() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("XNW_NULL_SRV").is_ok_and(|v| matches!(v.trim(), "1" | "dummy"));
+        if on {
+            xnw_core::info!("d3d12x: null views are shader-resource nulls (XNW_NULL_SRV=1)");
+        }
+        on
+    })
+}
+
+/// `XNW_NULL_SRV=dummy`: every null shader-resource view (and so every null
+/// unordered-access view, [`null_srv`]) is instead a raw view of a zeroed
+/// 64 KiB buffer of ours. WARP reads a resource through two fields of a
+/// descriptor (the JIT code at a run's fault: a flag behind
+/// the fourth qword, then a byte at +0x388 behind the second); a slot
+/// rewritten from a live view to a null one while a list reading it runs
+/// can be read half old, half new: the live flag, then the null's zero
+/// pointer, and four WARP threads fault reading 0x388. A live view over
+/// zeros has no null pointer to read. What a shader writes through such a
+/// slot lands in the dummy buffer.
+fn null_dummy() -> Option<&'static ID3D12Resource> {
+    struct Dummy(Option<ID3D12Resource>);
+    // SAFETY: D3D12 resources are free-threaded.
+    unsafe impl Send for Dummy {}
+    // SAFETY: as above.
+    unsafe impl Sync for Dummy {}
+    static DUMMY: std::sync::OnceLock<Dummy> = std::sync::OnceLock::new();
+    DUMMY
+        .get_or_init(|| {
+            let on = std::env::var("XNW_NULL_SRV").is_ok_and(|v| v.trim() == "dummy");
+            let Some(host) = host().filter(|_| on) else { return Dummy(None) };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: NULL_DUMMY_BYTES,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut r: Option<ID3D12Resource> = None;
+            // SAFETY: a plain committed buffer (default heaps start zeroed).
+            let made = unsafe { host.device.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut r) };
+            match made {
+                Ok(()) => xnw_core::info!("d3d12x: null views are views of a zeroed {NULL_DUMMY_BYTES}-byte buffer (XNW_NULL_SRV=dummy)"),
+                Err(e) => xnw_core::warn!("d3d12x: XNW_NULL_SRV=dummy: no dummy buffer ({e}); null views stay null"),
+            }
+            Dummy(r)
+        })
+        .0
+        .as_ref()
+}
+
+/// Bytes of the [`null_dummy`] buffer.
+const NULL_DUMMY_BYTES: u64 = 1 << 16;
+
+/// Writes the [`null_dummy`] view at `at`; false without the dummy.
+fn dummy_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
+    let (Some(host), Some(dummy)) = (host(), null_dummy()) else { return false };
+    let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_SRV { NumElements: (NULL_DUMMY_BYTES / 4) as u32, Flags: D3D12_BUFFER_SRV_FLAG_RAW, ..Default::default() },
+        },
+    };
+    // SAFETY: a live buffer of ours and a slot of our heap.
+    unsafe { gate::srv(&host.device, dummy, Some(&desc), at) };
+    true
+}
+
+/// Null unordered-access views made as shader-resource nulls ([`null_srv`]).
+pub(crate) static NULL_UAV_AS_SRV: AtomicU64 = AtomicU64::new(0);
+
 /// A buffer UAV that safely drops writes (raw, or structured if `stride` > 0).
 fn null_uav_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE, stride: u32) {
+    if null_srv() {
+        NULL_UAV_AS_SRV.fetch_add(1, Ordering::Relaxed);
+        return null_buffer_view(at);
+    }
     let Some(host) = host() else { return };
     let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
         Format: if stride > 0 {
@@ -4571,7 +4775,7 @@ fn null_uav_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE, stride: u32) {
     };
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
     unsafe {
-        host.device.CreateUnorderedAccessView(
+        gate::uav(&host.device,
             None::<&ID3D12Resource>,
             None::<&ID3D12Resource>,
             Some(&desc),
@@ -4582,6 +4786,10 @@ fn null_uav_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE, stride: u32) {
 
 /// A 2D texture UAV that safely drops writes.
 fn null_uav_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    if null_srv() {
+        NULL_UAV_AS_SRV.fetch_add(1, Ordering::Relaxed);
+        return null_view(at);
+    }
     let Some(host) = host() else { return };
     let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
         Format: DXGI_FORMAT_R32_UINT,
@@ -4595,7 +4803,7 @@ fn null_uav_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
     unsafe {
-        host.device.CreateUnorderedAccessView(
+        gate::uav(&host.device,
             None::<&ID3D12Resource>,
             None::<&ID3D12Resource>,
             Some(&desc),
@@ -4607,6 +4815,9 @@ fn null_uav_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 /// A buffer view that reads zeros (raw, as translated shaders mostly read
 /// buffers).
 fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    if dummy_view(at) {
+        return;
+    }
     let Some(host) = host() else { return };
     let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
         Format: DXGI_FORMAT_R32_TYPELESS,
@@ -4622,14 +4833,17 @@ fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
     unsafe {
-        host.device
-            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
+        gate::srv(&host.device,
+            None::<&ID3D12Resource>, Some(&desc), at)
     };
 }
 
 /// A texture view that reads zeros with the dimension (and mip and array
 /// counts) of the title's description `words`; 2D if it names none.
 fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    if dummy_view(at) {
+        return;
+    }
     const TEXTURES: std::ops::RangeInclusive<u32> = 2..=10;
     if !TEXTURES.contains(&words[1]) {
         return null_view(at);
@@ -4649,8 +4863,8 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
     unsafe {
-        host.device
-            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
+        gate::srv(&host.device,
+            None::<&ID3D12Resource>, Some(&desc), at)
     };
 }
 
@@ -4659,6 +4873,9 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 /// view; null buffer views there did not stop the world's low-address
 /// page faults (2026-11-24, run w10), so they are not the cause.
 fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    if dummy_view(at) {
+        return;
+    }
     let Some(host) = host() else { return };
     let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
         Format: DXGI_FORMAT_R8G8B8A8_UNORM,
@@ -4673,8 +4890,8 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
     unsafe {
-        host.device
-            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
+        gate::srv(&host.device,
+            None::<&ID3D12Resource>, Some(&desc), at)
     };
 }
 
