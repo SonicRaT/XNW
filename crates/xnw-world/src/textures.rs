@@ -270,6 +270,9 @@ pub struct TexTable {
     frame_no: u64,
     pub stats: TexStats,
     last_log: std::time::Instant,
+    /// This frame's entries: their texture and view (the title's own
+    /// programs in our pass make their own views of them, `bridged`).
+    views: HashMap<u32, (ID3D12Resource, D3D12_SHADER_RESOURCE_VIEW_DESC)>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the table is used by its pass's owner.
@@ -298,6 +301,7 @@ impl TexTable {
             frame_no: 0,
             stats: TexStats::default(),
             last_log: std::time::Instant::now(),
+            views: HashMap::new(),
         }
     }
 
@@ -310,6 +314,11 @@ impl TexTable {
     pub fn lookup(&self, slot: u64) -> (u32, bool) {
         let (i, srgb) = self.frame.get(&slot).copied().unwrap_or((0, false));
         if i < self.next { (i, srgb) } else { (0, false) }
+    }
+
+    /// The texture and view of `slot` this frame (None: flat).
+    pub fn host_view(&self, slot: u64) -> Option<(ID3D12Resource, D3D12_SHADER_RESOURCE_VIEW_DESC)> {
+        self.views.get(&self.lookup(slot).0).cloned()
     }
 
     /// Why `slot` is flat this frame (asked for draws `lookup` gave 0).
@@ -358,6 +367,7 @@ impl TexTable {
         let mut copies: Vec<Arc<resource::HostTexture>> = Vec::new();
         let mut checker_copies: Vec<(ID3D12Resource, ID3D12Resource)> = Vec::new();
         let mut provided_copies: Vec<(ID3D12Resource, ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> = Vec::new();
+        let mut made = HashMap::new();
         if self.opts.mode != TexMode::Off {
             let base = self.base;
             demand = self.fill(
@@ -370,10 +380,14 @@ impl TexTable {
                     TexMode::Provided => t.provide(device, slot, &mut provided_copies).map(|(r, v, s)| ((r, v), s)).ok_or(Flat::Other),
                     _ => t.resolve(slot, &mut budget, &mut waiting, &mut copies).map(|(r, v, s)| ((r, v), s)),
                 },
-                // SAFETY: a live resource and a slot of our heap's table.
-                &mut |(resource, srv), i| unsafe { device.CreateShaderResourceView(&resource, Some(&srv), cpu(base + i)) },
+                &mut |(resource, srv), i| {
+                    // SAFETY: a live resource and a slot of our heap's table.
+                    unsafe { device.CreateShaderResourceView(&resource, Some(&srv), cpu(base + i)) };
+                    made.insert(i, (resource, srv));
+                },
             );
         }
+        self.views = made;
         // Entries used last frame and not now: null views (the table is
         // bound whole).
         let null = D3D12_SHADER_RESOURCE_VIEW_DESC {

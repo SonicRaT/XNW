@@ -61,6 +61,11 @@ pub fn render_cli(args: &[String]) -> Result<(), String> {
     xnw_world::keep_jitter(args.iter().any(|a| a == "--jitter"));
     // `--bridgeps on|<hash>+<hash>` or `XNW_WORLD_RENDER=...,bridgeps=...`: those rows by the title's own programs in our pass.
     let bridgeps = opt("--bridgeps").map_or_else(|| xnw_world::bridge::parse_switch(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default()), |v| xnw_world::bridge::parse_switch(&format!("bridgeps={v}")));
+    // `--bridgems on|<hash>+<hash>` or `XNW_WORLD_RENDER=...,bridgems=...`: those rows from the title's mesh programs inside our pass; with `--bridgeps`, its pixel programs where named.
+    let bridgems = opt("--bridgems").map_or_else(|| xnw_world::bridge_ms::parse_switch(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default()), |v| xnw_world::bridge_ms::parse_switch(&format!("bridgems={v}")));
+    if !bridgems.is_empty() {
+        return crate::bridge_ms::bridgems_cli(args, dir, &host, &mut pass, &bridgems, &bridgeps);
+    }
     if !bridgeps.is_empty() {
         return crate::bridge_ps::bridgeps_cli(args, dir, &host, &mut pass, &bridgeps);
     }

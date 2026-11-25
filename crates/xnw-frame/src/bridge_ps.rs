@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use xnw_world::bridge;
+use xnw_world::bridged::{self, SrcRoot, SrcView, Source, WORDS};
 use xnw_world::{DrawRecord, GeomKey, HostGeometry, Pass, RAW_SHADER, TexMode};
 
 use crate::bridge::{Row, load, programs};
@@ -301,13 +302,100 @@ pub fn audit_pixels(args: &[String], dir: &Path, out: &Path, host: &xnw_gpu::hos
     Ok(())
 }
 
-/// `world-render <frame> --bridgeps on|<hash>+<hash>` (or
-/// `XNW_WORLD_RENDER=...,bridgeps=...`): the frame through our pass, then
-/// every main-view static row whose pixel program is named drawn again by
-/// the title's own mesh and pixel program into our colour target, tested
-/// against our depth (the replay side of the live switch).
-/// Our pass shows its albedo view (`--bridgeps-lit`: its shading) so the
-/// two read alike. Writes `--out <png>`: ours above, with the title's rows below.
+/// A frame pack sink as the bridged rows' [`Source`] (the live title's is
+/// the list sink's tap): its root constants, root views (the list's
+/// vertex buffer where the capture has none), tables, draw words and the
+/// views they name, sampler heap entries. Buffer bytes are shared across
+/// the frame's sinks by (address, length).
+pub struct PackSource<'a> {
+    pack: &'a Pack,
+    sink: u32,
+    tables: Vec<(u16, u64, Vec<xnw_formats::framepack::SlotView>)>,
+    vb: Option<(u64, Arc<Vec<u8>>)>,
+    shared: &'a std::cell::RefCell<HashMap<(u64, u64, u32), Arc<Vec<u8>>>>,
+}
+
+impl<'a> PackSource<'a> {
+    pub fn new(pack: &'a Pack, sink: u32, vb: Option<(u64, Arc<Vec<u8>>)>, shared: &'a std::cell::RefCell<HashMap<(u64, u64, u32), Arc<Vec<u8>>>>) -> PackSource<'a> {
+        PackSource { pack, sink, tables: pack.tables(sink), vb, shared }
+    }
+}
+
+fn src_view(v: &xnw_formats::framepack::SlotView) -> SrcView {
+    SrcView { kind: v.kind, addr: v.addr, bytes: v.bytes, format: v.format, width: v.width }
+}
+
+impl Source for PackSource<'_> {
+    fn roots(&self) -> Vec<SrcRoot> {
+        use xnw_formats::framepack::{kind, reason};
+        let mut out: Vec<SrcRoot> = Vec::new();
+        let mut put = |i: u16, r: SrcRoot| {
+            if out.len() <= usize::from(i) {
+                out.resize(usize::from(i) + 1, SrcRoot::None);
+            }
+            out[usize::from(i)] = r;
+        };
+        for r in self.pack.data.refs_of(self.sink) {
+            match r.kind {
+                kind::ROOTS if reason::has_bytes(r.reason) => {
+                    if let Some(b) = self.pack.blob(r.hash) {
+                        put(r.slot, SrcRoot::Constants(b.chunks_exact(4).map(|c| crate::le32(c, 0)).collect()));
+                    }
+                }
+                kind::ROOT_VIEW => put(r.slot, SrcRoot::View(r.addr)),
+                _ => {}
+            }
+        }
+        for (root, handle, _) in &self.tables {
+            put(*root, SrcRoot::Table(*handle));
+        }
+        out
+    }
+
+    fn table(&self, root: u16, slot: u32) -> Option<SrcView> {
+        self.tables.iter().find(|t| t.0 == root)?.2.iter().find(|v| v.slot == slot).map(src_view)
+    }
+
+    fn bytes(&self, root: u16, slot: u32, v: &SrcView) -> Option<Arc<Vec<u8>>> {
+        let (_, b) = self.pack.slot_bytes(self.sink, root, slot).ok()?;
+        let key = (v.addr, v.bytes, b.len() as u32);
+        Some(self.shared.borrow_mut().entry(key).or_insert_with(|| Arc::new(b)).clone())
+    }
+
+    fn root_view(&self, root: u16, addr: u64) -> Option<Arc<Vec<u8>>> {
+        use xnw_formats::framepack::{kind, reason};
+        let r = self.pack.data.refs_of(self.sink).find(|r| r.kind == kind::ROOT_VIEW && r.slot == root)?;
+        if reason::has_bytes(r.reason)
+            && let Some(b) = self.pack.blob(r.hash)
+        {
+            return Some(Arc::new(b));
+        }
+        // The capture cut it: the list's copy of the row's vertex buffer.
+        self.vb.as_ref().filter(|(at, _)| addr == *at || addr == *at + 0x4_0000_0000).map(|v| v.1.clone())
+    }
+
+    fn words(&self) -> Option<[u32; WORDS]> {
+        self.pack.draw_words(self.sink)?.words.ok()
+    }
+
+    fn heap(&self, index: u32) -> Option<(u64, SrcView)> {
+        let dw = self.pack.draw_words(self.sink)?;
+        let v = dw.views.ok()?.into_iter().find(|v| v.slot == index)?;
+        Some((dw.heap_start + 32 * u64::from(index), src_view(&v)))
+    }
+
+    fn samplers(&self) -> Option<Arc<Vec<(u32, bridge::SamplerDesc)>>> {
+        crate::bridge::samplers(self.pack, self.sink, &mut Vec::new()).map(Arc::new)
+    }
+}
+
+/// `--bridgeps on|<hash>+<hash>` or `XNW_WORLD_RENDER=...,bridgeps=...`:
+/// the rows of those pixel programs through the live title's path:
+/// each sink as a [`Source`] to [`bridged::take`], the pipelines from
+/// [`bridged::cache`], the frame drawn by our pass with the rows recorded
+/// on its list ([`xnw_world::bridged::record`]), textures from our texture
+/// table by handle. Prints both timings; `--out` writes the sheet (our
+/// pass alone above, with the title's rows below).
 pub fn bridgeps_cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, pass: &mut Pass, wanted: &[u32]) -> Result<(), String> {
     let (mut list, geoms) = load_list(dir)?;
     let pack = Pack::open(dir)?.ok_or("--bridgeps needs a v2 capture (pack\\manifest.tsv)")?;
@@ -322,57 +410,57 @@ pub fn bridgeps_cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, pas
     (pass.sky, pass.water, pass.terrain.opts.on) = (false, false, false);
     pass.tex.opts.mode = TexMode::Provided;
     let counts = Arc::new([const { AtomicU64::new(0) }; 3]);
-    pass.tex.set_provider(Some(pack.texel_provider(counts.clone())));
-    let mut texels = pack.texel_provider(counts);
+    pass.tex.set_provider(Some(pack.texel_provider(counts)));
     let mut decode = |key: &GeomKey| geoms.get(key).map(|(vb, idx)| HostGeometry { vertices: Vec::new(), indices: idx.clone(), raw_vb: Some(vb.clone()) });
     list.frame = 1;
     let t0 = std::time::Instant::now();
     let st = pass.draw(&list, &mut decode, true)?;
     let ours = pass.read_rgba()?;
     let t_ours = t0.elapsed().as_secs_f64();
-    let into = pass.bridge_into();
-    let mut progs: HashMap<u64, Result<_, String>> = HashMap::new();
-    let (mut drawn, mut failed, mut other) = (0u32, Vec::new(), 0u32);
+    // The pipelines, once per pair (here, not on a thread: the replay waits).
     let t1 = std::time::Instant::now();
-    for &(k, draw, sink) in &rows {
+    let mut taken = Vec::new();
+    let mut other = 0u32;
+    let shared = std::cell::RefCell::new(HashMap::new());
+    let vbs: HashMap<GeomKey, Arc<Vec<u8>>> = HashMap::new();
+    let mut vbs = vbs;
+    for &(k, _, sink) in &rows {
         let row: &DrawRecord = &list.draws[k];
-        let pipeline = pack.data.sinks.iter().find(|s| s.index == sink).map_or(0, |s| s.pipeline);
-        let entry = progs.entry(pipeline).or_insert_with(|| programs(&pack, sink));
-        let Ok((p, used, h)) = entry else {
+        let Some(pipeline) = pack.data.sinks.iter().find(|s| s.index == sink).map(|s| s.pipeline) else { continue };
+        let stage = |name: &str| pack.data.programs.iter().find(|p| p.pipeline == pipeline && p.stage == name).map(|p| p.container);
+        let (Some(ms), Some(ps)) = (stage("mesh"), stage("pixel")) else {
             other += 1;
             continue;
         };
-        if !wanted.contains(&((h[1] >> 96) as u32)) {
+        if !wanted.contains(&((ps >> 96) as u32)) {
             other += 1;
             continue;
         }
-        let mut loaded = load(&pack, sink, &Row::with_palette(row, &list, &pack, draw), geoms.get(&row.geom).map(|g| &g.0[..]), used, &mut texels);
-        loaded.direct_meshlets();
-        let d = loaded.draw();
-        let target = bridge::Target { width: pass.width, height: pass.height, depth: None, limit: if host.caps.software { 120.0 } else { 1.0 }, depth_only: false, records: false };
-        let r = bridge::bind(&p.ms, &p.ps, &d).and_then(|b| {
-            crate::replay::watchdog_arm();
-            let r = bridge::run_into(host, p, &b, &target, Some(&into));
-            crate::replay::watchdog_disarm();
-            r
-        });
-        match r {
-            Ok(_) => drawn += 1,
-            Err(e) => {
-                failed.push(format!("row {k}: {e}"));
-                // SAFETY: the device call takes no arguments.
-                if unsafe { host.device.GetDeviceRemovedReason() }.is_err() {
-                    break;
-                }
-            }
+        let key = (ms, ps);
+        if !bridged::cache().asked(key) {
+            let (Some(msc), Some(psc)) = (pack.blob(ms), pack.blob(ps)) else { continue };
+            bridged::cache().ask(key, msc, psc, &host.device, &host.caps, true);
         }
+        let Some(built) = bridged::cache().get(key) else { continue };
+        let vb = geoms.get(&row.geom).map(|g| (row.geom.vb_at, vbs.entry(row.geom).or_insert_with(|| Arc::new(g.0.clone())).clone()));
+        let mut o = bridged::take(&PackSource::new(&pack, sink, vb, &shared), key, &built.used);
+        o.set_groups(row.geom.mesh_at);
+        taken.push((k as u32, o));
     }
-    let theirs = bridge::read_colour(host, &into.colour, pass.width, pass.height)?;
+    let t_take = t1.elapsed().as_secs_f64();
+    let n = taken.len();
+    list.bridged = Some(Arc::new(bridged::Frame::new(taken)));
+    pass.bridge_on = true;
+    let t2 = std::time::Instant::now();
+    crate::replay::watchdog_arm();
+    let r = pass.draw(&list, &mut decode, true);
+    crate::replay::watchdog_disarm();
+    r?;
+    let theirs = pass.read_rgba()?;
+    let t_with = t2.elapsed().as_secs_f64();
     let changed = ours.chunks_exact(4).zip(theirs.chunks_exact(4)).filter(|(a, b)| a[..3] != b[..3]).count();
-    println!("bridgeps: our pass {} draws in {t_ours:.2} s; the title's programs {:08x?}: {drawn} rows drawn in {:.2} s, {} failed, {other} rows of other programs; {changed} pixels changed", st.draws, wanted, t1.elapsed().as_secs_f64(), failed.len());
-    for f in failed.iter().take(8) {
-        println!("  {f}");
-    }
+    println!("bridgeps: our pass {} draws in {t_ours:.2} s; the title's programs {wanted:08x?}: {n} rows ({other} rows of other programs), pipelines and inputs in {t_take:.2} s, the frame with them in {t_with:.2} s; {changed} pixels changed", st.draws);
+    println!("bridgeps: {}", bridged::line(list.frame, list.bridged.as_deref().unwrap_or(&bridged::Frame::default()), &pass.bridge_stats));
     if let Some(out) = args.iter().position(|a| a == "--out").and_then(|i| args.get(i + 1)) {
         let mut sheet = ours;
         sheet.extend_from_slice(&theirs);

@@ -807,7 +807,7 @@ const ROOT_WINDOW: u64 = 64 << 10;
 const ROOT_BUFFER: u8 = 0;
 const ROOT_STREAM: u8 = 1;
 const ROOT_WINDOWED: u8 = 2;
-const ROOT_NONE: u8 = 3;
+pub(super) const ROOT_NONE: u8 = 3;
 
 /// Bytes from `address` to the end of the hook stream holding it.
 fn stream_left(streams: &BTreeMap<u64, u64>, address: u64) -> Option<u64> {
@@ -824,7 +824,7 @@ fn stream_left(streams: &BTreeMap<u64, u64>, address: u64) -> Option<u64> {
 /// In order: a buffer object (`left`) at the address, then at the
 /// address - `GPU_ALIAS`; a hook stream (`stream`) at either; else a
 /// window at the address (the memory is mapped at both).
-fn root_view_at(a: u64, left: impl Fn(u64) -> Option<u64>, stream: impl Fn(u64) -> Option<u64>) -> (u64, u64, bool, u8) {
+pub(super) fn root_view_at(a: u64, left: impl Fn(u64) -> Option<u64>, stream: impl Fn(u64) -> Option<u64>) -> (u64, u64, bool, u8) {
     let cpu = a.checked_sub(GPU_ALIAS).filter(|&c| c >= 0x1_0000);
     if let Some(n) = left(a) {
         return (a, n, false, ROOT_BUFFER);

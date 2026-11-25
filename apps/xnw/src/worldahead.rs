@@ -86,6 +86,17 @@ pub(crate) fn set_offer(on: bool) {
     OFFER.store(on, Ordering::Relaxed);
 }
 
+/// The rows (place.tsv, ahead-keys.tsv, attach.tsv) are read only by a
+/// frame dump. A run that never dumps and never offers skips the title
+/// reads behind them: at world entry a backlog of 38,212 placements and
+/// 20,203 attaches, each a chain of ReadProcessMemory calls, held the list
+/// 211 and 240 ms on the first two world frames of a screen run.
+static ROWS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub(crate) fn set_rows(on: bool) {
+    ROWS.store(on, Ordering::Relaxed);
+}
+
 /// `XNW_WORLD_RENDER=...,ahead=off` leaves the title alone.
 pub(crate) fn enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| !std::env::var("XNW_WORLD_RENDER").is_ok_and(|v| v.split(',').any(|p| p.trim() == "ahead=off")));
@@ -294,6 +305,15 @@ pub(crate) const ATTACH_HEADER: &str = "frame\ttitle_frame\tentity\ttype\tarchet
 /// Once a frame (writer thread): the attaches since the last frame as rows
 /// (seq dumps: attach.tsv) and a count line every 60 frames.
 pub(crate) fn drain_attaches(frame: u64, cam: Option<[f32; 3]>) {
+    // Not installed (tests of the list): the ring is nobody's.
+    if ADDRS.get().is_some() {
+        drain_attaches_with(frame, cam, ROWS.load(Ordering::Relaxed));
+    }
+}
+
+/// `rows`: a dump may take the rows; else the attaches are counted, not read
+/// (a row is about 15 guarded reads: entity, archetype, handler, the drawable's LODs).
+pub(crate) fn drain_attaches_with(frame: u64, cam: Option<[f32; 3]>, rows: bool) {
     let Ok(mut g) = ATTACH_DRAIN.lock() else { return };
     let d = g.get_or_insert_with(|| AttachDrain { tail: 0, rows: Vec::new(), n: 0, near: 0, by_type: HashMap::new() });
     let head = ATTACH_HEAD.load(Ordering::Acquire);
@@ -301,6 +321,10 @@ pub(crate) fn drain_attaches(frame: u64, cam: Option<[f32; 3]>) {
     for i in from..head {
         let slot = &ATTACHES[i as usize & (ATTACH_N - 1)];
         let (entity, fid) = (slot[0].load(Ordering::Acquire), slot[1].load(Ordering::Relaxed));
+        if !rows {
+            d.n += u64::from(entity != 0);
+            continue;
+        }
         if let Some((ty, row)) = attach_row(frame, fid, entity, cam) {
             d.n += 1;
             *d.by_type.entry(ty).or_default() += 1;
@@ -313,7 +337,10 @@ pub(crate) fn drain_attaches(frame: u64, cam: Option<[f32; 3]>) {
         }
     }
     d.tail = head;
-    if frame % 60 == 0 && d.n > 0 {
+    if frame % 60 == 0 && d.n > 0 && !rows {
+        xnw_core::info!("world ahead: frame {frame}: entity drawables attached {} (not read: no dump in this run)", d.n);
+        d.n = 0;
+    } else if frame % 60 == 0 && d.n > 0 {
         let mut t: Vec<(u8, u64)> = d.by_type.drain().collect();
         t.sort();
         xnw_core::info!("world ahead: frame {frame}: entity drawables attached {} ({} within 200 m of the camera; by entity type {t:?})", d.n, d.near);
@@ -562,6 +589,8 @@ pub(crate) struct Stats {
     pub(crate) known: u64,
     pub(crate) unreadable: u64,
     pub(crate) overrun: u64,
+    /// Marks counted but not walked (no offer, no dump).
+    pub(crate) not_walked: u64,
     /// Placed indices per module vtable (title rva) that are not the DrawableStore.
     pub(crate) modules: HashMap<u64, u64>,
 }
@@ -593,10 +622,12 @@ const FRAME_BYTES: u64 = 64 << 20;
 /// offered on `list` (`want` is the pass's `known().wants`).
 pub(crate) fn drain(frame: u64, list: &mut FrameList, want: &mut dyn FnMut(&GeomKey) -> bool) {
     let Some(a) = ADDRS.get() else { return };
-    drain_with(a, frame, list, want, OFFER.load(Ordering::Relaxed));
+    drain_with(a, frame, list, want, OFFER.load(Ordering::Relaxed), ROWS.load(Ordering::Relaxed));
 }
 
-pub(crate) fn drain_with(a: &Addrs, frame: u64, list: &mut FrameList, want: &mut dyn FnMut(&GeomKey) -> bool, offer: bool) {
+/// `rows`: a dump may take the rows (else, without `offer`, the placements
+/// are counted and not walked: nothing would read the walk).
+pub(crate) fn drain_with(a: &Addrs, frame: u64, list: &mut FrameList, want: &mut dyn FnMut(&GeomKey) -> bool, offer: bool, rows: bool) {
     let Ok(mut g) = DRAIN.lock() else { return };
     let d = g.get_or_insert_with(|| Drain { tail: 0, queue: VecDeque::new(), retry: Vec::new(), owned: HashMap::new(), evict_tail: 0, stats: Stats::default(), rows: Vec::new(), keys: Vec::new() });
     let head = HEAD.load(Ordering::Acquire);
@@ -634,6 +665,12 @@ pub(crate) fn drain_with(a: &Addrs, frame: u64, list: &mut FrameList, want: &mut
     }
     let base = a.drawable_vt.wrapping_sub((DRAWABLE_STORE_VT - IMAGE_BASE) as u64);
     let (mut n, mut bytes) = (0usize, 0u64);
+    if !offer && !rows {
+        // Keys only and no dump to take them: count the marks, read nothing.
+        d.stats.placed += d.queue.iter().filter(|q| q.2 == 0).count() as u64;
+        d.stats.not_walked += d.queue.len() as u64;
+        d.queue.clear();
+    }
     let table = if d.queue.is_empty() { None } else { read_table(a) };
     while n < FRAME_GEOMS && bytes < FRAME_BYTES {
         let Some((ms, idx, tries)) = d.queue.pop_front() else { break };
@@ -729,8 +766,8 @@ pub(crate) fn drain_with(a: &Addrs, frame: u64, list: &mut FrameList, want: &mut
         mods.sort_by_key(|m| std::cmp::Reverse(m.1));
         let mods: Vec<String> = mods.iter().take(6).map(|(k, v)| format!("{:#x}: {v}", (*k as usize).wrapping_add(IMAGE_BASE))).collect();
         xnw_core::info!(
-            "world ahead: frame {frame}: placed {}, drawables {} (of them fragments {}; {} geometries: offered {} ({:.1} MiB), already known {}, unreadable {}; keys only (no uploader) {} ({:.1} MiB)), other modules {} [{}], no module {}, not occupied after {RETRIES} drains {}, resolved on a retry {}, queued {}, ring overrun {}; unloads {} (ours {}, keys dropped {})",
-            s.placed, s.drawables, s.fragments, s.geometries, s.offered, s.offered_bytes as f64 / f64::from(1 << 20), s.known, s.unreadable, s.keyed, s.keyed_bytes as f64 / f64::from(1 << 20), s.not_drawable, mods.join(", "), s.no_module, s.not_occupied, s.late, d.queue.len() + d.retry.len(), s.overrun, s.unloads, s.unloads_ours, s.keys_dropped
+            "world ahead: frame {frame}: placed {}, drawables {} (of them fragments {}; {} geometries: offered {} ({:.1} MiB), already known {}, unreadable {}; keys only (no uploader) {} ({:.1} MiB)), other modules {} [{}], no module {}, not occupied after {RETRIES} drains {}, resolved on a retry {}, queued {}, ring overrun {}; unloads {} (ours {}, keys dropped {}); not walked (no offer, no dump) {}",
+            s.placed, s.drawables, s.fragments, s.geometries, s.offered, s.offered_bytes as f64 / f64::from(1 << 20), s.known, s.unreadable, s.keyed, s.keyed_bytes as f64 / f64::from(1 << 20), s.not_drawable, mods.join(", "), s.no_module, s.not_occupied, s.late, d.queue.len() + d.retry.len(), s.overrun, s.unloads, s.unloads_ours, s.keys_dropped, s.not_walked
         );
     }
 }
@@ -757,6 +794,130 @@ mod tests {
         Box::leak(v.into_boxed_slice())
     }
 
+    /// The rings and drains are process-wide: tests that push and drain take turns.
+    static RINGS: Mutex<()> = Mutex::new(());
+
+    fn rings() -> std::sync::MutexGuard<'static, ()> {
+        RINGS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A store holding one drawable (2 LODs, a model of 2 geometries each,
+    /// 4 KiB vertex buffers) at local 5 of index range [1000, 2000).
+    fn store_world() -> (Addrs, u64) {
+        let vb_data = leak(vec![0u8; 4096]);
+        vb_data[0..4].copy_from_slice(&0x3063u32.to_le_bytes());
+        let vb_obj = leak(vec![0u8; 0x20]);
+        vb_obj[8..12].copy_from_slice(&1024u32.to_le_bytes());
+        vb_obj[0xC..0xE].copy_from_slice(&4u16.to_le_bytes());
+        vb_obj[0x18..0x20].copy_from_slice(&(vb_data.as_ptr() as u64).to_le_bytes());
+        let ib_obj = leak(vec![0u8; 0x20]);
+        ib_obj[8..12].copy_from_slice(&3u32.to_le_bytes());
+        ib_obj[0xC..0xE].copy_from_slice(&2u16.to_le_bytes());
+        ib_obj[0x18..0x20].copy_from_slice(&(vb_data.as_ptr() as u64).to_le_bytes());
+        let drawable = leak(vec![0u8; 0x70]);
+        for lod in 0..2u64 {
+            let geoms: Vec<u64> = (0..2u64)
+                .map(|k| {
+                    let g = leak(vec![0u8; 0x48]);
+                    g[8..16].copy_from_slice(&(vb_obj.as_ptr() as u64).to_le_bytes());
+                    g[0x10..0x18].copy_from_slice(&(ib_obj.as_ptr() as u64).to_le_bytes());
+                    g[0x30..0x38].copy_from_slice(&(0xC000 + 2 * lod + k).to_le_bytes());
+                    g.as_ptr() as u64
+                })
+                .collect();
+            let geoms = leak(geoms);
+            let model = leak(vec![0u8; 0x38]);
+            model[8..16].copy_from_slice(&(geoms.as_ptr() as u64).to_le_bytes());
+            model[0x36..0x38].copy_from_slice(&2u16.to_le_bytes());
+            let models = leak(vec![model.as_ptr() as u64]);
+            let arr = leak(vec![0u8; 16]);
+            arr[..8].copy_from_slice(&(models.as_ptr() as u64).to_le_bytes());
+            arr[8..10].copy_from_slice(&1u16.to_le_bytes());
+            let at = 0x50 + 8 * lod as usize;
+            drawable[at..at + 8].copy_from_slice(&(arr.as_ptr() as u64).to_le_bytes());
+        }
+        let pool = leak(vec![0u64; 16]);
+        pool[10] = drawable.as_ptr() as u64;
+        let bits = leak(vec![0b0010_0000u8, 0]);
+        let vt = 0x7777_0000u64;
+        let store = leak(vec![0u8; 0x68]);
+        store[..8].copy_from_slice(&vt.to_le_bytes());
+        store[8..12].copy_from_slice(&1000u32.to_le_bytes());
+        store[0x38..0x40].copy_from_slice(&(pool.as_ptr() as u64).to_le_bytes());
+        store[0x40..0x44].copy_from_slice(&16u32.to_le_bytes());
+        store[0x60..0x68].copy_from_slice(&(bits.as_ptr() as u64).to_le_bytes());
+        let table = leak(vec![0u8; 16]);
+        table[..8].copy_from_slice(&(store.as_ptr() as u64).to_le_bytes());
+        table[8..12].copy_from_slice(&2000u32.to_le_bytes());
+        let table_ptr = leak(vec![table.as_ptr() as u64]);
+        let count = leak(vec![1u16]);
+        (Addrs { table: table_ptr.as_ptr() as u64, count: count.as_ptr() as u64, drawable_vt: vt, stores: [store.as_ptr() as u64, 1, 2] }, drawable.as_ptr() as u64)
+    }
+
+    /// A world-entry backlog on the writer thread, as a screen run without
+    /// `ahead=on` drains it: placements (keys only) and entity attaches,
+    /// walked (a dump may take the rows) and counted only (no dump). Best of 3.
+    #[test]
+    fn drain_cost_with_and_without_rows() {
+        let _rings = rings();
+        let (a, drawable) = store_world();
+        let handler = leak(vec![0u8; 0x80]);
+        handler[8..16].copy_from_slice(&drawable.to_le_bytes());
+        let ent = leak(vec![0u8; 0x90]);
+        ent[0x28..0x30].copy_from_slice(&(handler.as_ptr() as u64).to_le_bytes());
+        ent[0x30] = 12;
+        const N: usize = 5_000;
+        let mut best = [f64::MAX; 4];
+        // Per (rows on, off): keys made, placements not walked, attaches read.
+        let mut seen = [[0u64; 3]; 2];
+        // Earlier tests' leftovers out of the rings and counters.
+        drain_with(&a, 61, &mut FrameList::default(), &mut |_| true, false, false);
+        drain_attaches_with(61, None, false);
+        if let Some(d) = DRAIN.lock().unwrap().as_mut() {
+            d.stats = Stats::default();
+        }
+        if let Some(d) = ATTACH_DRAIN.lock().unwrap().as_mut() {
+            (d.n, d.near) = (0, 0);
+            d.by_type.clear();
+        }
+        for _ in 0..3 {
+            for (k, rows) in [true, false].into_iter().enumerate() {
+                for _ in 0..N {
+                    push(1005);
+                }
+                let t = std::time::Instant::now();
+                drain_with(&a, 61, &mut FrameList::default(), &mut |_| true, false, rows);
+                best[k] = best[k].min(t.elapsed().as_secs_f64() * 1e3);
+                if let Some(d) = DRAIN.lock().unwrap().as_mut() {
+                    let st = std::mem::take(&mut d.stats);
+                    (seen[k][0], seen[k][1]) = (seen[k][0] + st.keyed, seen[k][1] + st.not_walked);
+                }
+                for _ in 0..N {
+                    attach(ent.as_ptr() as u64, 1);
+                }
+                let t = std::time::Instant::now();
+                drain_attaches_with(61, None, rows);
+                best[2 + k] = best[2 + k].min(t.elapsed().as_secs_f64() * 1e3);
+                if let Some(d) = ATTACH_DRAIN.lock().unwrap().as_mut() {
+                    seen[k][2] += std::mem::take(&mut d.near) + d.by_type.drain().map(|(_, v)| v).sum::<u64>();
+                    d.n = 0;
+                }
+            }
+        }
+        let _ = (take_key_rows(), take_rows(), take_attach_rows());
+        eprintln!(
+            "drain of {N} placements (4 geometries each, keys only): walked {:.2} ms ({:.2} us each), counted {:.3} ms; {N} attaches: read {:.2} ms ({:.2} us each), counted {:.3} ms",
+            best[0],
+            best[0] * 1e3 / N as f64,
+            best[1],
+            best[2],
+            best[2] * 1e3 / N as f64,
+            best[3]
+        );
+        let n = 3 * N as u64;
+        assert_eq!(seen, [[4 * n, 0, n], [0, n, 0]], "walked: 4 keys a placement, every attach read; counted: nothing read");
+    }
+
     /// A synthetic module table, DrawableStore pool, drawable, model and
     /// two geometries (one meshlet, one classic): a "mark loaded" of its
     /// index offers both geometries under the draw hook's keys, once.
@@ -781,6 +942,7 @@ mod tests {
     /// archetype, archetype +0x58, handler and the title frame.
     #[test]
     fn entity_attach_rows() {
+        let _rings = rings();
         let arch = leak(vec![0u8; 0x60]);
         arch[0x58..0x5C].copy_from_slice(&0x1234u32.to_le_bytes());
         let handler = leak(vec![0u8; 0x80]);
@@ -795,7 +957,7 @@ mod tests {
         ent[0x50..0x54].copy_from_slice(&12.5f32.to_le_bytes());
         let _ = take_attach_rows();
         attach(ent.as_ptr() as u64, 777);
-        drain_attaches(3, Some([0.0, 0.0, 0.0]));
+        drain_attaches_with(3, Some([0.0, 0.0, 0.0]), true);
         let rows = take_attach_rows();
         assert_eq!(rows.len(), 1, "{rows:?}");
         let f: Vec<&str> = rows[0].split('\t').collect();
@@ -819,6 +981,7 @@ mod tests {
 
     #[test]
     fn placed_drawable_offers_its_geometries() {
+        let _rings = rings();
         // Geometry bytes: a VB of 3 RGB32F vertices with the raw header word.
         let vb_data = leak(vec![0u8; 0x80 + 36]);
         // A filled header (float3 positions), else the buffer is "not ready".
@@ -899,7 +1062,7 @@ mod tests {
         push(1004); // not occupied
         let mut list = FrameList::default();
         let mut seen = std::collections::HashSet::new();
-        drain_with(&a, 1, &mut list, &mut |k| seen.insert(*k), true);
+        drain_with(&a, 1, &mut list, &mut |k| seen.insert(*k), true, true);
         let st = DRAIN.lock().unwrap().as_ref().map(|d| (d.stats.clone(), d.queue.len(), d.tail));
         assert_eq!(list.ahead_geoms.len(), 2, "{st:?} head {}", HEAD.load(Ordering::Relaxed));
         assert_eq!(list.ahead_geoms[1].0.hash, 0xBB00);
@@ -909,7 +1072,7 @@ mod tests {
         assert!(rows[0].contains(&format!("{:#x}", drawable.as_ptr() as u64)));
         push(1005);
         let mut list = FrameList::default();
-        drain_with(&a, 2, &mut list, &mut |k| seen.insert(*k), true);
+        drain_with(&a, 2, &mut list, &mut |k| seen.insert(*k), true, true);
         assert!(list.ahead_geoms.is_empty(), "already sent: not offered again");
         let g = DRAIN.lock().unwrap();
         let s = &g.as_ref().unwrap().stats;
@@ -920,13 +1083,13 @@ mod tests {
         bits[0] |= 0b0001_0000;
         pool[8] = drawable.as_ptr() as u64;
         let mut list = FrameList::default();
-        drain_with(&a, 3, &mut list, &mut |k| seen.insert(*k), true);
+        drain_with(&a, 3, &mut list, &mut |k| seen.insert(*k), true, true);
         assert_eq!(DRAIN.lock().unwrap().as_ref().unwrap().stats.late, 1);
         // The unload of the object we resolved: its keys are dropped from the pass.
         let _ = xnw_world::geometry::take_evict();
         unload(drawable.as_ptr() as u64);
         let mut list = FrameList::default();
-        drain_with(&a, 4, &mut list, &mut |k| seen.insert(*k), true);
+        drain_with(&a, 4, &mut list, &mut |k| seen.insert(*k), true, true);
         let s = DRAIN.lock().unwrap().as_ref().unwrap().stats.clone();
         assert_eq!((s.unloads_ours, s.keys_dropped), (1, 2));
         let ev = xnw_world::geometry::take_evict();

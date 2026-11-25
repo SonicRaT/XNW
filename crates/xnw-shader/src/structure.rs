@@ -1,5 +1,6 @@
 // Ported from VIctory crates/victory-shader/src/structure.rs, commit d2a4bae1f49533ef5cb512fd1b1ba1513f2e1989, GPL-3.0-or-later.
 // With VIctory open pull requests (GPL-3.0-or-later) where they touch this file: (8ae232f, d112889), (4c9a922, db20637, 3e8f2d3), (815178d), (fa5189d), (ec337a0, spilled lane masks), #878 (permadiego 7ab94ab, s_bcnt1 SCC of a mask).
+// With DexNom-VIctory (GPL-3.0-or-later) 76749ce: a wave64 mask restored through s_mov_b32 copies.
 //! Control-flow structurisation (decision 0003): the program as one lane
 //! runs it, without EXEC.
 //!
@@ -782,6 +783,20 @@ impl<'a> Lanes<'a> {
         if let Some(&m) = self.other.get(&k) {
             return (m, false);
         }
+        // DexNom-VIctory (76749ce): a scalar pair can be parked in two VGPR
+        // lanes and restored one dword at a time; the spill pass turns these
+        // into scalar moves. Recover the original lane predicate only when
+        // the two words still come from the same known mask, in their
+        // original order.
+        if self.p.wave64 {
+            let source = (self.move_source(k.0), self.move_source(k.1));
+            if source != k
+                && let Some(&m) = self.masks.get(&source)
+            {
+                self.masks.insert(k, m);
+                return (m, true);
+            }
+        }
         let p = self.p;
         // VIctory (ec337a0): a pair restored from VGPR lanes holds
         // the mask spilled there.
@@ -828,6 +843,22 @@ impl<'a> Lanes<'a> {
         };
         cache.insert(k, m);
         (m, derived)
+    }
+
+    /// DexNom-VIctory (76749ce): the value a chain of `s_mov_b32` copies
+    /// started from.
+    fn move_source(&self, mut value: Value) -> Value {
+        while let Some(&(b, i)) = self.defs.get(&value) {
+            let inst = &self.p.blocks[b].insts[i];
+            let [(Reg::S(_), source)] = inst.reads.as_slice() else {
+                break;
+            };
+            if inst.name() != "s_mov_b32" {
+                break;
+            }
+            value = *source;
+        }
+        value
     }
 
     /// A mask joined by phis at a block entry, and whether a mask coming in
@@ -1379,6 +1410,33 @@ mod tests {
                 Some((Atom::Lane(lo), Bool::FALSE, Bool::TRUE)),
                 "{reader:#x}: vcc_hi was zeroed after the compare"
             );
+        }
+    }
+
+    /// DexNom-VIctory (76749ce) structure.rs test, verbatim.
+    #[test]
+    fn split_scalar_copies_across_a_branch_preserve_both_words_of_a_wave64_mask() {
+        for (high, intact) in [(0xBE83_036B, true), (0xBE83_036A, false)] {
+            let p = build(
+                &[
+                    0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                    0xBE84_046A, // s_mov_b64 s[4:5], vcc
+                    0xBF06_0100, // s_cmp_eq_u32 s0, s1
+                    0xBF85_0004, // s_cbranch_scc1 -> join at 32
+                    0xBE82_036A, // s_mov_b32 s2, vcc_lo
+                    high,        // s_mov_b32 s3, vcc_hi (or vcc_lo)
+                    0xBE84_0302, // s_mov_b32 s4, s2
+                    0xBE85_0303, // s_mov_b32 s5, s3
+                    0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+                    0x7E02_0280, // v_mov_b32 v1, 0
+                    S_ENDPGM,
+                ],
+                true,
+            );
+            let s = structure(&p).unwrap();
+            let compare = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
+            let restored = p.blocks[2].insts[0].write(Reg::S(EXEC)).unwrap();
+            assert_eq!(s.masks[&restored] == s.masks[&compare], intact);
         }
     }
 

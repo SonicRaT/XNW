@@ -68,6 +68,29 @@ const C_NOT_RESIDENT: usize = 2;
 const C_NOT_VIEW: usize = 3;
 const C_MISS: usize = 4;
 
+thread_local! {
+    /// This thread's outcome counts not yet added to [`COUNTS`], and how many.
+    static PENDING: std::cell::Cell<([u32; 4], u32)> = const { std::cell::Cell::new(([0; 4], 0)) };
+}
+
+/// One draw's outcome, added to [`COUNTS`] 256 draws at a time per thread
+/// (the shared counters, bumped per draw by every recording thread, were
+/// part of the hook's cost); the 60-frame line lags by at most 255 a thread.
+fn count(k: usize) {
+    PENDING.with(|p| {
+        let (mut a, mut n) = p.get();
+        a[k] += 1;
+        n += 1;
+        if n >= 256 {
+            for (i, v) in a.iter().enumerate().filter(|(_, v)| **v != 0) {
+                COUNTS[i].fetch_add(u64::from(*v), Ordering::Relaxed);
+            }
+            (a, n) = ([0; 4], 0);
+        }
+        p.set((a, n));
+    });
+}
+
 /// Counts since the last call, for the frame line: (found, no var, not
 /// resident, not a view, lookups).
 pub(crate) fn take_counts() -> [u64; 5] {
@@ -86,7 +109,15 @@ struct Entry {
 }
 
 const TABLE: usize = 4096;
-static KNOWN: Mutex<[Entry; TABLE]> = Mutex::new([Entry { shader: 0, fx: 0, var: NO_VAR, clip: false, layers: [NO_VAR; 4] }; TABLE]);
+const EMPTY: Entry = Entry { shader: 0, fx: 0, var: NO_VAR, clip: false, layers: [NO_VAR; 4] };
+static KNOWN: Mutex<[Entry; TABLE]> = Mutex::new([EMPTY; TABLE]);
+
+/// Per recording thread, direct-mapped, in front of [`KNOWN`] (made at the
+/// thread's first draw: other threads carry only the empty slot).
+const L1_N: usize = 1024;
+thread_local! {
+    static L1: std::cell::RefCell<Option<Box<[Entry; L1_N]>>> = const { std::cell::RefCell::new(None) };
+}
 
 /// Layer diffuse names, joaat [V hash of the name, I that these
 /// are the names the layered effects use]: lyr0..3diffusetex (lineage: 7d4f12e2
@@ -187,15 +218,28 @@ pub(crate) fn albedo(g: &TexGlobals, shader: u64) -> (u64, bool) {
     let Some(fx) = (unsafe { dread::<u64>(shader) }) else { return (0, false) };
     // Two ways per set (entries `s` and `s + 1`); a new entry goes to an
     // empty way, else first, the older one moving to the second.
-    let s = (((shader.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ fx).wrapping_mul(0xBF58_476D_1CE4_E5B9) >> 52) as usize % TABLE) & !1;
-    let known = KNOWN.lock().ok().and_then(|t| [t[s], t[s + 1]].into_iter().find(|e| e.shader == shader && e.fx == fx));
+    let h = (shader.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ fx).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    let s = ((h >> 52) as usize % TABLE) & !1;
+    // This thread's own copy first: the shared table's lock, taken per
+    // draw by every recording thread, cost 0.46 us a draw on five threads
+    // against 0.05 on one (albedo_cost_five_threads).
+    let l1 = (h >> 40) as usize & (L1_N - 1);
+    let mine = L1.with(|c| c.borrow().as_ref().map(|t| t[l1]).filter(|e| e.shader == shader && e.fx == fx));
+    let known = mine.or_else(|| {
+        let e = KNOWN.lock().ok().and_then(|t| [t[s], t[s + 1]].into_iter().find(|e| e.shader == shader && e.fx == fx));
+        if let Some(e) = e {
+            L1.with(|c| c.borrow_mut().get_or_insert_with(|| Box::new([EMPTY; L1_N]))[l1] = e);
+        }
+        e
+    });
     let (var, clip, layers) = match known {
         Some(e) => (e.var, e.clip, e.layers),
         None => {
             COUNTS[C_MISS].fetch_add(1, Ordering::Relaxed);
             let (var, clip, layers) = lookup(fx);
+            let e = Entry { shader, fx, var, clip, layers };
+            L1.with(|c| c.borrow_mut().get_or_insert_with(|| Box::new([EMPTY; L1_N]))[l1] = e);
             if let Ok(mut t) = KNOWN.lock() {
-                let e = Entry { shader, fx, var, clip, layers };
                 if t[s].shader == 0 {
                     t[s] = e;
                 } else if t[s + 1].shader == 0 {
@@ -211,7 +255,7 @@ pub(crate) fn albedo(g: &TexGlobals, shader: u64) -> (u64, bool) {
     // The layers' slots (direct reads, as for the albedo below).
     LAYERS.with(|c| c.set(if layers[0] == NO_VAR && layers[1] == NO_VAR { [0; 4] } else { layers.map(|l| if l == NO_VAR { 0 } else { slot_of(g, shader, l).unwrap_or(0) }) }));
     if var == NO_VAR {
-        COUNTS[C_NO_VAR].fetch_add(1, Ordering::Relaxed);
+        count(C_NO_VAR);
         WHY.with(|w| w.set(1));
         return (0, clip);
     }
@@ -231,18 +275,18 @@ pub(crate) fn albedo(g: &TexGlobals, shader: u64) -> (u64, bool) {
         }
     };
     if view == 0 {
-        COUNTS[C_NOT_RESIDENT].fetch_add(1, Ordering::Relaxed);
+        count(C_NOT_RESIDENT);
         WHY.with(|w| w.set(2));
         return (0, clip);
     }
     // SAFETY: the view this draw binds.
     let (vt, slot) = unsafe { (dread::<u64>(view), dread::<u64>(view.wrapping_add(0x18))) };
     if vt != Some(g.view_vtbl) || g.view_vtbl == 0 {
-        COUNTS[C_NOT_VIEW].fetch_add(1, Ordering::Relaxed);
+        count(C_NOT_VIEW);
         WHY.with(|w| w.set(3));
         return (0, clip);
     }
-    COUNTS[C_FOUND].fetch_add(1, Ordering::Relaxed);
+    count(C_FOUND);
     WHY.with(|w| w.set(0));
     (slot.unwrap_or(0), clip)
 }
@@ -391,5 +435,41 @@ mod tests {
         eprintln!("albedo slot: 5,000 draws in {best:.3} ms ({:.3} us/draw), {misses} table misses in 25,000 (other tests count too)", best * 1000.0 / 5000.0);
         assert!(best < 2.0, "{best} ms");
         assert!(misses < 2_500, "{misses} misses: the table thrashes");
+    }
+
+    /// The hook's case: five title threads at once over the same 500
+    /// shaders (1,200 draws each, after a warm pass), time summed over the threads. Best of five.
+    #[test]
+    fn albedo_cost_five_threads() {
+        let worlds: &Vec<World> = Box::leak(Box::new((0..500).map(|_| world("normal_spec", 0xC8E8_C282, 0)).collect()));
+        let gl = g(&worlds[0]);
+        for w in worlds {
+            albedo(&gl, w.shader.as_ptr() as u64);
+        }
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let ns: u64 = std::thread::scope(|sc| {
+                let hs: Vec<_> = (0..5usize)
+                    .map(|k| {
+                        sc.spawn(move || {
+                            // A long-lived title thread: its own copies warm.
+                            for w in worlds {
+                                albedo(&gl, w.shader.as_ptr() as u64);
+                            }
+                            let t0 = std::time::Instant::now();
+                            let mut found = 0;
+                            for i in 0..1200 {
+                                found += usize::from(albedo(&gl, worlds[(k * 97 + i) % 500].shader.as_ptr() as u64).0 != 0);
+                            }
+                            assert_eq!(found, 1200);
+                            t0.elapsed().as_nanos() as u64
+                        })
+                    })
+                    .collect();
+                hs.into_iter().map(|h| h.join().unwrap()).sum()
+            });
+            best = best.min(ns as f64 / 1e6);
+        }
+        eprintln!("albedo slot, 5 threads x 1,200 draws: {best:.3} ms summed ({:.3} us/draw)", best * 1000.0 / 6000.0);
     }
 }

@@ -9,6 +9,8 @@ publish.workspace = true
 [dependencies]
 xnw-core.workspace = true
 xnw-gpu.workspace = true
+# Descriptor view kinds of the bridged rows' sources (bridged.rs).
+xnw-formats.workspace = true
 # Translated title programs in the bridge and the pre-skin (bridge.rs, preskin.rs); `host` as xnw-gpu has it (one copy).
 xnw-shader = { workspace = true, features = ["host"] }
 

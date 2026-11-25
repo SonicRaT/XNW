@@ -1046,8 +1046,16 @@ fn writable(at: usize) -> bool {
 mod tests {
     use super::*;
 
+    /// The guards, traps, journal and fault handler are the process's and
+    /// cargo runs tests on parallel threads: one test at a time.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static ONE: Mutex<()> = Mutex::new(());
+        ONE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn written_pages_are_reported_to_every_asker() {
+        let _serial = serial();
         // SAFETY: a fresh write-watched allocation, freed at the end.
         let p = unsafe { win::VirtualAlloc(std::ptr::null(), 4 * PAGE, win::MEM_RESERVE | win::MEM_COMMIT | win::MEM_WRITE_WATCH, win::PAGE_READWRITE) } as usize;
         assert_ne!(p, 0);
@@ -1076,6 +1084,7 @@ mod tests {
 
     #[test]
     fn gaps_and_sweeps_keep_ranges_disjoint() {
+        let _serial = serial();
         let mut s = Vec::new();
         assert_eq!(gaps(&s, 0, 10), [(0, 10)]);
         sweep_in(&mut s, 4, 6);
@@ -1117,6 +1126,7 @@ mod tests {
     /// the outer asking found; after the sweep the kernel is asked as before.
     #[test]
     fn a_sweep_shares_the_kernels_answer_with_nested_ranges() {
+        let _serial = serial();
         let p = watched(4);
         // SAFETY: committed pages of ours.
         unsafe { ((p + 2 * PAGE) as *mut u8).write(1) };
@@ -1139,6 +1149,7 @@ mod tests {
     /// seen by the next asking in the same sweep.
     #[test]
     fn a_sweep_asks_again_after_its_own_write() {
+        let _serial = serial();
         let p = watched(2);
         let sweep = Sweep::begin();
         let (_, before) = writes(p, p + 2 * PAGE, false).expect("watched");
@@ -1175,6 +1186,7 @@ mod tests {
     /// lands and the block counts as written.
     #[test]
     fn kernel_reads_into_guarded_blocks_after_opening() {
+        let _serial = serial();
         use std::io::{Read, Seek, Write};
         let view = view(2);
         assert!(guard(view, view + 2 * BLOCK).is_some()); // now read-only
@@ -1206,6 +1218,7 @@ mod tests {
     /// write at the GPU address, and pages come back at the GPU address.
     #[test]
     fn the_gpu_view_of_the_pair_is_watched_at_the_cpu_view() {
+        let _serial = serial();
         // Two views of one section standing in for the reservation (only
         // this test sets the pair; it clears it at the end).
         // SAFETY: plain section creation and two mappings of it.
@@ -1251,6 +1264,7 @@ mod tests {
     /// trap stays (read-only again after the read, opened by the write).
     #[test]
     fn traps_note_reads_and_writes_and_compose_with_guards() {
+        let _serial = serial();
         let tag = 0x4000 + std::process::id() % 0x1000;
         let view = view(2);
         // SAFETY: our view.
@@ -1295,8 +1309,9 @@ mod tests {
     /// thread does it holding a lock, as the submission lock is held by our
     /// own reads at submission.
     #[test]
-    #[ignore = "kills the test process (0xc0000005) in about 60 % of runs, alone or with the rest (CI on 5347589): an AV inside the nested fill/handler path; run with --ignored to reproduce; needs its owner"]
+    #[ignore = "kills the test process (0xc0000005) in about 40-60 % of runs even with the watch tests serialised (so not shared state): an AV inside the nested fill/handler path; run with --ignored to reproduce; needs its owner"]
     fn crossed_fills_do_not_wait_on_each_other() {
+        let _serial = serial();
         // Below the roles' tags (0x10000 on) and the texture bypass's (0x1000-0x1FFF).
         const TAGS: std::ops::Range<u32> = 0x2000..0x2002;
         static BLOCKS: std::sync::OnceLock<[usize; 2]> = std::sync::OnceLock::new();
@@ -1349,6 +1364,7 @@ mod tests {
     /// our own read runs it too.
     #[test]
     fn trap_callbacks_fill_before_the_access() {
+        let _serial = serial();
         // Below the roles' tags (0x10000 on) and the texture bypass's (0x1000-0x1FFF).
         const TAGS: std::ops::Range<u32> = 0x3000..0x3100;
         fn fill(_tag: u32, address: usize, len: usize) {
@@ -1377,6 +1393,7 @@ mod tests {
     /// written at every asking.
     #[test]
     fn blocks_written_every_frame_stay_unguarded() {
+        let _serial = serial();
         let view = view(1);
         for _ in 0..HOT_AFTER + 1 {
             super::super::queue::pass_frame();
@@ -1403,6 +1420,7 @@ mod tests {
     /// to overflow. Up there no test has guarded blocks.
     #[test]
     fn ranges_past_the_address_space_end_do_not_overflow() {
+        let _serial = serial();
         let top = usize::MAX - 16;
         writing(top, PAGE);
         title_memory_remapped(top, usize::MAX);

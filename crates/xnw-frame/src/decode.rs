@@ -333,7 +333,69 @@ pub fn transform(m: &[f32], p: [f32; 3]) -> [f32; 3] {
 
 /// The meshlets of a blob as vertex-buffer indices, three per live
 /// triangle (the layout `decode_meshlets` reads; culled triangles left out).
+/// A meshlet whose triangle words and vertex indices lie inside the blob is
+/// expanded from slices; any other takes the read-by-read path
+/// (`expand_meshlets_checked`), which fails at the first read past the blob.
 pub fn expand_meshlets(blob: &[u8]) -> Result<Vec<u32>, String> {
+    let rd = |at: usize| blob.get(at..at + 4).map(|s| u32::from_le_bytes(s.try_into().unwrap())).ok_or_else(|| format!("meshlet data: read at {at:#x} past {:#x}", blob.len()));
+    let count = rd(0)? & 0x1_FFFF;
+    let prims = rd(4)? as usize;
+    let prim_base = 12 + 16 * count as usize;
+    let index_base = prim_base + 4 * prims;
+    let mut out = Vec::with_capacity(3 * prims.min(blob.len() / 4));
+    for k in 0..count as usize {
+        let (h0, h1) = (rd(12 + 16 * k)?, rd(16 + 16 * k)?);
+        let nv = (h0 & 0x7F) + 1;
+        let np = (h0 >> 7 & 0x7F) + 1;
+        let first_v = (h1 & 0xFFFF | (h0 >> 14 & 1) << 16) as usize;
+        let first_p = (h1 >> 16 | (h0 >> 15 & 1) << 16) as usize;
+        let words = blob.get(prim_base + 4 * first_p..prim_base + 4 * (first_p + np as usize));
+        let verts = blob.get(index_base + 2 * first_v..index_base + 2 * (first_v + nv as usize));
+        if let (Some(words), Some(verts)) = (words, verts) {
+            // The meshlet's vertex indices widened once (at most 128).
+            let mut v = [0u32; 128];
+            for (d, s) in v.iter_mut().zip(verts.chunks_exact(2)) {
+                *d = u32::from(u16::from_le_bytes([s[0], s[1]]));
+            }
+            for w in words.chunks_exact(4) {
+                let w = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+                let (a, b, c) = (w & 0x7F, w >> 7 & 0x7F, w >> 14 & 0x7F);
+                if a.max(b).max(c) >= nv {
+                    continue;
+                }
+                out.push(v[a as usize]);
+                out.push(v[b as usize]);
+                out.push(v[c as usize]);
+            }
+        } else {
+            meshlet_checked(blob, k, (nv, np, first_v, first_p), (prim_base, index_base), &mut out)?;
+        }
+    }
+    Ok(out)
+}
+
+/// One meshlet read by read (the reference): an error at the first read past the blob.
+fn meshlet_checked(blob: &[u8], k: usize, (nv, np, first_v, first_p): (u32, u32, usize, usize), (prim_base, index_base): (usize, usize), out: &mut Vec<u32>) -> Result<(), String> {
+    let rd = |at: usize| blob.get(at..at + 4).map(|s| u32::from_le_bytes(s.try_into().unwrap())).ok_or_else(|| format!("meshlet data: read at {at:#x} past {:#x}", blob.len()));
+    let local = |i: u32| -> Result<u32, String> {
+        let at = index_base + 2 * (first_v + i as usize);
+        blob.get(at..at + 2).map(|s| u32::from(u16::from_le_bytes(s.try_into().unwrap()))).ok_or_else(|| format!("meshlet {k}: vertex index at {at:#x} past {:#x}", blob.len()))
+    };
+    for p in 0..np as usize {
+        let w = rd(prim_base + 4 * (first_p + p))?;
+        let i = [w & 0x7F, w >> 7 & 0x7F, w >> 14 & 0x7F];
+        if i.iter().any(|i| *i >= nv) {
+            continue;
+        }
+        for x in i {
+            out.push(local(x)?);
+        }
+    }
+    Ok(())
+}
+
+/// The reference expansion, read by read (tests: the fast path equals it).
+pub fn expand_meshlets_checked(blob: &[u8]) -> Result<Vec<u32>, String> {
     let rd = |at: usize| blob.get(at..at + 4).map(|s| u32::from_le_bytes(s.try_into().unwrap())).ok_or_else(|| format!("meshlet data: read at {at:#x} past {:#x}", blob.len()));
     let count = rd(0)? & 0x1_FFFF;
     let prims = rd(4)? as usize;
@@ -346,20 +408,7 @@ pub fn expand_meshlets(blob: &[u8]) -> Result<Vec<u32>, String> {
         let np = (h0 >> 7 & 0x7F) + 1;
         let first_v = (h1 & 0xFFFF | (h0 >> 14 & 1) << 16) as usize;
         let first_p = (h1 >> 16 | (h0 >> 15 & 1) << 16) as usize;
-        let local = |i: u32| -> Result<u32, String> {
-            let at = index_base + 2 * (first_v + i as usize);
-            blob.get(at..at + 2).map(|s| u32::from(u16::from_le_bytes(s.try_into().unwrap()))).ok_or_else(|| format!("meshlet {k}: vertex index at {at:#x} past {:#x}", blob.len()))
-        };
-        for p in 0..np as usize {
-            let w = rd(prim_base + 4 * (first_p + p))?;
-            let i = [w & 0x7F, w >> 7 & 0x7F, w >> 14 & 0x7F];
-            if i.iter().any(|i| *i >= nv) {
-                continue;
-            }
-            for x in i {
-                out.push(local(x)?);
-            }
-        }
+        meshlet_checked(blob, k, (nv, np, first_v, first_p), (prim_base, index_base), &mut out)?;
     }
     Ok(out)
 }
@@ -368,4 +417,50 @@ pub fn expand_meshlets(blob: &[u8]) -> Result<Vec<u32>, String> {
 pub fn max_meshlet_vertices(blob: &[u8]) -> u32 {
     let count = blob.get(0..4).map_or(0, |s| u32::from_le_bytes(s.try_into().unwrap()) & 0x1_FFFF) as usize;
     (0..count).filter_map(|k| blob.get(12 + 16 * k..16 + 16 * k)).map(|s| (u32::from_le_bytes(s.try_into().unwrap()) & 0x7F) + 1).max().unwrap_or(0)
+}
+
+#[cfg(test)]
+mod meshlet_tests {
+    use super::*;
+
+    /// The slice path gives what the read-by-read path gives (indices or the
+    /// same error) on random meshlet blobs, whole and cut short.
+    #[test]
+    fn fast_expansion_equals_checked() {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let (mut ok, mut err) = (0, 0);
+        for _ in 0..400 {
+            let count = (rnd() % 6 + 1) as u32;
+            let prims = (rnd() % 300) as u32;
+            let mut b = Vec::new();
+            for w in [count | (rnd() as u32 & 0xFFFE_0000), prims, 0] {
+                b.extend_from_slice(&w.to_le_bytes());
+            }
+            for _ in 0..count {
+                let (h0, h1) = (rnd() as u32 & 0x3FFF, (rnd() % 20) as u32 | ((rnd() % 20) as u32) << 16);
+                for w in [h0, h1, 0, 0] {
+                    b.extend_from_slice(&w.to_le_bytes());
+                }
+            }
+            for _ in 0..prims {
+                b.extend_from_slice(&(rnd() as u32 & 0x1F_FFFF).to_le_bytes());
+            }
+            for _ in 0..(rnd() % 600 + 200) {
+                b.extend_from_slice(&(rnd() as u16).to_le_bytes());
+            }
+            for cut in [b.len(), b.len() * 3 / 4, b.len() / 2, 13] {
+                let blob = &b[..cut.min(b.len())];
+                let (f, c) = (expand_meshlets(blob), expand_meshlets_checked(blob));
+                if c.is_ok() { ok += 1 } else { err += 1 }
+                assert_eq!(f, c);
+            }
+        }
+        assert!(ok > 50 && err > 50, "both outcomes covered: {ok} ok, {err} errors");
+    }
 }

@@ -232,12 +232,19 @@ fn start_log(m: u8) {
 mod tests {
     use super::*;
 
+    /// `describe` only try-locks REGIONS: tests that hold or take it run one at a time.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static ONE: Mutex<()> = Mutex::new(());
+        ONE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Every guarded block is at least 16-aligned (the title loads our
     /// pipeline with `vmovaps` at +0x10), whatever its size and asked
     /// alignment; the slack before the guard is the canary, and a slack
     /// write is found.
     #[test]
     fn guarded_blocks_are_16_aligned() {
+        let _serial = serial();
         for (size, align) in [(0x38, 8), (1, 1), (0x560 + 1024 + 200, 8), (40, 0x100), (4096, 16), (4095, 4), (24, 64)] {
             let at = alloc_any("test", size, align).expect("a guarded block");
             assert!((at as usize).is_multiple_of(align.max(MIN_ALIGN)), "{size} bytes aligned {align}: {at:p}");
@@ -265,6 +272,7 @@ mod tests {
     /// object and the offset).
     #[test]
     fn a_one_byte_overrun_is_on_the_guard() {
+        let _serial = serial();
         // The guard is off in tests: regions are made by hand.
         let body = 200;
         let len = 3 * PAGE;

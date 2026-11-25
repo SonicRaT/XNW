@@ -110,6 +110,10 @@ mod skinhook;
 mod preskin;
 /// The imposter submits' live reads (`imposters=on`).
 mod imposter;
+/// The bridged rows' live reads (`bridgeps=on|<hashes>`).
+mod bridgeps;
+/// The list's geometry reads (`geomcopy=direct`, `geomasync=on`).
+mod geomread;
 
 // ---- configuration ----
 
@@ -143,12 +147,16 @@ struct Config {
     skinlog: usize,
     /// `pack=2`: the frame pack v2 in seq frames.
     pack: bool,
+    /// `scan=exit`: scan.txt from the scene scan's records at the exit of
+    /// the compaction 0x14547BE70 (its wrapper 0x140B5F960 calls it from
+    /// our hook), not at the drain's entry, which can race the next scan.
+    scan_exit: bool,
 }
 
 fn parse(v: &str) -> Result<Config, String> {
     let mut parts = v.split(',').map(str::trim);
     let dir = parts.next().filter(|d| !d.is_empty()).ok_or("no directory")?;
-    let mut c = Config { dir: PathBuf::from(dir), frames: 3, max: 20_000, at: Vec::new(), raw: 0, render: false, seq: false, skinlog: 0, census: false, auto: None, auto_veh: 0, cut_present: false, pack: false };
+    let mut c = Config { dir: PathBuf::from(dir), frames: 3, max: 20_000, at: Vec::new(), raw: 0, render: false, seq: false, skinlog: 0, census: false, auto: None, auto_veh: 0, cut_present: false, pack: false, scan_exit: false };
     for p in parts {
         let (k, val) = p.split_once('=').ok_or_else(|| format!("`{p}`: key=value"))?;
         let n = |s: &str| s.trim().parse::<u64>().map_err(|_| format!("`{p}`: bad number"));
@@ -159,6 +167,11 @@ fn parse(v: &str) -> Result<Config, String> {
             "skinlog" => c.skinlog = n(val)? as usize,
             "census" => c.census = n(val)? != 0,
             "cut" => c.cut_present = val.trim() == "present",
+            "scan" => match val.trim() {
+                "exit" => c.scan_exit = true,
+                "drain" => c.scan_exit = false,
+                _ => return Err(format!("`{p}`: scan=exit or scan=drain")),
+            },
             "pack" => match n(val)? {
                 0 => c.pack = false,
                 2 => c.pack = true,
@@ -193,7 +206,7 @@ fn parse(v: &str) -> Result<Config, String> {
                 c.at = val.split('+').map(n).collect::<Result<_, _>>()?;
                 c.at.sort_unstable();
             }
-            _ => return Err(format!("`{p}`: unknown key (frames, max, at, seq, raw, skinlog, census, cut, pack)")),
+            _ => return Err(format!("`{p}`: unknown key (frames, max, at, seq, raw, skinlog, census, cut, pack, scan)")),
         }
     }
     Ok(c)
@@ -380,6 +393,9 @@ struct Draw {
     /// The draw's own record +0x54, read at the list sink from slot 0 of
     /// its T9 table (`preskin=on`, PreSkinD programs): the pre-skin join key.
     sink_range: Option<u32>,
+    /// `bridgeps`: the draw's binding inputs, read at its list sink when its
+    /// pixel program is a named one (`worldprobe/bridgeps.rs`).
+    bridged: Option<Box<xnw_world::bridged::Owned>>,
     /// The ped remap bases (record +0x74 current, +0x78 previous; -1: none).
     remap: [u32; 2],
     /// The ped skin record this draw's remap base came from (0x144E351B0
@@ -1675,9 +1691,16 @@ fn dcopy(addr: u64, len: usize) -> Option<Vec<u8>> {
     if !(0x1_0000..0x8000_0000_0000).contains(&addr) || addr.checked_add(len as u64)? > 0x8000_0000_0000 {
         return None;
     }
-    let mut v = vec![0u8; len];
-    // SAFETY: into our own buffer of `len` bytes.
-    unsafe { fcopy(v.as_mut_ptr(), addr as *const u8, len) }.then_some(v)
+    // Not zeroed first: the copy writes every byte (a second pass over
+    // 47 MiB of a cut frame's geometry otherwise).
+    let mut v = Vec::<u8>::with_capacity(len);
+    // SAFETY: into our own buffer's `len` bytes of capacity; the length is
+    // set only after the copy wrote them all.
+    unsafe { fcopy(v.as_mut_ptr(), addr as *const u8, len) }.then(|| {
+        // SAFETY: as above.
+        unsafe { v.set_len(len) };
+        v
+    })
 }
 
 // The hook's reads of title objects (direct, no syscall) with a fault
@@ -1879,7 +1902,29 @@ fn drain_mark(kind: u8, frame: usize) {
 
 extern "system" fn on_drain(frame: usize, _id: usize) {
     drain_mark(1, frame);
+    if !COMPACT_HOOKED.load(Ordering::Relaxed) {
+        scan_snapshot();
+    }
+}
+
+/// `scan=exit`: the compaction's wrapper (sub rsp,28h; call 0x14547BE70;
+/// mov al,1; add rsp,28h; ret [V exe bytes]) and the compaction.
+const COMPACT_WRAPPER: usize = 0x1_40B5_F960;
+const COMPACT_WRAPPER_BYTES: [u8; 16] = [0x48, 0x83, 0xEC, 0x28, 0xE8, 0x07, 0xC5, 0x91, 0x04, 0xB0, 0x01, 0x48, 0x83, 0xC4, 0x28, 0xC3];
+const COMPACT: usize = 0x1_4547_BE70;
+static COMPACT_AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static COMPACT_HOOKED: AtomicBool = AtomicBool::new(false);
+
+/// In place of the wrapper: the compaction, then the scan snapshot of
+/// the records it left; returns the wrapper's 1 (its caller gets it in al).
+extern "system" fn on_compaction(_frame: usize, _id: usize) -> u64 {
+    let at = COMPACT_AT.load(Ordering::Relaxed);
+    // SAFETY: the title's compaction, which takes no arguments (the
+    // wrapper sets none [V exe bytes]; the caller takes none [I]).
+    let compact = unsafe { std::mem::transmute::<usize, extern "system" fn()>(at) };
+    compact();
     scan_snapshot();
+    1
 }
 
 /// The scene scan's visible records (32 B each at 0x14940BFF0, count
@@ -1909,6 +1954,8 @@ fn scan_snapshot() {
         })
         .collect();
     if let Ok(mut q) = SCANS.lock() {
+        // Several scans of one frame id: the last one stands.
+        q.retain(|(g, _)| *g != f);
         if q.len() >= 512 {
             q.pop_front();
         }
@@ -1961,6 +2008,36 @@ fn attach_wheel(w: skinhook::WheelInst) -> bool {
     }
 }
 
+/// `bridgeps`: this thread's last recorded draw's vertex stream and
+/// meshlet buffer (vb_at, vb_len, mesh_at), when it is the draw a sink
+/// belongs to (this frame's, and no hook since).
+fn last_draw_streams() -> Option<(u64, u64, u64)> {
+    let s = STATE.get()?;
+    let slot = s.slot();
+    let g = slot.lock().ok()?;
+    let c = g.as_ref().filter(|c| c.frame == frame_key())?;
+    c.draws.last().filter(|d| d.hook_n == c.seen).map(|d| (d.vb_at, d.vb_len, d.mesh_at))
+}
+
+/// `bridgeps`: gives a draw's binding inputs to this thread's last
+/// recorded draw (as [`attach_sink_range`]). False: no such draw.
+fn attach_bridged(o: Box<xnw_world::bridged::Owned>) -> bool {
+    let Some(s) = STATE.get() else { return false };
+    let slot = s.slot();
+    let Ok(mut g) = slot.lock() else { return false };
+    let now = frame_key();
+    match g.as_mut() {
+        Some(c) if c.frame == now => match c.draws.last_mut() {
+            Some(d) if d.hook_n == c.seen => {
+                d.bridged = Some(o);
+                true
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// `preskin=on`: gives a PreSkinD draw's own range word (its sink record
 /// +0x54) to this thread's last recorded draw, when that is the draw the
 /// sink belongs to (this frame's, and no hook since). False: no such draw.
@@ -1982,19 +2059,24 @@ fn attach_sink_range(word: u32) -> bool {
 }
 
 /// The list sink's draw consumers (`tap::set_draw_tap` takes one): the
-/// instanced wheels (`skinrules` bit 8) and the PreSkinD records (`preskin=on`).
+/// instanced wheels (`skinrules` bit 8), the PreSkinD records (`preskin=on`)
+/// and the bridged rows (`bridgeps`).
 static SINK_WHEELS: AtomicBool = AtomicBool::new(false);
 static SINK_PRESKIN: AtomicBool = AtomicBool::new(false);
+static SINK_BRIDGE: AtomicBool = AtomicBool::new(false);
 
 fn sink_want(pipeline: usize) -> bool {
-    (SINK_WHEELS.load(Ordering::Relaxed) && skinhook::wheel_want(pipeline)) || (SINK_PRESKIN.load(Ordering::Relaxed) && preskin::draw_want(pipeline))
+    (SINK_WHEELS.load(Ordering::Relaxed) && skinhook::wheel_want(pipeline)) || (SINK_PRESKIN.load(Ordering::Relaxed) && preskin::draw_want(pipeline)) || (SINK_BRIDGE.load(Ordering::Relaxed) && bridgeps::draw_want(pipeline))
 }
 
 fn on_sink(d: &xnw_gpu::d3d12x::tap::TapDraw) {
     if SINK_WHEELS.load(Ordering::Relaxed) && skinhook::wheel_want(d.pipeline) {
         skinhook::on_wheel_sink(d);
-    } else if SINK_PRESKIN.load(Ordering::Relaxed) {
+    } else if SINK_PRESKIN.load(Ordering::Relaxed) && preskin::draw_want(d.pipeline) {
         preskin::on_draw_sink(d);
+    }
+    if SINK_BRIDGE.load(Ordering::Relaxed) && bridgeps::draw_want(d.pipeline) {
+        bridgeps::on_draw_sink(d);
     }
 }
 
@@ -2003,7 +2085,7 @@ static HOOK_FAULTS: AtomicU64 = AtomicU64::new(0);
 
 /// The reader whose copy faulted (the thread's site at the fault), and the
 /// last faulting address: says which reads fault and when.
-pub(crate) const FAULT_SITES: [&str; 8] = ["draw hook", "bones and masks", "vehicle wheels", "imposters", "pre-skin streams", "pre-skin hide mask", "pre-skin delta", "pre-skin face"];
+pub(crate) const FAULT_SITES: [&str; 9] = ["draw hook", "bones and masks", "vehicle wheels", "imposters", "pre-skin streams", "pre-skin hide mask", "pre-skin delta", "pre-skin face", "bridged rows"];
 pub(crate) const SITE_BONES: u8 = 1;
 pub(crate) const SITE_WHEELS: u8 = 2;
 pub(crate) const SITE_IMPOSTERS: u8 = 3;
@@ -2014,7 +2096,9 @@ pub(crate) const SITE_PRESKIN_MASK: u8 = 5;
 pub(crate) const SITE_PRESKIN_DELTA: u8 = 6;
 /// Variant 11's face table header.
 pub(crate) const SITE_PRESKIN_FACE: u8 = 7;
-static FAULTS_BY: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// The bridged rows' reads (`bridgeps`).
+pub(crate) const SITE_BRIDGE: u8 = 8;
+static FAULTS_BY: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 static FAULT_LAST: AtomicU64 = AtomicU64::new(0);
 thread_local! {
     static FAULT_SITE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
@@ -3619,7 +3703,7 @@ fn albedo(tex_at: u64, effect: u64) -> Albedo {
 /// pass's shader), one record per draw with a transform, the frame's
 /// palettes; published for the presenter or anyone taking lists.
 fn render_frame(c: Capture, cache: &mut xnw_world::GeometryCache<()>, dump: Option<&std::path::Path>) {
-    use xnw_world::{HostGeometry, NO_PALETTE};
+    use xnw_world::NO_PALETTE;
     let t0 = Instant::now();
     let mut list = FrameList { frame: c.frame, cameras: c.cameras.iter().map(|(v, k)| RCamera { viewport: *v, view: k.view, proj: k.proj }).collect(), ..Default::default() };
     // The timecycle block (render copy, 0x16C0 B): the sun.
@@ -3643,84 +3727,28 @@ fn render_frame(c: Capture, cache: &mut xnw_world::GeometryCache<()>, dump: Opti
     if imposter::on() {
         list.imposters = imposter::take(c.frame);
     }
-    let mut copied = 0u64;
-    let mut failed = 0;
-    let mut not_ready = 0u32;
     let skinlog = STATE.get().is_some_and(|s| s.cfg.skinlog > 0);
+    // The slow-frame line's parts before the draw loop: the frame state
+    // reads above, the new geometries' reads, the drains of the ahead rings.
+    let state_ms = t0.elapsed().as_secs_f64() * 1e3;
+    let tg = Instant::now();
     // Why a hooked draw gets no list row, per draw (SKIP_NAMES; 0 listed),
     // and per geometry why it is not in the cache.
     let mut skip = vec![SKIP_LISTED; c.draws.len()];
     let mut geom_why: HashMap<GeomKey, u8> = HashMap::new();
-    for d in &c.draws {
-        let key = key_of(d);
-        if key.vb_at == 0 || key.mesh_at == 0 {
-            geom_why.insert(key, SKIP_NO_BUFFERS);
-            continue;
-        }
-        // The pass says what it lacks; a geometry it holds, has
-        // queued or was just sent is not copied again (one dropped or failed
-        // there is asked for again).
-        if !xnw_world::geometry::known().wants(&key, c.frame) {
-            cache.get_or_make(key, c.frame, || Some(()));
-            continue;
-        }
-        let vb = bytes(key.vb_at, key.vb_len.min(64 << 20) as usize);
-        // A vertex buffer the title has not filled yet [V] (no stream
-        // table) is not taken: not cached, asked for again on a later frame
-        // (at most NOT_READY_RETRIES reads a frame).
-        if vb.as_deref().is_some_and(|b| !vb_ready(b)) {
-            not_ready += 1;
-            geom_why.insert(key, SKIP_VB_NOT_READY);
-            xnw_world::geometry::known().not_sent(&key);
-            continue;
-        }
-        if not_ready >= NOT_READY_RETRIES {
-            geom_why.insert(key, SKIP_RETRY_CAP);
-            xnw_world::geometry::known().not_sent(&key);
-            continue;
-        }
-        let vb_read = vb.is_some();
-        let geometry = vb.and_then(|vb| {
-            let indices = if key.mesh_len != 0 {
-                expand_meshlets(&bytes(key.mesh_at, key.mesh_len.min(16 << 20) as usize)?).ok()?
-            } else {
-                let (n, elem) = ((key.ib >> 8).min(3 << 20) as usize, (key.ib & 0xFF) as usize);
-                let ib = bytes(key.mesh_at, n * elem)?;
-                match elem {
-                    2 => ib.chunks_exact(2).map(|c| u32::from(u16::from_le_bytes([c[0], c[1]]))).collect(),
-                    4 => ib.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect(),
-                    _ => return None,
-                }
-            };
-            Some(HostGeometry { vertices: Vec::new(), indices, raw_vb: Some(vb) })
-        });
-        match geometry {
-            Some(g) => {
-                if skinlog
-                    && let Some(vb) = &g.raw_vb
-                    && let Ok(mut m) = BONES.lock()
-                {
-                    m.get_or_insert_with(HashMap::new).insert(key, bones_used(vb, &g.indices));
-                }
-                copied += (g.raw_vb.as_ref().map_or(0, Vec::len) + 4 * g.indices.len()) as u64;
-                cache.get_or_make(key, c.frame, || Some(()));
-                list.new_geoms.push((key, g));
-            }
-            None => {
-                failed += 1;
-                geom_why.insert(key, if vb_read { SKIP_INDICES } else { SKIP_UNREADABLE });
-                xnw_world::geometry::known().not_sent(&key);
-            }
-        }
-    }
+    let taken = geomread::take(&c.draws, c.frame, cache, &mut list.new_geoms, &mut geom_why, skinlog, geomread::asynchronous() && dump.is_none(), geomread::direct());
+    let (copied, failed, not_ready) = (taken.copied, taken.failed, taken.not_ready);
     // Drawables placed by the streamer since the last frame: their
     // geometries offered ahead of any draw (worldahead.rs).
+    let geom_ms = tg.elapsed().as_secs_f64() * 1e3;
+    let ta = Instant::now();
     if crate::worldahead::enabled() {
         crate::worldahead::drain(c.frame, &mut list, &mut |k| xnw_world::geometry::known().wants(k, c.frame));
         crate::worldahead::drain_events(c.frame);
         let cam = list.main_camera().map(|c| xnw_world::camera_position(&c.view));
         crate::worldahead::drain_attaches(c.frame, cam);
     }
+    let ahead_ms = ta.elapsed().as_secs_f64() * 1e3;
     // The frame's skinned spans, copied as one window of the
     // title's ring buffer (or span by span); each draw's bones are rebased to it.
     let skin = STATE.get().map(|s| skin_copy_live(s, &c.draws)).unwrap_or_default();
@@ -4048,14 +4076,20 @@ fn render_frame(c: Capture, cache: &mut xnw_world::GeometryCache<()>, dump: Opti
     let parts = c.parts;
     if hook_ms > 50.0 || list_ms > 50.0 {
         xnw_core::warn!(
-            "world render: slow frame {}: hook {hook_ms:.1} ms on the title's threads ({} draws, {} new geometries read), list {list_ms:.1} ms off them ({} new geometries copied, {} KiB; skin {:.1} ms; instances {inst_ms:.1} ms)",
+            "world render: slow frame {}: hook {hook_ms:.1} ms on the title's threads ({} draws, {} new geometries read), list {list_ms:.1} ms off them ({} new geometries copied, {} KiB; skin {:.1} ms; instances {inst_ms:.1} ms; frame state {state_ms:.1} ms, geometry reads {geom_ms:.1} ms ({}{}), ahead drains {ahead_ms:.1} ms)",
             c.frame,
             c.draws.len(),
             c.geom_misses,
             list.new_geoms.len(),
             copied >> 10,
-            skin.ms
+            skin.ms,
+            taken.parts.line(),
+            if taken.sent + taken.arrived > 0 { format!("; reader: sent {}, arrived {}, waited {} frames at most", taken.sent, taken.arrived, taken.waited) } else { String::new() }
         );
+    }
+    if geomread::asynchronous() && c.frame % 60 == 0 {
+        let (p, flight) = geomread::stats();
+        xnw_core::info!("world render: frame {}: geometry reader (60 frames): {}; in flight {flight}", c.frame, p.line());
     }
     // Main-view keys hooked but given no row (ours vs the title's drops).
     let main_vps = list.main_viewports();
@@ -4119,6 +4153,17 @@ fn render_frame(c: Capture, cache: &mut xnw_world::GeometryCache<()>, dump: Opti
                 let words: Vec<(Option<u32>, Option<u32>)> = (0..list.draws.len()).filter_map(draw_of).map(|d| (d.sink_range, d.range)).collect();
                 xnw_core::info!("{}", preskin::join_line(frame, &words, list.preskin.draws.len()));
             }
+        }
+        // `bridgeps`: the rows whose sinks were read, for the title's own programs in our pass.
+        if SINK_BRIDGE.load(Ordering::Relaxed) {
+            let rows: Vec<(u32, xnw_world::bridged::Owned)> = list_v1.iter().enumerate().filter_map(|(row, &i)| c.draws.get(i)?.bridged.as_deref().map(|o| (row as u32, o.clone()))).collect();
+            let (not_ready, unread) = bridgeps::take_counts();
+            let mut f = xnw_world::bridged::Frame::new(rows);
+            (f.not_ready, f.unread) = (not_ready, unread);
+            if frame % 60 == 0 {
+                xnw_core::info!("world render: frame {frame}: bridgeps reads: {} rows, {} KiB read from title memory since the last line", f.rows.len(), bridgeps::take_read_bytes() >> 10);
+            }
+            list.bridged = Some(std::sync::Arc::new(f));
         }
         // `preskinbits` bit 3: ped-flagged rows without a ped remap are props (after the join, which takes the flag).
         if preskin::bits() & xnw_world::preskin_gpu::BIT_PROPS != 0 {
@@ -4613,6 +4658,21 @@ struct Coherence {
     /// Missing-then-back draws whose key was hooked in the missing frame
     /// and skipped by us, per reason; the rest the title never hooked.
     ours: HashMap<u8, u32>,
+    /// Of `ours`, those whose main camera turned less than
+    /// [`STILL_TURN_DEG`] across the three lists: a prefilter drop that follows the
+    /// camera is a correct cull (the pass draws with the camera it tested); one
+    /// under a still camera is not (FLK3 replay: only LOD-pair swaps there).
+    ours_still: u32,
+    /// The main camera's forward axis in the last two lists (newest first).
+    fwd: [Option<[f32; 3]>; 2],
+}
+
+/// The largest main-camera turn, in degrees, that counts as a still camera.
+const STILL_TURN_DEG: f32 = 0.5;
+
+/// The angle in degrees between two unit axes.
+fn turn_deg(a: [f32; 3], b: [f32; 3]) -> f32 {
+    (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]).clamp(-1.0, 1.0).acos().to_degrees()
 }
 
 static COHERENCE: Mutex<Option<Coherence>> = Mutex::new(None);
@@ -4630,6 +4690,12 @@ fn coherence(list: &FrameList, skipped: HashMap<(u64, u32), u8>) {
     let start = *k.start.get_or_insert_with(Instant::now);
     let Some(cam) = list.main_camera() else { return };
     let origin = xnw_world::camera_position(&cam.view);
+    // The view's third column: the camera's depth axis in world space.
+    let fwd = [cam.view[2], cam.view[6], cam.view[10]];
+    let still = match k.fwd {
+        [Some(a), Some(b)] => turn_deg(b, a).max(turn_deg(a, fwd)) < STILL_TURN_DEG,
+        _ => false,
+    };
     let mut keys: HashMap<(u64, u32), u32> = HashMap::new();
     let mut inst_keys: std::collections::HashSet<(u64, u32)> = std::collections::HashSet::new();
     let mut statics: HashMap<(u64, [i32; 3]), [f32; 3]> = HashMap::new();
@@ -4662,6 +4728,7 @@ fn coherence(list: &FrameList, skipped: HashMap<(u64, u32), u8>) {
                     *k.by_class.entry((key.1, inst_keys.contains(key))).or_default() += m;
                     if let Some(r) = k.prev_skip.get(key) {
                         *k.ours.entry(*r).or_default() += m;
+                        k.ours_still += if still { m } else { 0 };
                     }
                 }
             }
@@ -4676,6 +4743,7 @@ fn coherence(list: &FrameList, skipped: HashMap<(u64, u32), u8>) {
     k.prev2 = old.map(|o| o.1);
     k.prev = Some((list.frame, keys, statics));
     k.prev_skip = skipped;
+    k.fwd = [Some(fwd), k.fwd[0]];
     k.frames += 1;
     if start.elapsed().as_secs_f64() >= 1.0 {
         k.residual.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -4698,21 +4766,22 @@ fn coherence(list: &FrameList, skipped: HashMap<(u64, u32), u8>) {
                 v.iter().take(4).map(|((s, i), n)| format!("stage {s}{} {n}", if *i { " instanced" } else { "" })).collect::<Vec<_>>().join(", ")
             },
             k.there_once,
-            ours_line(k.missing_back, &k.ours, late)
+            ours_line(k.missing_back, &k.ours, k.ours_still, late)
         );
-        *k = Coherence { prev: k.prev.take(), prev2: k.prev2.take(), prev_skip: std::mem::take(&mut k.prev_skip), start: Some(Instant::now()), ..Default::default() };
+        *k = Coherence { prev: k.prev.take(), prev2: k.prev2.take(), prev_skip: std::mem::take(&mut k.prev_skip), fwd: k.fwd, start: Some(Instant::now()), ..Default::default() };
     }
 }
 
 /// The coherence line's tail: of the missing-then-back draws, those
 /// hooked that frame but given no row by us (per reason), those the title
 /// never hooked; and the draws recorded after their frame's cut (dropped).
-fn ours_line(missing: u32, ours: &HashMap<u8, u32>, late: [u64; 2]) -> String {
+/// `still`: of ours, those under a still main camera.
+fn ours_line(missing: u32, ours: &HashMap<u8, u32>, still: u32, late: [u64; 2]) -> String {
     let n: u32 = ours.values().sum();
     let mut v: Vec<_> = ours.iter().collect();
     v.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
     let why = v.iter().take(4).map(|(r, c)| format!("{} {c}", SKIP_NAMES.get(**r as usize).unwrap_or(&"?"))).collect::<Vec<_>>().join(", ");
-    format!("missing-then-back hooked but not listed {n} ({why}), not hooked {}; late draws {} in {} captures (recorded after their frame's cut)", missing.saturating_sub(n), late[0], late[1])
+    format!("missing-then-back hooked but not listed {n} ({why}; camera still {still}), not hooked {}; late draws {} in {} captures (recorded after their frame's cut)", missing.saturating_sub(n), late[0], late[1])
 }
 
 /// Whether this frame's list is dumped.
@@ -4823,12 +4892,14 @@ pub unsafe fn start(base: usize) {
         }
     };
     crate::worldtex::set_globals(base);
-    let cfg_cut_present = cfg.cut_present;
+    let (cfg_cut_present, cfg_scan_exit) = (cfg.cut_present, cfg.scan_exit);
     // The residency and scene-event hooks in every recording mode (capture
     // too: place.tsv / cine.tsv); geometry bytes are offered only to a screen pass.
     let (install, offer) = crate::worldahead::modes(render.as_deref());
     if install {
         crate::worldahead::set_offer(offer);
+        // The rows go only into frame dumps; a screen run dumps with `raw=` or `seq=auto` (c.dump).
+        crate::worldahead::set_rows(!cfg.render || cfg.raw > 0 || cfg.auto.is_some());
         // SAFETY: forwarded (nothing runs the title yet).
         unsafe { crate::worldahead::install(base) };
     }
@@ -4862,7 +4933,11 @@ pub unsafe fn start(base: usize) {
         SINK_WHEELS.store(true, Ordering::Relaxed);
         xnw_core::info!("world render: vehicle wheels: instanced wheel and tyre draws read at the list sink (skinrules bit 8)");
     }
-    if SINK_PRESKIN.load(Ordering::Relaxed) || SINK_WHEELS.load(Ordering::Relaxed) {
+    if bridgeps::on() && cfg.render {
+        SINK_BRIDGE.store(true, Ordering::Relaxed);
+        xnw_core::info!("world render: bridgeps: draws of pixel programs {:08x?} read at the list sink for the title's own programs in our pass", bridgeps::wanted());
+    }
+    if SINK_PRESKIN.load(Ordering::Relaxed) || SINK_WHEELS.load(Ordering::Relaxed) || SINK_BRIDGE.load(Ordering::Relaxed) {
         xnw_gpu::d3d12x::tap::set_draw_tap(Some((sink_want, on_sink)));
     }
     // The imposter reads need the arena and the type table (the pack sets
@@ -4919,6 +4994,23 @@ pub unsafe fn start(base: usize) {
             }
         } else {
             xnw_core::warn!("world probe: {name} entry {got:02x?} not the expected one; no frame boundary marks");
+        }
+    }
+    if cfg_scan_exit {
+        let at = real(base, COMPACT_WRAPPER) as usize;
+        let mut got = [0u8; 16];
+        if crate::watch::guarded_read(at, &mut got) && got == COMPACT_WRAPPER_BYTES {
+            COMPACT_AT.store(real(base, COMPACT) as usize, Ordering::Relaxed);
+            // SAFETY: nothing runs the title yet; the hook always returns 1, so the relocated wrapper never runs.
+            match unsafe { crate::watch::hook_entry_early(at as *mut u8, 8, on_compaction as usize) } {
+                Ok(_) => {
+                    COMPACT_HOOKED.store(true, Ordering::Relaxed);
+                    xnw_core::info!("world probe: scan=exit: compaction wrapper 0x140B5F960 hooked; scan.txt from the records at the compaction's exit");
+                }
+                Err(e) => xnw_core::warn!("world probe: scan=exit: compaction wrapper not hooked: {e}; scan.txt at drain entry"),
+            }
+        } else {
+            xnw_core::warn!("world probe: scan=exit: wrapper bytes {got:02x?} not the expected ones; scan.txt at drain entry");
         }
     }
     let drain_cut = hooked == 2 && !cfg_cut_present;
@@ -5617,7 +5709,7 @@ mod tests {
 
     fn test_state(dir: &std::path::Path, seq: bool) -> State {
         let (tx, _rx) = mpsc::channel::<Capture>();
-        let cfg = Config { dir: dir.to_path_buf(), frames: 3, max: 100_000, at: Vec::new(), raw: 1, render: false, seq, skinlog: 0, census: false, auto: None, auto_veh: 0, cut_present: false, pack: false };
+        let cfg = Config { dir: dir.to_path_buf(), frames: 3, max: 100_000, at: Vec::new(), raw: 1, render: false, seq, skinlog: 0, census: false, auto: None, auto_veh: 0, cut_present: false, pack: false, scan_exit: false };
         State { cfg, title: 0, tls_index: 0, g: Globals::default(), base: AtomicU64::new(0), wait_world: false, done: AtomicBool::new(false), pending: AtomicU64::new(u64::MAX), slots: Mutex::new(Vec::new()), sent: AtomicU64::new(u64::MAX), late: [AtomicU64::new(0), AtomicU64::new(0)], tx: Mutex::new(tx) }
     }
 
@@ -5688,12 +5780,32 @@ mod tests {
         // Frame 11: draw 2 was hooked and skipped by us.
         coherence(&list(11, 0.5, false), HashMap::from([((2, 67), SKIP_INST_FRUSTUM)]));
         coherence(&list(13, 1.0, true), HashMap::new());
+        {
+            let g = COHERENCE.lock().unwrap();
+            let k = g.as_ref().unwrap();
+            assert!(k.residual.iter().all(|r| *r < 1e-4), "{:?}", k.residual);
+            assert_eq!((k.missing_back, k.gaps), (1, 1));
+            assert_eq!(k.ours.get(&SKIP_INST_FRUSTUM), Some(&1), "the drop is ours");
+            assert_eq!(k.ours_still, 1, "the camera only moved: still");
+            assert_eq!(ours_line(3, &k.ours, k.ours_still, [5, 2]), "missing-then-back hooked but not listed 1 (inst_frustum 1; camera still 1), not hooked 2; late draws 5 in 2 captures (recorded after their frame's cut)");
+        }
+        // The same drop while the camera turns 10 degrees a list is not under a still camera.
+        let turned = |frame: u64, deg: f32, with_b: bool| {
+            let mut l = list(frame, 0.0, with_b);
+            let (s, c) = deg.to_radians().sin_cos();
+            let v = &mut l.cameras[0].view;
+            (v[0], v[2], v[8], v[10]) = (c, -s, s, c);
+            l
+        };
+        if let Ok(mut g) = COHERENCE.lock() {
+            *g = None;
+        }
+        coherence(&turned(20, 0.0, true), HashMap::new());
+        coherence(&turned(21, 10.0, false), HashMap::from([((2, 67), SKIP_INST_FRUSTUM)]));
+        coherence(&turned(22, 20.0, true), HashMap::new());
         let g = COHERENCE.lock().unwrap();
         let k = g.as_ref().unwrap();
-        assert!(k.residual.iter().all(|r| *r < 1e-4), "{:?}", k.residual);
-        assert_eq!((k.missing_back, k.gaps), (1, 1));
-        assert_eq!(k.ours.get(&SKIP_INST_FRUSTUM), Some(&1), "the drop is ours");
-        assert_eq!(ours_line(3, &k.ours, [5, 2]), "missing-then-back hooked but not listed 1 (inst_frustum 1), not hooked 2; late draws 5 in 2 captures (recorded after their frame's cut)");
+        assert_eq!((k.ours.get(&SKIP_INST_FRUSTUM), k.ours_still), (Some(&1), 0), "a turning camera's drop");
     }
 
     /// Drain cut: draws of title frame 10 recorded on three threads (one of them
@@ -6431,6 +6543,10 @@ mod tests {
         assert_eq!(parse("d,skinlog=8").map(|c| c.skinlog), Ok(8));
         assert_eq!(parse("d,raw=1,seq=auto:peds>=8:draws>=2000:frames=6").map(|c| (c.auto, c.seq)), Ok((Some((8, 2000, 6)), true)));
         assert!(parse("d,seq=auto:bogus>=1").is_err());
+        assert_eq!(parse("d,seq=10+120/1,scan=exit").map(|c| (c.scan_exit, c.at.len())), Ok((true, 120)));
+        assert!(!parse("d,scan=drain").unwrap().scan_exit && parse("d,scan=x").is_err());
+        // The wrapper's first 15 bytes move to the trampoline (its call made absolute).
+        assert_eq!(crate::watch::relocated_len(&COMPACT_WRAPPER_BYTES), Some(15));
         assert_eq!(parse("d,seq=auto:peds>=4:draws>=2000:vehicles>=20:frames=6").map(|c| (c.auto, c.auto_veh)), Ok((Some((4, 2000, 6)), 20)));
         assert!(is_vehicle_effect("standard_vehicle_paint") && is_vehicle_effect("vehicle_tyre") && !is_vehicle_effect("standard"));
         assert!(parse("").is_err());

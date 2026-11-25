@@ -3,3 +3,8 @@ target-dir = "target"
 
 [alias]
 x = "run --quiet -p xnw --"
+
+# The toolchain's own lld-link (rustup ships it; nothing installed) in place of MSVC link.exe: same objects, same
+# code, a faster link of the dev exes and test harnesses (BLD2).
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"

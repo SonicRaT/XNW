@@ -142,12 +142,21 @@ impl Desc {
     /// The graphics state of a graphics pipeline (`None`: compute, or a
     /// plain description, whose state is not kept).
     fn graphics_state(&self) -> Option<GraphicsState> {
+        // DexNom-VIctory (ddb7332, GPL-3.0-or-later; there at the end of
+        // `create_stream`): no blending on integer targets, before a
+        // pipeline is made from the state.
+        let mut g = self.graphics_state_as_given()?;
+        g.apply_integer_blend_bypass();
+        Some(g)
+    }
+
+    fn graphics_state_as_given(&self) -> Option<GraphicsState> {
         match self.slot {
             86 => self.graphics.as_deref().cloned(),
             // SAFETY: the entries lie in the title's loaded pipeline cache.
             57 => Some(GraphicsState::from_cache(&self.state_entry, &self.outputs_entry)),
             55 => {
-                let mut g = self.base.as_ref()?.graphics_state()?;
+                let mut g = self.base.as_ref()?.graphics_state_as_given()?;
                 g.apply_overrides(&self.override_descs);
                 Some(g)
             }

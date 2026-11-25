@@ -9,6 +9,7 @@
 pub mod audit;
 pub mod bridge;
 pub mod bridge_ps;
+pub mod bridge_ms;
 pub mod decode;
 pub mod hair;
 pub mod imposter;

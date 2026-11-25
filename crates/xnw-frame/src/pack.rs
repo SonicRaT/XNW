@@ -105,7 +105,8 @@ impl Pack {
     /// the hook draws named (HANDLE_VIEW: the handle itself, slot 0).
     pub fn views_by_handle(&self) -> HashMap<u64, SlotView> {
         let mut out = HashMap::new();
-        for r in self.data.refs.iter().filter(|r| r.kind == kind::TABLE || r.kind == kind::HANDLE_VIEW || (r.kind == kind::HEAP_SLOT && r.owner == fp::FRAME_SCOPE && r.addr != 0)) {
+        // v2.4: the views a draw's words name, at heap start + 32 * index (DRAW_WORDS slot 1).
+        for r in self.data.refs.iter().filter(|r| r.kind == kind::TABLE || r.kind == kind::HANDLE_VIEW || (r.kind == kind::HEAP_SLOT && r.owner == fp::FRAME_SCOPE && r.addr != 0) || (r.kind == kind::DRAW_WORDS && r.slot == 1 && r.addr != 0)) {
             for v in self.bytes_of(r).map(|b| fp::decode_slots(&b)).unwrap_or_default() {
                 out.insert(r.addr + 32 * u64::from(v.slot), v);
             }

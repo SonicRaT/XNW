@@ -45,6 +45,10 @@ pub mod preskin;
 pub mod imposter;
 /// One captured draw through the title's own mesh and pixel program.
 pub mod bridge;
+/// The title's pixel programs per row in our pass, live and replayed.
+pub mod bridged;
+/// The title's mesh programs in our pass (`bridgems`).
+pub mod bridge_ms;
 /// The ped pre-skin as our own compute pass: the frame's items, the draws' copies.
 pub mod preskin_gpu;
 /// Strand hair: the title's strand draws as data, the strand vertex rule.
@@ -497,6 +501,8 @@ pub struct FrameList {
     pub terrain: Option<std::sync::Arc<terrain::Terrain>>,
     /// The frame's imposter batches (None: not read).
     pub imposters: Option<std::sync::Arc<imposter::Imposters>>,
+    /// Rows drawn again by the title's own pixel programs (`bridgeps`; None: off).
+    pub bridged: Option<std::sync::Arc<bridged::Frame>>,
 }
 
 /// An instance record (64 B: rows 0..2 of a row-major 3x4, translation
@@ -866,6 +872,25 @@ VsOut vs(uint v : SV_VertexID, uint instance : SV_InstanceID) {
     }
     return o;
 }
+// A row drawn from the title's mesh program (`bridgems`): t0 is the
+// frame's record ring, vbBytes its size; palFirst this row's first record
+// byte, palBytes a record's bytes; instFirst max vertices | vertex stride << 16;
+// instBytes position row | uv row << 8 | uv channel << 16 | uv on << 24;
+// remapAt normal row | channel << 8 | on << 16 (bridge_ms::Join). A vertex at
+// or past its group's count gets a NaN position (dropped).
+float4 rrow(uint a, uint row, uint ch) { uint b = a + 16 * row + 4 * ch; return asfloat(uint4(ld(b), ld(b + 4), ld(b + 8), ld(b + 12))); }
+[RootSignature(RS)]
+VsOut vs_rec(uint id : SV_VertexID) {
+    uint maxv = max(instFirst & 0xFFFF, 1), stride = instFirst >> 16;
+    uint rec = palFirst + (id / maxv) * palBytes, v = id % maxv;
+    uint a = rec + 16 + v * stride;
+    VsOut o;
+    o.pos = v < ld(rec) ? rrow(a, instBytes & 0xFF, 0) : asfloat(0x7FC00000).xxxx;
+    o.uv = (instBytes >> 24) != 0 ? rrow(a, (instBytes >> 8) & 0xFF, (instBytes >> 16) & 3).xy : float2(0, 0);
+    o.normal = (remapAt >> 16) != 0 ? rrow(a, remapAt & 0xFF, (remapAt >> 8) & 3).xyz : float3(0, 0, 1);
+    o.col = float4(0, 0, 0, 0);
+    return o;
+}
 float4 shade(VsOut i) {
     if (flags & 1) return float4(0.95, 0.95, 0.9, 1);
     // ID mode (world-render --pick): the draw's index + 1 as the colour.
@@ -1113,6 +1138,9 @@ fn filtered_count(main: usize, kept: usize) -> usize {
 pub struct PassStats {
     /// Geometry copies skipped (outside the page or the staging).
     pub copies_refused: usize,
+    /// Rows drawn from the title's mesh programs (`bridgems`); of them with the title's pixel program.
+    pub bridged: usize,
+    pub bridged_title_ps: usize,
     pub draws: usize,
     pub triangles: u64,
     pub skipped: usize,
@@ -1312,12 +1340,30 @@ pub struct Pass {
     pub terrain: terrain::TerrainPass,
     /// Imposter cards (`--imposters`, off by default).
     pub imposters: imposter::ImposterPass,
+    /// The title's pixel programs on a list's bridged rows (`bridgeps`, off
+    /// by default): on, what the last frame's record did, the objects its
+    /// list uses (to the fence) and the grey stand-in texture.
+    pub bridge_on: bool,
+    pub bridge_stats: bridged::Stats,
+    bridge_keep: Vec<windows::core::IUnknown>,
+    bridge_grey: Option<ID3D12Resource>,
+    /// The words buffer (upload memory, mapped): the frame table's slot 86 for the bridged rows.
+    bridge_words: Option<(ID3D12Resource, *mut u8, u64)>,
     /// The picture shown (a copy of `colour` from the last frame that was
     /// complete enough) and the cut watch (`hold=off`: `colour` is shown).
     shown: ID3D12Resource,
     pub cuts: cuts::CutWatch,
     /// The ped pre-skin compute pass (made at its first item).
     preskin: preskin_gpu::GpuPreskin,
+    /// Rows drawn from the title's mesh programs (`bridgems`): set
+    /// before [`Pass::draw`] (its rows by list index), kept across frames
+    /// for its pipelines.
+    pub bridge_ms: Option<bridge_ms::Batch>,
+    /// The raw shader's source (`vs_rec` is compiled from it on demand),
+    /// its record-drawing pipeline and the heap slot of the record ring.
+    raw_source: String,
+    rec_pso: Option<ID3D12PipelineState>,
+    rec_slot: Option<u32>,
 }
 
 /// Screen-mode budgets per frame.
@@ -1514,6 +1560,7 @@ impl Pass {
             (root, raw, wire, decal)
         };
         (self.raw_root, self.raw_pso, self.wire_pso, self.decal_pso, self.raw_shaders) = (root, raw, wire, decal, (vs, ps));
+        (self.raw_source, self.rec_pso) = (source.to_string(), None);
         self.state_psos.clear();
         self.pso_jobs = None;
         self.pso_asked.clear();
@@ -1643,9 +1690,18 @@ impl Pass {
                 pages: Pages::default(),
                 terrain,
                 imposters,
+                bridge_on: false,
+                bridge_stats: bridged::Stats::default(),
+                bridge_keep: Vec::new(),
+                bridge_grey: None,
+                bridge_words: None,
                 shown,
                 cuts: cuts::CutWatch::new(false),
                 preskin: preskin_gpu::GpuPreskin::default(),
+                bridge_ms: None,
+                raw_source: RAW_SHADER.to_string(),
+                rec_pso: None,
+                rec_slot: None,
             })
         }
     }
@@ -1834,6 +1890,35 @@ impl Pass {
     /// `readback` the target is copied for [`Pass::read_rgba`]. Waits for
     /// the GPU; the colour target is left in the render-target state.
     pub fn draw(&mut self, list: &FrameList, decode: &mut dyn FnMut(&GeomKey) -> Option<HostGeometry>, readback: bool) -> std::result::Result<PassStats, String> {
+        // The bridged rows stay with the pass whatever the frame does.
+        let batch = self.bridge_ms.take();
+        let r = self.draw_with(list, decode, readback, batch.as_ref().filter(|b| !b.is_empty()));
+        self.bridge_ms = batch;
+        r
+    }
+
+    /// The record-drawing pipeline (`vs_rec` of the raw shader's source,
+    /// our pixel shader and default state) and the record ring's heap
+    /// slot, made at their first use.
+    fn rec_ready(&mut self) -> std::result::Result<(), String> {
+        if self.rec_pso.is_none() {
+            let vs = compile_source(&self.raw_source, c"vs_rec", c"vs_5_1")?;
+            self.rec_pso = Some(pipeline(&self.device, &self.raw_root, &vs, &self.raw_shaders.1, &[], false).map_err(|e| format!("bridgems record pipeline: {e}"))?);
+        }
+        if self.rec_slot.is_none() {
+            let slot = self.free_slots.pop().or_else(|| (self.next_slot < HEAP_SLOTS - TEX_SLOTS).then(|| {
+                self.next_slot += 1;
+                self.next_slot - 1
+            }));
+            self.rec_slot = Some(slot.ok_or("bridgems: no heap slot for the record ring")?);
+        }
+        Ok(())
+    }
+
+    fn draw_with(&mut self, list: &FrameList, decode: &mut dyn FnMut(&GeomKey) -> Option<HostGeometry>, readback: bool, ms_rows: Option<&bridge_ms::Batch>) -> std::result::Result<PassStats, String> {
+        if ms_rows.is_some() {
+            self.rec_ready()?;
+        }
         // Every failure names its call, sizes and the frame.
         let frame = list.frame;
         let at = |what: String| move |e: windows::core::Error| format!("frame {frame}: {what}: {e}");
@@ -2092,6 +2177,15 @@ impl Pass {
             }
             // The ped pre-skin: draw index -> its vertex-buffer copy (slot, bytes).
             let pre = self.preskin_record(list, l);
+            // every bridged row's mesh program, then one barrier; the
+            // record ring's raw view for `vs_rec`.
+            if let Some(b) = ms_rows {
+                b.record_compute(l);
+                l.SetDescriptorHeaps(&[Some(self.heap.clone())]);
+                if let (Some((ring, bytes)), Some(slot)) = (b.records(), self.rec_slot) {
+                    self.raw_view(ring, bytes, slot);
+                }
+            }
             // This frame's albedo table (uploads recorded on this list first).
             let (heap_cpu, step) = (self.heap.GetCPUDescriptorHandleForHeapStart().ptr, self.heap_step as usize);
             let cpu = |slot: u32| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: heap_cpu + slot as usize * step };
@@ -2101,7 +2195,9 @@ impl Pass {
             let tt = std::time::Instant::now();
             let tex_base = self.tex.opts.frame_ms;
             self.tex.opts.frame_ms = self.cuts.tex_ms(tex_base);
-            self.tex.prepare(&self.device, l, &mut draws.iter().flat_map(|r| r.material.layers).chain(draws.iter().map(|r| r.material.albedo_desc)), &cpu);
+            // The bridged rows' textures last (our rows' come first in the table).
+            let bridged = list.bridged.as_deref().filter(|_| self.bridge_on);
+            self.tex.prepare(&self.device, l, &mut draws.iter().flat_map(|r| r.material.layers).chain(draws.iter().map(|r| r.material.albedo_desc)).chain(bridged.into_iter().flat_map(|f| f.rows.iter().flat_map(|r| r.1.handles()))), &cpu);
             self.tex.opts.frame_ms = tex_base;
             st.tex_ms = tt.elapsed().as_secs_f64() * 1e3;
             let tex_table = self.gpu_slot(self.tex.base());
@@ -2140,6 +2236,58 @@ impl Pass {
                         water_done = true;
                         st.water = self.record_water(list, &cam).map_err(at("water grid upload".into()))?;
                         raw_bound = None;
+                    }
+                    // a bridged row draws from its records, not our geometry.
+                    let idx = ((*r as *const DrawRecord as usize).wrapping_sub(list.draws.as_ptr() as usize) / std::mem::size_of::<DrawRecord>()) as u32;
+                    if let Some(b) = ms_rows.filter(|_| !wire && (idx as usize) < list.draws.len())
+                        && let Some(it) = b.item(idx)
+                    {
+                        let pr = b.prog(it.prog);
+                        if pr.title_ps {
+                            b.record_title(l, it);
+                            l.SetDescriptorHeaps(&[Some(self.heap.clone())]);
+                            st.bridged_title_ps += 1;
+                        } else if let (Some(pso), Some(slot), Some(j), Some((ibv, n)), Some((_, ring_bytes))) = (&self.rec_pso, self.rec_slot, pr.join, b.indices(it), b.records()) {
+                            let c = draw_constants(r, &cam);
+                            let mut k = [0u32; 58];
+                            for (i, v) in c.iter().enumerate() {
+                                k[i] = v.to_bits();
+                            }
+                            let (ti, srgb) = self.tex.lookup(r.material.albedo_desc);
+                            k[48] = ti.min(TEX_SLOTS - 1);
+                            k[49] = u32::from(r.material.alpha_clip) | u32::from(srgb) << 1;
+                            self.tex.count_draw(r.material.albedo_desc);
+                            let jc = j.constants(&pr.p.layout);
+                            (k[32], k[33], k[36], k[37], k[39], k[56]) = (ring_bytes.min(u64::from(u32::MAX)) as u32, b.record_at(it) as u32, pr.p.layout.record_bytes(), jc[0], jc[1], jc[2]);
+                            k[35] = u32::from(r.ped) << 1 | u32::from(self.id_mode) << 2;
+                            k[57] = idx + 1;
+                            if let Some(s) = list.sun {
+                                for (j, v) in s.iter().enumerate() {
+                                    k[40 + j] = v.to_bits();
+                                }
+                            }
+                            if let Some(s) = list.sky.filter(|_| self.sky) {
+                                for (j, v) in s.fog.iter().enumerate() {
+                                    k[52 + j] = v.to_bits();
+                                }
+                            }
+                            l.SetGraphicsRootSignature(&self.raw_root);
+                            l.SetPipelineState(pso);
+                            l.SetGraphicsRootDescriptorTable(1, self.gpu_slot(slot));
+                            l.SetGraphicsRootDescriptorTable(2, self.gpu_slot(turn as u32));
+                            l.SetGraphicsRootDescriptorTable(3, self.gpu_slot(2 + turn as u32));
+                            l.SetGraphicsRootDescriptorTable(4, tex_table);
+                            l.SetGraphicsRootConstantBufferView(5, light_va);
+                            l.SetGraphicsRoot32BitConstants(0, 58, k.as_ptr().cast(), 0);
+                            l.IASetIndexBuffer(Some(&ibv));
+                            l.DrawIndexedInstanced(n, 1, 0, 0, 0);
+                        } else {
+                            continue;
+                        }
+                        // Our root signature, heap tables and pipeline are bound again at the next raw draw.
+                        raw_bound = None;
+                        st.bridged += 1;
+                        continue;
                     }
                     let Some((ibv, vbv, indices, raw)) = self.cache.get_or_make(r.geom, list.frame, || None).map(|g| (g.ibv, g.vbv, g.indices, g.raw)) else {
                         if !wire {
@@ -2317,6 +2465,12 @@ impl Pass {
             if list.imposters.is_some() && self.imposters.opts.show {
                 self.imposters.record(l, list, &cam);
             }
+            // The title's own pixel programs on the bridged rows, over ours.
+            if self.bridge_on
+                && let Some(f) = list.bridged.as_deref()
+            {
+                self.bridge_stats = self.record_bridged(l, f).map_err(|x| format!("frame {frame}: bridgeps: {x}"))?;
+            }
             // A frame complete enough becomes the shown picture.
             if self.cuts.hold && !st.held {
                 transition(l, &self.colour, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -2356,6 +2510,7 @@ impl Pass {
             // The copies ran: the staging space is free again (and a large
             // one made for a big offline frame goes).
             self.copies.clear();
+            self.bridge_keep.clear();
             if self.staging.as_ref().is_some_and(|s| s.2 > 256 << 20) {
                 self.staging = None;
             }
@@ -2375,6 +2530,61 @@ impl Pass {
 
     /// Records the frame's water (uploading its grid when it changed):
     /// whether it was drawn.
+    /// [`bridged::record`] on our open list `l`, into our colour and depth;
+    /// the grey stand-in made on first use.
+    fn record_bridged(&mut self, l: &ID3D12GraphicsCommandList, f: &bridged::Frame) -> std::result::Result<bridged::Stats, String> {
+        let e = |x: windows::core::Error| x.message().to_string();
+        // SAFETY: our device and open list; the upload goes to the fence with `bridge_keep`.
+        unsafe {
+            if self.bridge_grey.is_none() {
+                let desc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 1, Height: 1, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8G8B8A8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() };
+                let mut t: Option<ID3D12Resource> = None;
+                self.device.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut t).map_err(e)?;
+                let t = t.ok_or("no grey texture")?;
+                let bdesc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: 256, Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default() };
+                let mut up: Option<ID3D12Resource> = None;
+                self.device.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &bdesc, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut up).map_err(e)?;
+                let up = up.ok_or("no grey upload")?;
+                let mut at = std::ptr::null_mut();
+                up.Map(0, None, Some(&mut at)).map_err(e)?;
+                std::ptr::copy_nonoverlapping([128u8, 128, 128, 255].as_ptr(), at.cast::<u8>(), 4);
+                up.Unmap(0, None);
+                let fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: 0, Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: DXGI_FORMAT_R8G8B8A8_UNORM, Width: 1, Height: 1, Depth: 1, RowPitch: 256 } };
+                let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: ManuallyDrop::new(Some(t.clone())), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+                let src = D3D12_TEXTURE_COPY_LOCATION { pResource: ManuallyDrop::new(Some(up.clone())), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
+                l.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                drop(ManuallyDrop::into_inner(dst.pResource));
+                drop(ManuallyDrop::into_inner(src.pResource));
+                transition(l, &t, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                self.bridge_keep.push(windows::core::Interface::cast(&up).map_err(e)?);
+                self.bridge_grey = Some(t);
+            }
+            // The words buffer: grown to the frame's largest offset (at most
+            // 256 MiB), kept; each frame writes only its rows' words.
+            let want = f.words_end.next_multiple_of(1 << 20).min(256 << 20);
+            if self.bridge_words.as_ref().is_none_or(|w| w.2 < want) {
+                if let Some((old, _, _)) = self.bridge_words.take() {
+                    old.Unmap(0, None);
+                    self.bridge_keep.push(windows::core::Interface::cast(&old).map_err(e)?);
+                }
+                let bdesc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: want.max(1 << 20), Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default() };
+                let mut r: Option<ID3D12Resource> = None;
+                self.device.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &bdesc, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut r).map_err(e)?;
+                let r = r.ok_or("no words buffer")?;
+                let mut at = std::ptr::null_mut();
+                r.Map(0, None, Some(&mut at)).map_err(e)?;
+                self.bridge_words = Some((r, at.cast::<u8>(), want.max(1 << 20)));
+            }
+            let (words, wp, wlen) = self.bridge_words.clone().ok_or("no words buffer")?;
+            f.write_words(std::slice::from_raw_parts_mut(wp, wlen as usize));
+            let grey = self.bridge_grey.clone().ok_or("no grey texture")?;
+            let tex = &self.tex;
+            let texture = |h: u64| tex.host_view(h);
+            let t = bridged::Target { rtv: self.rtv.GetCPUDescriptorHandleForHeapStart(), dsv: self.dsv.GetCPUDescriptorHandleForHeapStart(), width: self.width, height: self.height, texture: &texture, grey: &grey, words: (&words, wlen) };
+            bridged::record(&self.device, l, f, &t, &mut self.bridge_keep)
+        }
+    }
+
     fn record_water(&mut self, list: &FrameList, cam: &Camera) -> Result<bool> {
         let Some(w) = list.water.as_ref().filter(|w| self.water && !w.grid.indices.is_empty()) else { return Ok(false) };
         if self.water_gpu.as_ref().is_none_or(|g| g.0 != w.grid.id) {
@@ -2682,10 +2892,24 @@ fn screen_frame_inner() -> Option<ID3D12Resource> {
                 p.terrain.opts = terrain::parse_screen(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default());
                 // `imposters=on` (off by default): cards for the title's imposter batches.
                 p.imposters.opts = imposter::parse_screen(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default());
-                // `bridgeps=on|<hashes>` (off by default): the replay draws those rows with the title's programs; live has no binding source yet.
+                // `bridgeps=on|<hashes>` (off by default): those rows again with the title's own
+                // programs (the list sink's tap reads their bindings); on the hardware
+                // adapter only with XNW_BRIDGE_HW=1 (a scheduled run).
                 let bridgeps = bridge::parse_switch(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default());
                 if !bridgeps.is_empty() {
-                    xnw_core::info!("world render: bridgeps asks for {} pixel programs ({bridgeps:08x?}); the live pass has no source of their bindings yet: drawn by our own programs", bridgeps.len());
+                    let hw = std::env::var("XNW_BRIDGE_HW").ok().as_deref() == Some("1");
+                    p.bridge_on = host.caps.software || hw;
+                    xnw_core::info!(
+                        "world render: bridgeps: {} pixel programs ({bridgeps:08x?}) {} on {}",
+                        bridgeps.len(),
+                        if p.bridge_on { "drawn by the title's own programs over ours" } else { "not drawn: the hardware adapter needs XNW_BRIDGE_HW=1" },
+                        host.caps.adapter
+                    );
+                }
+                // `bridgems=on|<hashes>` (off by default): the replay draws those rows from the title's mesh programs (`bridge_ms`); live waits for a binding source too.
+                let bridgems = bridge_ms::parse_switch(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default());
+                if !bridgems.is_empty() {
+                    xnw_core::info!("world render: bridgems asks for {} mesh programs; the live pass has no source of their bindings yet: drawn by our own programs", bridgems.len());
                 }
                 p.terrain.table.opts.mode = p.tex.opts.mode;
                 p.terrain.table.opts.async_reads = p.tex.opts.async_reads;
@@ -2810,6 +3034,10 @@ fn screen_frame_inner() -> Option<ID3D12Resource> {
                 if list.frame % 60 == 0 && (!list.preskin.items.is_empty() || list.preskin.unreadable > 0) {
                     let s = pass.preskin_stats();
                     xnw_core::info!("{}", preskin_gpu::line(list.frame, &list.preskin, &s));
+                }
+                if list.frame % 60 == 0 && pass.bridge_on {
+                    let none = bridged::Frame::default();
+                    xnw_core::info!("{}", bridged::line(list.frame, list.bridged.as_deref().unwrap_or(&none), &pass.bridge_stats));
                 }
                 if list.frame % 60 == 0 && pass.imposters.opts.on {
                     xnw_core::info!("{}", pass.imposters.frame_line(list.frame, list.imposters.as_deref()));

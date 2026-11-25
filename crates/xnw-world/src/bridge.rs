@@ -25,6 +25,7 @@ use xnw_shader::{HwStage, RootType};
 
 use super::preskin::{self, Kind, View};
 use super::textures::Provided;
+use std::collections::HashMap;
 
 /// What a descriptor slot holds for the binding: a buffer view (as the
 /// compute binding describes one) or a texture's texels.
@@ -32,6 +33,9 @@ use super::textures::Provided;
 pub enum Slot<'a> {
     Buffer(View<'a>),
     Texture(&'a Provided),
+    /// A texture by its descriptor handle in the title's heap: the caller
+    /// makes its view (our pass's texture table, `bridged`).
+    Handle(u64),
 }
 
 /// `D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE`.
@@ -110,6 +114,8 @@ pub struct Binding<'a> {
     pub views: preskin::Binding<'a>,
     /// Textures by view heap slot.
     pub textures: Vec<(u32, &'a Provided)>,
+    /// Textures by descriptor handle, by view heap slot ([`Slot::Handle`]).
+    pub handles: Vec<(u32, u64)>,
     pub samplers: Vec<(u32, SamplerDesc)>,
     pub sampler_slots: u32,
     pub mesh: Stage<'a>,
@@ -134,7 +140,7 @@ pub fn bind<'a>(ms: &HostShader, ps: &HostShader, d: &Draw<'a>) -> Result<Bindin
     // A texture holds its slot in the layout as an empty raw view.
     let lay = |s: &Slot<'a>| match s {
         Slot::Buffer(v) => *v,
-        Slot::Texture(_) => View { kind: Kind::Raw, bytes: &[] },
+        Slot::Texture(_) | Slot::Handle(_) => View { kind: Kind::Raw, bytes: &[] },
     };
     let mut dispatch = preskin::Dispatch { groups: [d.groups, 1, 1], tables: Vec::new(), heap: d.heap.iter().map(|(k, s)| (*k, lay(s))).collect() };
     for &r in &tables {
@@ -154,7 +160,14 @@ pub fn bind<'a>(ms: &HostShader, ps: &HostShader, d: &Draw<'a>) -> Result<Bindin
         }
     }
     textures.sort_by_key(|t| t.0);
-    views.slots.retain(|(s, _)| textures.binary_search_by_key(s, |t| t.0).is_err());
+    let mut handles: Vec<(u32, u64)> = d.heap.iter().filter_map(|(k, s)| if let Slot::Handle(h) = s { Some((*k, *h)) } else { None }).collect();
+    for &r in &tables {
+        if let Some(Root::Table(v)) = d.roots.get(usize::from(r)) {
+            handles.extend(v.iter().filter_map(|(k, s)| if let Slot::Handle(h) = s { Some((first[usize::from(r)] + k, *h)) } else { None }));
+        }
+    }
+    handles.sort_by_key(|t| t.0);
+    views.slots.retain(|(s, _)| textures.binary_search_by_key(s, |t| t.0).is_err() && handles.binary_search_by_key(s, |t| t.0).is_err());
     let stage = |name: &str, s: &HostShader| -> Result<Stage<'a>, String> {
         let mut constants = vec![0u32; s.user_data_dwords().max(1) as usize];
         for u in &s.user_data {
@@ -182,7 +195,7 @@ pub fn bind<'a>(ms: &HostShader, ps: &HostShader, d: &Draw<'a>) -> Result<Bindin
     // out, and the heap bound sends their indices to the bound's guard.
     let sampler_slots = d.samplers.iter().map(|s| s.0 + 1).max().unwrap_or(0).max(d.sampler_slots).clamp(1, SAMPLER_HEAP_MAX);
     views.bounds[6] = sampler_slots;
-    Ok(Binding { views, textures, samplers: d.samplers.iter().filter(|s| s.0 < sampler_slots).copied().collect(), sampler_slots, mesh, pixel, groups: d.groups })
+    Ok(Binding { views, textures, handles, samplers: d.samplers.iter().filter(|s| s.0 < sampler_slots).copied().collect(), sampler_slots, mesh, pixel, groups: d.groups })
 }
 
 /// Optional-feature bits of a DXIL container's `SFI0` part that an adapter
@@ -328,6 +341,7 @@ pub fn targets(ps: &[u8]) -> Vec<(u32, i32)> {
 }
 
 /// The translated pair of one draw.
+#[derive(Clone)]
 pub struct Programs {
     /// The mesh program in compute form and its record layout.
     pub ms: HostShader,
@@ -337,9 +351,9 @@ pub struct Programs {
     pub ps: HostShader,
     /// The compute form's `WaveSize`.
     pub wave: u32,
-    /// A plain draw through the title's vertex program instead (HAIR1:
-    /// the strand draws): `ms` is then that vertex program, drawn as
-    /// (vertices, instances, triangle strip) with no compute step.
+    /// A plain draw through the title's vertex program instead (the strand
+    /// hair draws): `ms` is then that vertex program, drawn as (vertices,
+    /// instances, triangle strip) with no compute step.
     pub vertex: Option<(u32, u32, bool)>,
 }
 
@@ -456,87 +470,211 @@ pub fn run_into(host: &xnw_gpu::host::Host, p: &Programs, b: &Binding, t: &Targe
     submit(host, p, b, t, into).map_err(|e| if unsafe { host.device.GetDeviceRemovedReason() }.is_err() { format!("device removed: {e}{}", layer_errors(&host.device)) } else { e })
 }
 
-fn submit(host: &xnw_gpu::host::Host, p: &Programs, b: &Binding, t: &Target, into: Option<&Into>) -> Result<Frame, String> {
-    if !host.caps.software && std::env::var("XNW_BRIDGE_HW").ok().as_deref() != Some("1") {
-        return Err("the title's translated programs run on the software adapter; the hardware adapter needs XNW_BRIDGE_HW=1 (a scheduled run)".into());
-    }
-    if let Some(gap) = gap(&host.caps, &p.needs()) {
-        return Err(gap);
-    }
-    let e = |e: windows::core::Error| e.message().to_string();
-    let dev = &host.device;
-    let eh = emit::host::Host::from_device(dev.clone());
-    use emit::mesh::{INDEX_REGISTER, RECORD_REGISTER};
-    // A vertex-program draw has no compute step; its vertex stage is the title's program.
-    let compute = match p.vertex {
-        Some(_) => None,
-        None => {
-            let croot = eh.root_signature_records(&[(&p.ms, D3D12_SHADER_VISIBILITY_ALL)], &[(true, RECORD_REGISTER), (true, INDEX_REGISTER), (false, RECORD_REGISTER)])?;
-            let cpso = eh.compute_pipeline_with(&croot, &p.ms.dxil).map_err(|x| format!("compute pipeline: {x}"))?;
-            Some((croot, cpso))
-        }
-    };
-    let passthrough = HostShader { stage: HwStage::Vs, dxil: p.vs.clone(), user_data: Vec::new(), samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: Vec::new(), root_srvs: Vec::new(), root_uavs: Vec::new(), address_map: false, descriptor_words: false };
-    let vs = if p.vertex.is_some() { &p.ms } else { &passthrough };
-    let pixel = !t.depth_only;
-    let gstages: Vec<(&HostShader, D3D12_SHADER_VISIBILITY)> = if pixel { vec![(vs, D3D12_SHADER_VISIBILITY_VERTEX), (&p.ps, D3D12_SHADER_VISIBILITY_PIXEL)] } else { vec![(vs, D3D12_SHADER_VISIBILITY_VERTEX)] };
-    let groot = eh.root_signature_records(&gstages, &[(false, RECORD_REGISTER)])?;
-    let (cp, gp) = (params(&[&p.ms], 3), params(&gstages.iter().map(|s| s.0).collect::<Vec<_>>(), 1));
-    let formats = if pixel { targets(&p.ps.dxil) } else { Vec::new() };
-    let count = formats.last().map_or(0, |f| f.0 as usize + 1);
-    if pixel && formats.first().map(|f| *f) != Some((0, DXGI_FORMAT_R32G32B32A32_FLOAT.0)) {
-        return Err(format!("the pixel program's target 0 is not a float target ({formats:?})"));
-    }
-    let (formats, count, read) = if into.is_some() { (vec![(0, INTO_COLOUR.0)], 1, false) } else { (formats, count, true) };
-    let (w, h) = (t.width, t.height);
-    // SAFETY: D3D12 calls with descriptions that outlive them; every
-    // resource lives until the fence says the GPU is done.
-    unsafe {
-        let mut gdesc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
-            pRootSignature: std::mem::transmute_copy(&groot),
-            VS: D3D12_SHADER_BYTECODE { pShaderBytecode: vs.dxil.as_ptr().cast(), BytecodeLength: vs.dxil.len() },
-            PS: if pixel { D3D12_SHADER_BYTECODE { pShaderBytecode: p.ps.dxil.as_ptr().cast(), BytecodeLength: p.ps.dxil.len() } } else { D3D12_SHADER_BYTECODE::default() },
-            SampleMask: u32::MAX,
-            RasterizerState: D3D12_RASTERIZER_DESC { FillMode: D3D12_FILL_MODE_SOLID, CullMode: D3D12_CULL_MODE_NONE, DepthClipEnable: true.into(), ..Default::default() },
-            PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
-            NumRenderTargets: count as u32,
-            DSVFormat: DXGI_FORMAT_D32_FLOAT,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-            ..Default::default()
-        };
-        for rt in &mut gdesc.BlendState.RenderTarget {
-            rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
-        }
-        for &(n, f) in &formats {
-            gdesc.RTVFormats[n as usize] = DXGI_FORMAT(f);
-        }
-        let depth_state = if into.is_some() { Some((false, D3D12_COMPARISON_FUNC_GREATER_EQUAL.0)) } else { t.depth };
-        let reverse = depth_state.is_some_and(|(_, func)| matches!(D3D12_COMPARISON_FUNC(func), D3D12_COMPARISON_FUNC_GREATER | D3D12_COMPARISON_FUNC_GREATER_EQUAL));
-        if let Some((write, func)) = depth_state {
-            gdesc.DepthStencilState = D3D12_DEPTH_STENCIL_DESC { DepthEnable: true.into(), DepthWriteMask: if write { D3D12_DEPTH_WRITE_MASK_ALL } else { D3D12_DEPTH_WRITE_MASK_ZERO }, DepthFunc: D3D12_COMPARISON_FUNC(func), ..Default::default() };
-        }
-        let gpso: ID3D12PipelineState = dev.CreateGraphicsPipelineState(&gdesc).map_err(|x| format!("graphics pipeline: {}", e(x)))?;
+/// The pipelines of one program pair on a device: the compute form's root
+/// signature and pipeline, the draw's (pass-through vertex shader, the
+/// pixel program unless depth only). Made once per pair and target shape
+/// (made per row they took 0.7 s a row on WARP).
+pub struct Pipes {
+    /// The compute step (none for a vertex-program draw).
+    pub compute: Option<(ID3D12RootSignature, ID3D12PipelineState)>,
+    pub cp: Params,
+    pub groot: ID3D12RootSignature,
+    pub gpso: ID3D12PipelineState,
+    pub gp: Params,
+    pub pixel: bool,
+    pub vertex: Option<(u32, u32, bool)>,
+}
 
-        let committed = |desc: &D3D12_RESOURCE_DESC, heap: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES, clear: Option<*const D3D12_CLEAR_VALUE>| -> Result<ID3D12Resource, String> {
-            let mut r: Option<ID3D12Resource> = None;
-            dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() }, D3D12_HEAP_FLAG_NONE, desc, state, clear, &mut r).map_err(e)?;
-            r.ok_or_else(|| "no resource".to_string())
+impl Pipes {
+    /// `formats`: the render targets (index, DXGI format) the draw binds;
+    /// `depth`: the depth state (write, D3D12 comparison) or none.
+    pub fn new(dev: &ID3D12Device, p: &Programs, pixel: bool, formats: &[(u32, i32)], depth: Option<(bool, i32)>) -> Result<Pipes, String> {
+        let e = |e: windows::core::Error| e.message().to_string();
+        let eh = emit::host::Host::from_device(dev.clone());
+        use emit::mesh::{INDEX_REGISTER, RECORD_REGISTER};
+        // A vertex-program draw has no compute step; its vertex stage is the title's program.
+        let compute = match p.vertex {
+            Some(_) => None,
+            None => {
+                let croot = eh.root_signature_records(&[(&p.ms, D3D12_SHADER_VISIBILITY_ALL)], &[(true, RECORD_REGISTER), (true, INDEX_REGISTER), (false, RECORD_REGISTER)])?;
+                let cpso = eh.compute_pipeline_with(&croot, &p.ms.dxil).map_err(|x| format!("compute pipeline: {x}"))?;
+                Some((croot, cpso))
+            }
         };
-        let buffer = |size: u64, heap: D3D12_HEAP_TYPE, flags: D3D12_RESOURCE_FLAGS, state: D3D12_RESOURCE_STATES| {
-            committed(&D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: size.max(256), Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, Flags: flags, ..Default::default() }, heap, state, None)
+        let passthrough = HostShader { stage: HwStage::Vs, dxil: p.vs.clone(), user_data: Vec::new(), samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: Vec::new(), root_srvs: Vec::new(), root_uavs: Vec::new(), address_map: false, descriptor_words: false };
+        let vs = if p.vertex.is_some() { &p.ms } else { &passthrough };
+        let gstages: Vec<(&HostShader, D3D12_SHADER_VISIBILITY)> = if pixel { vec![(vs, D3D12_SHADER_VISIBILITY_VERTEX), (&p.ps, D3D12_SHADER_VISIBILITY_PIXEL)] } else { vec![(vs, D3D12_SHADER_VISIBILITY_VERTEX)] };
+        let groot = eh.root_signature_records(&gstages, &[(false, RECORD_REGISTER)])?;
+        let (cp, gp) = (params(&[&p.ms], 3), params(&gstages.iter().map(|s| s.0).collect::<Vec<_>>(), 1));
+        let count = formats.iter().map(|f| f.0 as usize + 1).max().unwrap_or(0);
+        // SAFETY: a description that outlives the call.
+        let gpso = unsafe {
+            let mut gdesc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&groot),
+                VS: D3D12_SHADER_BYTECODE { pShaderBytecode: vs.dxil.as_ptr().cast(), BytecodeLength: vs.dxil.len() },
+                PS: if pixel { D3D12_SHADER_BYTECODE { pShaderBytecode: p.ps.dxil.as_ptr().cast(), BytecodeLength: p.ps.dxil.len() } } else { D3D12_SHADER_BYTECODE::default() },
+                SampleMask: u32::MAX,
+                RasterizerState: D3D12_RASTERIZER_DESC { FillMode: D3D12_FILL_MODE_SOLID, CullMode: D3D12_CULL_MODE_NONE, DepthClipEnable: true.into(), ..Default::default() },
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: count as u32,
+                DSVFormat: DXGI_FORMAT_D32_FLOAT,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            for rt in &mut gdesc.BlendState.RenderTarget {
+                rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+            }
+            for &(n, f) in formats {
+                gdesc.RTVFormats[n as usize] = DXGI_FORMAT(f);
+            }
+            if let Some((write, func)) = depth {
+                gdesc.DepthStencilState = D3D12_DEPTH_STENCIL_DESC { DepthEnable: true.into(), DepthWriteMask: if write { D3D12_DEPTH_WRITE_MASK_ALL } else { D3D12_DEPTH_WRITE_MASK_ZERO }, DepthFunc: D3D12_COMPARISON_FUNC(func), ..Default::default() };
+            }
+            dev.CreateGraphicsPipelineState::<ID3D12PipelineState>(&gdesc).map_err(|x| format!("graphics pipeline: {}", e(x)))?
         };
-        let texture = |w: u32, h: u32, format: DXGI_FORMAT, flags: D3D12_RESOURCE_FLAGS, state: D3D12_RESOURCE_STATES, clear: Option<*const D3D12_CLEAR_VALUE>| {
-            committed(&D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: u64::from(w), Height: h, DepthOrArraySize: 1, MipLevels: 1, Format: format, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Flags: flags, ..Default::default() }, D3D12_HEAP_TYPE_DEFAULT, state, clear)
-        };
-        let upload = |bytes: &[u8], size: u64| -> Result<ID3D12Resource, String> {
-            let r = buffer(size, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ)?;
-            let mut at = std::ptr::null_mut();
-            r.Map(0, None, Some(&mut at)).map_err(e)?;
-            std::ptr::write_bytes(at.cast::<u8>(), 0, size.max(256) as usize);
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), at.cast::<u8>(), bytes.len().min(size as usize));
-            r.Unmap(0, None);
-            Ok(r)
-        };
+        Ok(Pipes { compute, cp, groot, gpso, gp, pixel, vertex: p.vertex })
+    }
+}
+
+/// One row's binding on the device ([`upload`]): its view and sampler
+/// heaps, the buffers behind them, the stride table, the zero first-group
+/// word, and the root views' addresses per stage.
+pub struct Uploaded {
+    pub views: ID3D12DescriptorHeap,
+    pub samplers: ID3D12DescriptorHeap,
+    stride_table: ID3D12Resource,
+    base: ID3D12Resource,
+    mesh_views: Vec<(u8, bool, u64)>,
+    pixel_views: Vec<(u8, bool, u64)>,
+    /// The binding's arguments the recording needs.
+    mesh_constants: Vec<u32>,
+    mesh_lengths: Vec<u32>,
+    pixel_constants: Vec<u32>,
+    bounds: [u32; 8],
+    pub groups: u32,
+    /// Bytes put on the device for this row.
+    pub bytes: u64,
+    _keep: Vec<ID3D12Resource>,
+}
+
+/// Buffers and textures the rows of one batch share by content: frame
+/// tables and textures many rows name are put on the device once (a
+/// batch of 1,000 rows that each copied them ran WARP out of memory).
+/// A large buffer (a frame table's copy, megabytes) differs between rows
+/// only where `load` wrote a row's own words (draw words, bone mask words
+/// at the row's record): such rows share one buffer holding every row's
+/// words ([`Shared::merge`]).
+#[derive(Default)]
+pub struct Shared {
+    bufs: HashMap<(u64, usize), ID3D12Resource>,
+    texs: HashMap<(u64, u32, u32, u32), ID3D12Resource>,
+    large: HashMap<u64, Vec<Merged>>,
+    /// Bytes not put on the device again; rows merged into a large buffer.
+    pub saved: u64,
+    pub merged: u64,
+    /// New bytes by kind: large buffer views (not merged), small buffer
+    /// views, textures, root views.
+    pub new: [u64; 4],
+}
+
+struct Merged {
+    first: Vec<u8>,
+    now: Vec<u8>,
+    res: ID3D12Resource,
+    mapped: *mut u8,
+}
+
+/// Buffers from this size on are merged, smaller ones shared by content.
+pub const MERGE_BYTES: usize = 1 << 20;
+
+impl Shared {
+    /// A device buffer of `size` holding `bytes` for this row: one already
+    /// made whose bytes differ from these in under 1 % (and only where no
+    /// other row changed them: those bytes are written into it), else a
+    /// new one.
+    fn merge(&mut self, dev: &ID3D12Device, bytes: &[u8], size: u64) -> Result<(ID3D12Resource, bool), String> {
+        let list = self.large.entry(size).or_default();
+        'next: for m in list.iter_mut() {
+            let mut patch = Vec::new();
+            let mut differ = 0usize;
+            for (k, (a, b)) in m.now.chunks(64).zip(bytes.chunks(64)).enumerate() {
+                if a == b {
+                    continue;
+                }
+                let f = &m.first[64 * k..64 * k + a.len()];
+                for (j, ((&now, &new), &first)) in a.iter().zip(b).zip(f).enumerate() {
+                    if now == new || new == first {
+                        continue;
+                    }
+                    // Changed by another row already: another value here is a conflict.
+                    if now != first {
+                        continue 'next;
+                    }
+                    differ += 1;
+                    patch.push((64 * k + j, new));
+                }
+                if differ * 100 > bytes.len() {
+                    continue 'next;
+                }
+            }
+            for &(at, v) in &patch {
+                m.now[at] = v;
+                // SAFETY: inside the mapped upload buffer (`at` < its size).
+                unsafe { *m.mapped.add(at) = v };
+            }
+            self.merged += 1;
+            return Ok((m.res.clone(), true));
+        }
+        let res = upload_bytes(dev, bytes, size)?;
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: an upload buffer stays mapped for its life.
+        unsafe { res.Map(0, None, Some(&mut mapped)) }.map_err(|e| e.message().to_string())?;
+        list.push(Merged { first: bytes.to_vec(), now: bytes.to_vec(), res: res.clone(), mapped: mapped.cast() });
+        Ok((res, false))
+    }
+}
+
+fn content(bytes: &[u8]) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::hash::DefaultHasher::new();
+    h.write(bytes);
+    h.finish()
+}
+
+fn committed(dev: &ID3D12Device, desc: &D3D12_RESOURCE_DESC, heap: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES, clear: Option<*const D3D12_CLEAR_VALUE>) -> Result<ID3D12Resource, String> {
+    let mut r: Option<ID3D12Resource> = None;
+    // SAFETY: descriptions that outlive the call.
+    unsafe { dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() }, D3D12_HEAP_FLAG_NONE, desc, state, clear, &mut r) }.map_err(|e| e.message().to_string())?;
+    r.ok_or_else(|| "no resource".to_string())
+}
+
+/// A buffer of `size` bytes (at least 256).
+pub fn buffer(dev: &ID3D12Device, size: u64, heap: D3D12_HEAP_TYPE, flags: D3D12_RESOURCE_FLAGS, state: D3D12_RESOURCE_STATES) -> Result<ID3D12Resource, String> {
+    committed(dev, &D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: size.max(256), Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, Flags: flags, ..Default::default() }, heap, state, None)
+}
+
+fn upload_bytes(dev: &ID3D12Device, bytes: &[u8], size: u64) -> Result<ID3D12Resource, String> {
+    let r = buffer(dev, size, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ)?;
+    let mut at = std::ptr::null_mut();
+    // SAFETY: an upload buffer of at least max(size, 256) bytes, mapped here.
+    unsafe {
+        r.Map(0, None, Some(&mut at)).map_err(|e| e.message().to_string())?;
+        std::ptr::write_bytes(at.cast::<u8>(), 0, size.max(256) as usize);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), at.cast::<u8>(), bytes.len().min(size as usize));
+        r.Unmap(0, None);
+    }
+    Ok(r)
+}
+
+/// Puts binding `b` on the device for pipelines `pipes`: the view heap
+/// (typed nulls, guards, buffer views), the sampler heap, the textures
+/// (copies recorded on `list`), the root views. Nothing else is recorded.
+pub fn upload(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, b: &Binding, pipes: &Pipes, shared: &mut Shared) -> Result<Uploaded, String> {
+    let e = |e: windows::core::Error| e.message().to_string();
+    let mut bytes = 0u64;
+    // SAFETY: D3D12 calls with descriptions that outlive them; the
+    // resources are kept in the result until the caller's GPU work is done.
+    unsafe {
         let heap = |ty, n: u32, flags| -> Result<ID3D12DescriptorHeap, String> { dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: ty, NumDescriptors: n.max(1), Flags: flags, ..Default::default() }).map_err(e) };
         let visible = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         let views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, b.views.heap_slots, visible)?;
@@ -563,29 +701,39 @@ fn submit(host: &xnw_gpu::host::Host, p: &Programs, b: &Binding, t: &Target, int
                 continue;
             }
             let Some((size, n)) = v.kind.extent(v.bytes.len() as u64) else { continue };
+            let r = if v.bytes.len() >= MERGE_BYTES {
+                let (r, old) = shared.merge(dev, v.bytes, size)?;
+                if old {
+                    shared.saved += size
+                } else {
+                    bytes += size;
+                    shared.new[0] += size;
+                }
+                r
+            } else {
+                let key = (content(v.bytes), size as usize);
+                match shared.bufs.get(&key) {
+                    Some(r) => {
+                        shared.saved += size;
+                        r.clone()
+                    }
+                    None => {
+                        let r = upload_bytes(dev, v.bytes, size)?;
+                        bytes += size;
+                        shared.new[1] += size;
+                        shared.bufs.insert(key, r.clone());
+                        r
+                    }
+                }
+            };
             match v.kind {
-                Kind::Raw => {
-                    let r = upload(v.bytes, size)?;
-                    dev.CreateShaderResourceView(&r, Some(&srv(DXGI_FORMAT_R32_TYPELESS, n, 0, D3D12_BUFFER_SRV_FLAG_RAW)), at(s));
-                    keep.push(r);
-                }
-                Kind::Structured(stride) => {
-                    let r = upload(v.bytes, size)?;
-                    dev.CreateShaderResourceView(&r, Some(&srv(DXGI_FORMAT_UNKNOWN, n, stride.max(4), D3D12_BUFFER_SRV_FLAG_NONE)), at(s));
-                    keep.push(r);
-                }
-                Kind::Typed { format, .. } => {
-                    let r = upload(v.bytes, size)?;
-                    dev.CreateShaderResourceView(&r, Some(&srv(DXGI_FORMAT(format), n, 0, D3D12_BUFFER_SRV_FLAG_NONE)), at(s));
-                    keep.push(r);
-                }
-                Kind::Cbv => {
-                    let r = upload(v.bytes, size)?;
-                    dev.CreateConstantBufferView(Some(&D3D12_CONSTANT_BUFFER_VIEW_DESC { BufferLocation: r.GetGPUVirtualAddress(), SizeInBytes: n }), at(s));
-                    keep.push(r);
-                }
+                Kind::Raw => dev.CreateShaderResourceView(&r, Some(&srv(DXGI_FORMAT_R32_TYPELESS, n, 0, D3D12_BUFFER_SRV_FLAG_RAW)), at(s)),
+                Kind::Structured(stride) => dev.CreateShaderResourceView(&r, Some(&srv(DXGI_FORMAT_UNKNOWN, n, stride.max(4), D3D12_BUFFER_SRV_FLAG_NONE)), at(s)),
+                Kind::Typed { format, .. } => dev.CreateShaderResourceView(&r, Some(&srv(DXGI_FORMAT(format), n, 0, D3D12_BUFFER_SRV_FLAG_NONE)), at(s)),
+                Kind::Cbv => dev.CreateConstantBufferView(Some(&D3D12_CONSTANT_BUFFER_VIEW_DESC { BufferLocation: r.GetGPUVirtualAddress(), SizeInBytes: n }), at(s)),
                 Kind::RawUav { .. } => {}
             }
+            keep.push(r);
         }
         // Samplers: one default (linear, wrap) at every slot, the captured
         // entries (v2.4) at their indices.
@@ -598,21 +746,22 @@ fn submit(host: &xnw_gpu::host::Host, p: &Programs, b: &Binding, t: &Target, int
         for (s, desc) in b.samplers.iter().filter(|s| s.0 < b.sampler_slots) {
             dev.CreateSampler(desc, sat(*s as usize));
         }
-
-        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
-        let list: ID3D12GraphicsCommandList = match &compute {
-            Some((_, cpso)) => dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, cpso),
-            None => dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &gpso),
-        }
-        .map_err(e)?;
         // Textures: one mip each, copied from an upload buffer.
         let shader_read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         for &(s, tx) in &b.textures {
+            let key = (content(&tx.rows), tx.width, tx.height, tx.format);
+            if let Some(r) = shared.texs.get(&key) {
+                shared.saved += tx.rows.len() as u64;
+                dev.CreateShaderResourceView(r, Some(&tex2d(DXGI_FORMAT(tx.format as i32))), at(s));
+                continue;
+            }
             let desc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: u64::from(tx.width), Height: tx.height, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT(tx.format as i32), SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() };
-            let r = committed(&desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST, None)?;
+            let r = committed(dev, &desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST, None)?;
             let (mut fp, mut rows, mut row_size, mut total) = (D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(), 0u32, 0u64, 0u64);
             dev.GetCopyableFootprints(&desc, 0, 1, 0, Some(&mut fp), Some(&mut rows), Some(&mut row_size), Some(&mut total));
-            let up = buffer(total, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ)?;
+            let up = buffer(dev, total, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ)?;
+            bytes += total;
+            shared.new[2] += total;
             let mut to = std::ptr::null_mut();
             up.Map(0, None, Some(&mut to)).map_err(e)?;
             let n = (row_size as usize).min(tx.row_bytes as usize);
@@ -627,51 +776,162 @@ fn submit(host: &xnw_gpu::host::Host, p: &Programs, b: &Binding, t: &Target, int
             list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
             list.ResourceBarrier(&[barrier(&r, D3D12_RESOURCE_STATE_COPY_DEST, shader_read)]);
             dev.CreateShaderResourceView(&r, Some(&tex2d(DXGI_FORMAT(tx.format as i32))), at(s));
+            shared.texs.insert(key, r.clone());
             keep.extend([r, up]);
         }
-
-        // The mesh program's records and index triples, and the piece's
-        // first group (0: a direct dispatch of every group).
-        let lay = &p.layout;
-        let groups = u64::from(b.groups.max(1));
-        let (rec_bytes, idx_bytes) = if compute.is_some() { (groups * u64::from(lay.record_bytes()), groups * u64::from(lay.index_bytes())) } else { (256, 256) };
-        let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        let records = buffer(rec_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, uav)?;
-        let indices = buffer(idx_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, uav)?;
-        let base = upload(&[0; 16], 16)?;
+        let base = upload_bytes(dev, &[0; 16], 16)?;
         let strides: Vec<u8> = b.views.strides.iter().flatten().flat_map(|w| w.to_le_bytes()).collect();
-        let stride_table = upload(&strides, strides.len() as u64)?;
-        let mut root_view = |v: &(u8, bool, &[u8])| -> Result<u64, String> {
-            let r = upload(v.2, (v.2.len() as u64).next_multiple_of(256))?;
-            let va = r.GetGPUVirtualAddress();
-            keep.push(r);
-            Ok(va)
+        let stride_table = upload_bytes(dev, &strides, strides.len() as u64)?;
+        let mut root_views = |stage: &Stage, params: &[(u8, bool, u32)], name: &str| -> Result<Vec<(u8, bool, u64)>, String> {
+            let mut out = Vec::new();
+            for &(r, is_srv, param) in params {
+                let v = stage.views.iter().find(|v| v.0 == r && v.1 == is_srv).ok_or_else(|| format!("{name}: root view {r} not bound"))?;
+                let size = (v.2.len() as u64).next_multiple_of(256);
+                let key = (content(v.2), size as usize);
+                let buf = match shared.bufs.get(&key) {
+                    Some(r) => {
+                        shared.saved += size;
+                        r.clone()
+                    }
+                    None => {
+                        let r = upload_bytes(dev, v.2, size)?;
+                        bytes += size;
+                        shared.new[3] += size;
+                        shared.bufs.insert(key, r.clone());
+                        r
+                    }
+                };
+                out.push((param as u8, is_srv, buf.GetGPUVirtualAddress()));
+                keep.push(buf);
+            }
+            Ok(out)
         };
-        list.SetDescriptorHeaps(&[Some(views.clone()), Some(samplers.clone())]);
-        if let Some((croot, _)) = &compute {
+        let mesh_views = root_views(&b.mesh, &pipes.cp.views, "mesh")?;
+        // A vertex-program draw's vertex stage is the record's mesh stage.
+        let both = Stage { views: b.pixel.views.iter().chain(if pipes.vertex.is_some() { &b.mesh.views[..] } else { &[] }).copied().collect(), ..Stage::default() };
+        let pixel_views = root_views(&both, &pipes.gp.views, "pixel")?;
+        let mut mesh_lengths = b.mesh.lengths.clone();
+        mesh_lengths.resize(mesh_lengths.len().next_multiple_of(4).max(4), 0);
+        Ok(Uploaded { views, samplers, stride_table, base, mesh_views, pixel_views, mesh_constants: b.mesh.constants.clone(), mesh_lengths, pixel_constants: b.pixel.constants.clone(), bounds: b.views.bounds, groups: b.groups, bytes, _keep: keep })
+    }
+}
+
+/// Records the mesh program's dispatch of the uploaded binding `u` (heaps,
+/// root signature, pipeline, arguments) writing its records and index
+/// triples at the two addresses. No barrier.
+pub fn record_dispatch(list: &ID3D12GraphicsCommandList, pipes: &Pipes, u: &Uploaded, records: u64, indices: u64) {
+    let (cp, g) = (&pipes.cp, &u.bounds);
+    let Some((croot, cpso)) = &pipes.compute else { return };
+    // SAFETY: recording with live objects; the caller keeps them until the GPU is done.
+    unsafe {
+        list.SetDescriptorHeaps(&[Some(u.views.clone()), Some(u.samplers.clone())]);
         list.SetComputeRootSignature(croot);
-        list.SetComputeRoot32BitConstants(0, b.mesh.constants.len() as u32, b.mesh.constants.as_ptr().cast(), 0);
-        for &(r, is_srv, param) in &cp.views {
-            let v = b.mesh.views.iter().find(|v| v.0 == r && v.1 == is_srv).ok_or_else(|| format!("mesh: root view {r} not bound"))?;
-            let va = root_view(v)?;
-            if is_srv { list.SetComputeRootShaderResourceView(param, va) } else { list.SetComputeRootConstantBufferView(param, va) }
+        list.SetPipelineState(cpso);
+        list.SetComputeRoot32BitConstants(0, u.mesh_constants.len() as u32, u.mesh_constants.as_ptr().cast(), 0);
+        for &(param, is_srv, va) in &u.mesh_views {
+            if is_srv { list.SetComputeRootShaderResourceView(u32::from(param), va) } else { list.SetComputeRootConstantBufferView(u32::from(param), va) }
         }
         if let Some(param) = cp.stride {
-            list.SetComputeRootShaderResourceView(param, stride_table.GetGPUVirtualAddress());
+            list.SetComputeRootShaderResourceView(param, u.stride_table.GetGPUVirtualAddress());
         }
-        list.SetComputeRootUnorderedAccessView(cp.records, records.GetGPUVirtualAddress());
-        list.SetComputeRootUnorderedAccessView(cp.records + 1, indices.GetGPUVirtualAddress());
-        list.SetComputeRootShaderResourceView(cp.records + 2, base.GetGPUVirtualAddress());
+        list.SetComputeRootUnorderedAccessView(cp.records, records);
+        list.SetComputeRootUnorderedAccessView(cp.records + 1, indices);
+        list.SetComputeRootShaderResourceView(cp.records + 2, u.base.GetGPUVirtualAddress());
         if let Some(param) = cp.lengths {
-            let mut lengths = b.mesh.lengths.clone();
-            lengths.resize(lengths.len().next_multiple_of(4).max(4), 0);
-            list.SetComputeRoot32BitConstants(param, lengths.len() as u32, lengths.as_ptr().cast(), 0);
+            list.SetComputeRoot32BitConstants(param, u.mesh_lengths.len() as u32, u.mesh_lengths.as_ptr().cast(), 0);
         }
         if let Some(param) = cp.bounds {
             list.SetComputeRoot32BitConstants(param, 8, g.as_ptr().cast(), 0);
         }
-        list.Dispatch(b.groups, 1, 1);
+        list.Dispatch(u.groups, 1, 1);
+    }
+}
+
+/// Records the draw of the uploaded binding's records (at `records`, index
+/// triples in `ibv`) with the pass-through vertex shader and the pixel
+/// program: heaps, root signature, pipeline, arguments. Targets, viewport
+/// and topology are the caller's.
+pub fn record_draw(list: &ID3D12GraphicsCommandList, pipes: &Pipes, u: &Uploaded, records: u64, ibv: &D3D12_INDEX_BUFFER_VIEW, max_prims: u32) {
+    let (gp, g) = (&pipes.gp, &u.bounds);
+    // SAFETY: as in record_dispatch.
+    unsafe {
+        list.SetDescriptorHeaps(&[Some(u.views.clone()), Some(u.samplers.clone())]);
+        list.SetPipelineState(&pipes.gpso);
+        list.SetGraphicsRootSignature(&pipes.groot);
+        if pipes.vertex.is_some() {
+            list.SetGraphicsRoot32BitConstants(0, u.mesh_constants.len() as u32, u.mesh_constants.as_ptr().cast(), 0);
+        } else {
+            list.SetGraphicsRoot32BitConstants(0, 1, [0u32].as_ptr().cast(), 0);
         }
+        if pipes.pixel {
+            list.SetGraphicsRoot32BitConstants(1, u.pixel_constants.len() as u32, u.pixel_constants.as_ptr().cast(), 0);
+        }
+        for &(param, is_srv, va) in &u.pixel_views {
+            if is_srv { list.SetGraphicsRootShaderResourceView(u32::from(param), va) } else { list.SetGraphicsRootConstantBufferView(u32::from(param), va) }
+        }
+        if let Some(param) = gp.stride {
+            list.SetGraphicsRootShaderResourceView(param, u.stride_table.GetGPUVirtualAddress());
+        }
+        list.SetGraphicsRootShaderResourceView(gp.records, records);
+        if let Some(param) = gp.bounds {
+            list.SetGraphicsRoot32BitConstants(param, 8, g.as_ptr().cast(), 0);
+        }
+        if let Some((vertices, instances, strip)) = pipes.vertex {
+            use windows::Win32::Graphics::Direct3D::{D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP};
+            list.IASetPrimitiveTopology(if strip { D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP } else { D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST });
+            list.DrawInstanced(vertices, instances, 0, 0);
+        } else {
+            list.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            list.IASetIndexBuffer(Some(ibv));
+            list.DrawIndexedInstanced(u.groups * max_prims * 3, 1, 0, 0, 0);
+        }
+    }
+}
+
+fn submit(host: &xnw_gpu::host::Host, p: &Programs, b: &Binding, t: &Target, into: Option<&Into>) -> Result<Frame, String> {
+    if !host.caps.software && std::env::var("XNW_BRIDGE_HW").ok().as_deref() != Some("1") {
+        return Err("the title's translated programs run on the software adapter; the hardware adapter needs XNW_BRIDGE_HW=1 (a scheduled run)".into());
+    }
+    if let Some(gap) = gap(&host.caps, &p.needs()) {
+        return Err(gap);
+    }
+    let e = |e: windows::core::Error| e.message().to_string();
+    let dev = &host.device;
+    let pixel = !t.depth_only;
+    let formats = if pixel { targets(&p.ps.dxil) } else { Vec::new() };
+    let count = formats.last().map_or(0, |f| f.0 as usize + 1);
+    if pixel && formats.first().map(|f| *f) != Some((0, DXGI_FORMAT_R32G32B32A32_FLOAT.0)) {
+        return Err(format!("the pixel program's target 0 is not a float target ({formats:?})"));
+    }
+    let (formats, count, read) = if into.is_some() { (vec![(0, INTO_COLOUR.0)], 1, false) } else { (formats, count, true) };
+    let (w, h) = (t.width, t.height);
+    let depth_state = if into.is_some() { Some((false, D3D12_COMPARISON_FUNC_GREATER_EQUAL.0)) } else { t.depth };
+    let reverse = depth_state.is_some_and(|(_, func)| matches!(D3D12_COMPARISON_FUNC(func), D3D12_COMPARISON_FUNC_GREATER | D3D12_COMPARISON_FUNC_GREATER_EQUAL));
+    let pipes = Pipes::new(dev, p, pixel, &formats, depth_state)?;
+    // SAFETY: D3D12 calls with descriptions that outlive them; every
+    // resource lives until the fence says the GPU is done.
+    unsafe {
+        let buffer = |size: u64, heap: D3D12_HEAP_TYPE, flags: D3D12_RESOURCE_FLAGS, state: D3D12_RESOURCE_STATES| buffer(dev, size, heap, flags, state);
+        let texture = |w: u32, h: u32, format: DXGI_FORMAT, flags: D3D12_RESOURCE_FLAGS, state: D3D12_RESOURCE_STATES, clear: Option<*const D3D12_CLEAR_VALUE>| {
+            committed(dev, &D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: u64::from(w), Height: h, DepthOrArraySize: 1, MipLevels: 1, Format: format, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Flags: flags, ..Default::default() }, D3D12_HEAP_TYPE_DEFAULT, state, clear)
+        };
+        let heap = |ty, n: u32, flags| -> Result<ID3D12DescriptorHeap, String> { dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: ty, NumDescriptors: n.max(1), Flags: flags, ..Default::default() }).map_err(e) };
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
+        let list: ID3D12GraphicsCommandList = match &pipes.compute {
+            Some((_, cpso)) => dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, cpso),
+            None => dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &pipes.gpso),
+        }
+        .map_err(e)?;
+        let up = upload(dev, &list, b, &pipes, &mut Shared::default())?;
+
+        // The mesh program's records and index triples.
+        let lay = &p.layout;
+        let groups = u64::from(b.groups.max(1));
+        let (rec_bytes, idx_bytes) = if pipes.compute.is_some() { (groups * u64::from(lay.record_bytes()), groups * u64::from(lay.index_bytes())) } else { (256, 256) };
+        let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        let records = buffer(rec_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, uav)?;
+        let indices = buffer(idx_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, uav)?;
+        record_dispatch(&list, &pipes, &up, records.GetGPUVirtualAddress(), indices.GetGPUVirtualAddress());
         list.ResourceBarrier(&[barrier(&records, uav, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE), barrier(&indices, uav, D3D12_RESOURCE_STATE_INDEX_BUFFER)]);
 
         // Targets: float colour targets cleared to CLEAR, D32.
@@ -707,43 +967,15 @@ fn submit(host: &xnw_gpu::host::Host, p: &Programs, b: &Binding, t: &Target, int
             list.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, far, 0, None);
         }
 
-        list.SetPipelineState(&gpso);
-        list.SetGraphicsRootSignature(&groot);
-        if p.vertex.is_some() {
-            list.SetGraphicsRoot32BitConstants(0, b.mesh.constants.len() as u32, b.mesh.constants.as_ptr().cast(), 0);
-        } else {
-            list.SetGraphicsRoot32BitConstants(0, 1, [0u32].as_ptr().cast(), 0);
-        }
-        if pixel {
-            list.SetGraphicsRoot32BitConstants(1, b.pixel.constants.len() as u32, b.pixel.constants.as_ptr().cast(), 0);
-        }
-        for &(r, is_srv, param) in &gp.views {
-            let v = b.pixel.views.iter().chain(if p.vertex.is_some() { &b.mesh.views[..] } else { &[] }).find(|v| v.0 == r && v.1 == is_srv).ok_or_else(|| format!("pixel: root view {r} not bound"))?;
-            let va = root_view(v)?;
-            if is_srv { list.SetGraphicsRootShaderResourceView(param, va) } else { list.SetGraphicsRootConstantBufferView(param, va) }
-        }
-        if let Some(param) = gp.stride {
-            list.SetGraphicsRootShaderResourceView(param, stride_table.GetGPUVirtualAddress());
-        }
-        list.SetGraphicsRootShaderResourceView(gp.records, records.GetGPUVirtualAddress());
-        if let Some(param) = gp.bounds {
-            list.SetGraphicsRoot32BitConstants(param, 8, g.as_ptr().cast(), 0);
-        }
         // The first handle outlives the call (a temporary in an `if` arm
         // is dropped at the arm's end: edition 2024; WARP 1.0.22 crashed).
         let first = rtv(0);
         list.OMSetRenderTargets(count as u32, (count > 0).then_some(&first as *const _), true, Some(&dsv));
         list.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: w as f32, Height: h as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
         list.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 }]);
-        if let Some((vertices, instances, strip)) = p.vertex {
-            use windows::Win32::Graphics::Direct3D::{D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP};
-            list.IASetPrimitiveTopology(if strip { D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP } else { D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST });
-            list.DrawInstanced(vertices, instances, 0, 0);
-        } else {
-            list.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            list.IASetIndexBuffer(Some(&D3D12_INDEX_BUFFER_VIEW { BufferLocation: indices.GetGPUVirtualAddress(), SizeInBytes: idx_bytes as u32, Format: DXGI_FORMAT_R32_UINT }));
-            list.DrawIndexedInstanced(b.groups * lay.max_prims * 3, 1, 0, 0, 0);
-        }
+        list.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        let ibv = D3D12_INDEX_BUFFER_VIEW { BufferLocation: indices.GetGPUVirtualAddress(), SizeInBytes: idx_bytes as u32, Format: DXGI_FORMAT_R32_UINT };
+        record_draw(&list, &pipes, &up, records.GetGPUVirtualAddress(), &ibv, lay.max_prims);
 
         // Target 0 back: 16 B per pixel, rows at the copy pitch. The depth
         // target after it, at the footprint the device gives its plane.
@@ -765,7 +997,7 @@ fn submit(host: &xnw_gpu::host::Host, p: &Programs, b: &Binding, t: &Target, int
             let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&depth), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
             list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
         }
-        let rback = if t.records && compute.is_some() {
+        let rback = if t.records {
             let r = buffer(rec_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST)?;
             list.ResourceBarrier(&[barrier(&records, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
             list.CopyBufferRegion(&r, 0, &records, 0, rec_bytes);
@@ -806,7 +1038,7 @@ fn submit(host: &xnw_gpu::host::Host, p: &Programs, b: &Binding, t: &Target, int
             recs.extend_from_slice(std::slice::from_raw_parts(from.cast::<u8>(), rec_bytes as usize));
             r.Unmap(0, None);
         }
-        drop((keep, colour, depth, records, indices, base, stride_table));
+        drop((up, colour, depth, records, indices));
         Ok(Frame { rt0, depth: zs, far, targets: count, seconds, records: recs })
     }
 }
