@@ -34,6 +34,9 @@ use crate::pack::Pack;
 /// draw's: the bone palette (48 B a bone) and the pool as an unordered view.
 pub const PALETTE_SLOT: u32 = 1;
 pub const POOL_SLOT: u32 = 36;
+/// HAIR4: the sim state `smh_sim` writes (unordered, 5.4 MB); the sim
+/// records' InterpolateStrands variants read it as slot 16.
+pub const SIM_SLOT: u32 = 33;
 /// HAIR3: the head position table `CS_UpdatePosePosition` grows the guides
 /// from (record +0x13c: its header's byte), filled on the GPU by the head
 /// compute graph, zero in every capture.
@@ -43,9 +46,42 @@ pub const SPAN_SLOT: u32 = 22;
 const GPU_ALIAS: u64 = 0x4_0000_0000;
 const BONE: usize = 48;
 
-/// A strand-input program of the chain, by its name.
+/// A strand-input program of the chain, by its name. With
+/// [`sim_on`] the `smh_sim_N` dispatches (Init, Solve) run between them in
+/// captured order: they write the sim state (frame table slot 33) that the
+/// sim records' InterpolateStrands variants read back as slot 16.
 pub fn is_chain(name: &str) -> bool {
-    name.starts_with("smh_pose_") || name.starts_with("smh_gen_")
+    name.starts_with("smh_pose_") || name.starts_with("smh_gen_") || (name.starts_with("smh_sim_") && sim_on())
+}
+
+/// `smh_sim_3:CS_InitSimBuffer`: the Init of the smh_sim_3 records (pk8a
+/// f1027 and pk9a f1070-1075 hold none of its dispatches).
+pub const INIT_3: u128 = 0xd8f39b4be685c330a42ce9ff24e9aae6;
+const INIT_3_BEFORE: &str = "smh_sim_3:CS_SolvePerVertConstraint";
+
+/// `XNW_HAIR_SIM_INIT=on` (default off, needs [`sim_on`]): the stand-in
+/// Init [`INIT_3`] before a record's first Solve when no Init ran for it.
+pub fn init_on() -> bool {
+    sim_on() && std::env::var("XNW_HAIR_SIM_INIT").is_ok_and(|v| v == "on")
+}
+
+/// A compute program of the shader pack by its hash, translated as
+/// [`crate::compute::program`] translates a captured one.
+fn standin_program(hash: u128) -> Result<crate::compute::Program, String> {
+    let rpf = xnw_gpu::d3d12x::pack::default_pack().ok_or("the stand-in Init comes from shaders.rpf: set XNW_GAME_DRIVE (or XNW_SHADER_PACK)")?;
+    let c = ps::container(&rpf, None, hash).ok_or_else(|| format!("{}: no container {hash:032x}", rpf.display()))?;
+    let shader = xnw_shader::emit::translate_with(&c, xnw_world::bridge::options()).map_err(|e| format!("{hash:032x}: {e}"))?;
+    let wave = ps::wave_size(&c).ok_or("no wave size")?;
+    let uses = cr::uses(&c)?;
+    let (mut named, mut w) = (HashMap::new(), 32);
+    crate::bridge::named(&c, &mut named, &mut w)?;
+    Ok(crate::compute::Program { shader, wave, uses, named, container: hash })
+}
+
+/// `XNW_HAIR_SIM=on` (default off, HAIR5): run the captured `smh_sim`
+/// dispatches in the chain (PACK v2.10 gives them their tables).
+pub fn sim_on() -> bool {
+    std::env::var("XNW_HAIR_SIM").is_ok_and(|v| v == "on")
 }
 
 /// One dispatch run.
@@ -79,6 +115,10 @@ pub struct Chain {
     pub dropped: BTreeMap<&'static str, u32>,
     /// The device failed: the chain ended there.
     pub removed: bool,
+    /// HAIR5 ([`sim_on`]): the sim state (slot 33) after the last dispatch,
+    /// at its title address; empty without the sim.
+    pub sim_at: u64,
+    pub sim: Vec<u8>,
 }
 
 impl Chain {
@@ -307,6 +347,27 @@ fn borrowed(p: &Pack, want: &[SlotView]) -> HashMap<(u64, u64), (i64, Vec<u8>)> 
 /// shared compute runner.
 pub fn run(p: &Pack, host: &xnw_gpu::host::Host) -> Result<Chain, String> {
     let names = crate::audit::program_names(&p.dir).ok_or("hair chain: no shader-names.tsv above the frame")?;
+    let mut runner = cr::Runner::new(host)?;
+    run_on(p, &mut runner, &names, &mut Programs::new(), true)
+}
+
+/// Translated chain programs by container hash (HAIR6: the live path keeps
+/// them across frames; a translation takes far longer than a frame).
+pub type Programs = HashMap<u128, Result<crate::compute::Program, String>>;
+
+/// The program names of the shader pack (`shader-names.tsv`), for a pack
+/// made in memory (HAIR6).
+pub fn names_in(dir: &std::path::Path) -> Option<HashMap<u128, String>> {
+    crate::audit::program_names(&dir.join("x"))
+}
+
+/// [`run`] on `runner` (its kept resources forgotten first: every frame
+/// starts from a zero pool, as a capture's), with the shader pack's
+/// `names` and the translations in `programs` (filled as met); `cpu`:
+/// each PreSkinSimGuides step's pool read back against the CPU rule.
+pub fn run_on(p: &Pack, runner: &mut cr::Runner, names: &HashMap<u128, String>, programs: &mut Programs, cpu: bool) -> Result<Chain, String> {
+    runner.forget();
+    let names = names.clone();
     let list = dispatches(p, &names);
     let first = list.first().ok_or("hair chain: no strand-input dispatch in the frame")?.0;
     let table = |sink: u32| p.tables(sink).into_iter().find(|t| t.0 == 0).map(|t| t.2).unwrap_or_default();
@@ -339,7 +400,12 @@ pub fn run(p: &Pack, host: &xnw_gpu::host::Host) -> Result<Chain, String> {
         }
         n
     };
-    let mut runner = cr::Runner::new(host)?;
+    // HAIR5 probes (default off): `XNW_HAIR_LIMIT=<s>` the runner's
+    // per-submission limit (600 s), `XNW_HAIR_SKIP=<sink>,..` sinks left out.
+    if let Some(s) = std::env::var("XNW_HAIR_LIMIT").ok().and_then(|v| v.trim().parse::<f64>().ok()) {
+        runner.limit = s;
+    }
+    let skip: BTreeSet<u32> = std::env::var("XNW_HAIR_SKIP").unwrap_or_default().split(',').filter_map(|v| v.trim().parse().ok()).collect();
     // Inputs the capture holds in part, put at their addresses once (the
     // runner then binds what it holds at an address over the capture's bytes).
     let mut palettes: HashMap<u64, Vec<u8>> = HashMap::new();
@@ -419,7 +485,9 @@ pub fn run(p: &Pack, host: &xnw_gpu::host::Host) -> Result<Chain, String> {
     if !assetless.is_empty() {
         chain.lacks.insert(format!("records {assetless:?}: no strand asset (+0x120) held: their dispatches are not run"));
     }
-    let mut programs: HashMap<u64, Result<crate::compute::Program, String>> = HashMap::new();
+    // HAIR5: records whose sim state an Init dispatch has written (or the stand-in).
+    let mut inited: BTreeSet<u32> = BTreeSet::new();
+    let mut standin: Option<Result<crate::compute::Program, String>> = None;
     for (sink, _, _, name) in list {
         let mut step = Step { sink, name, ..Step::default() };
         step.constants = p.data.refs_of(sink).find(|r| r.kind == kind::ROOTS && r.slot == 1).and_then(|r| p.bytes_of(r)).map(|b| b.chunks_exact(4).map(|w| le32(w, 0)).collect()).unwrap_or_default();
@@ -428,8 +496,14 @@ pub fn run(p: &Pack, host: &xnw_gpu::host::Host) -> Result<Chain, String> {
             chain.steps.push(step);
             continue;
         }
+        if skip.contains(&sink) {
+            step.skipped = Some("not run: XNW_HAIR_SKIP".into());
+            chain.steps.push(step);
+            continue;
+        }
         let pipeline = p.data.sinks.iter().find(|s| s.index == sink).map_or(0, |s| s.pipeline);
-        let prog = match programs.entry(pipeline).or_insert_with(|| crate::compute::program(p, sink)) {
+        let container = p.data.programs.iter().find(|g| g.pipeline == pipeline && g.stage == "compute").map_or(0, |g| g.container);
+        let prog = match programs.entry(container).or_insert_with(|| crate::compute::program(p, sink)) {
             Ok(x) => x,
             Err(e) => {
                 runner.refuse(cr::why::TRANSLATE, e.clone());
@@ -438,6 +512,38 @@ pub fn run(p: &Pack, host: &xnw_gpu::host::Host) -> Result<Chain, String> {
                 continue;
             }
         };
+        let record = step.constants.get(3).copied().unwrap_or(u32::MAX);
+        if step.name.contains(":CS_InitSimBuffer") {
+            inited.insert(record);
+        }
+        // HAIR5 `XNW_HAIR_SIM_INIT=on`: a smh_sim_3 Solve of a record no
+        // Init has written runs after that variant's Init (d8f39b4b, in no
+        // captured frame: from shaders.rpf) over the Solve's own bindings
+        // (the two declare the same five: slots 15, 20-22 and 33, V) and
+        // group count (I).
+        if init_on() && step.name.starts_with(INIT_3_BEFORE) && inited.insert(record) {
+            let mut init = Step { sink, name: format!("stand-in {INIT_3:032x} smh_sim_3:CS_InitSimBuffer (record {record})"), constants: step.constants.clone(), ..Step::default() };
+            match standin.get_or_insert_with(|| standin_program(INIT_3)) {
+                Err(e) => init.error = Some(format!("translate: {e}")),
+                Ok(sp) => {
+                    let l = crate::compute::load(p, sink, &sp.uses, &sp.named);
+                    let mut j = l.job();
+                    j.heap = named.clone();
+                    init.groups = j.groups;
+                    match runner.dispatch(&sp.shader, sp.wave, &sp.uses, &j) {
+                        Ok(cr::Outcome::Dropped(d)) => init.error = Some(format!("dropped: {} ({})", d.reason, d.detail)),
+                        Ok(cr::Outcome::Ran(r)) => init.seconds = r.seconds,
+                        Err(e) => {
+                            init.error = Some(e);
+                            chain.steps.push(init);
+                            chain.removed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            chain.steps.push(init);
+        }
         let loaded = crate::compute::load(p, sink, &prog.uses, &prog.named);
         chain.lacks.extend(loaded.lacks.iter().filter(|l| !l.contains("sampler heap")).cloned());
         let mut job = loaded.job();
@@ -457,7 +563,7 @@ pub fn run(p: &Pack, host: &xnw_gpu::host::Host) -> Result<Chain, String> {
                 break;
             }
         }
-        if step.error.is_none() && step.name.contains("CS_PreSkinSimGuides") {
+        if cpu && step.error.is_none() && step.name.contains("CS_PreSkinSimGuides") {
             let mut records = p.slot_bytes(sink, 0, xnw_world::hair::GROUPS_SLOT).map(|r| r.1).unwrap_or_default();
             patch(&mut records);
             let palette = table(sink).iter().find(|v| v.slot == PALETTE_SLOT).and_then(|v| palettes.get(&v.addr)).map_or(&[][..], |b| &b[..]);
@@ -467,6 +573,14 @@ pub fn run(p: &Pack, host: &xnw_gpu::host::Host) -> Result<Chain, String> {
         chain.steps.push(step);
     }
     chain.dropped = runner.dropped.clone();
+    if sim_on()
+        && let Some(v) = table(first).into_iter().find(|v| v.slot == SIM_SLOT)
+    {
+        chain.sim_at = v.addr;
+        let k = crate::compute::key(v.addr);
+        chain.sim = if runner.held(k).is_some() && !chain.removed { runner.read(k)? } else { Vec::new() };
+        chain.sim.truncate(v.bytes as usize);
+    }
     chain.pool = if runner.held(pool_key).is_some() && !chain.removed { runner.read(pool_key)? } else { vec![0; pool_view.bytes as usize] };
     chain.pool.truncate(pool_view.bytes as usize);
     Ok(chain)
@@ -557,6 +671,10 @@ pub fn chain_cmd(dir: &std::path::Path) -> Result<Chain, String> {
         println!("  lacks: {l}");
     }
     println!("{}", c.line());
+    if sim_on() {
+        let fnv = c.sim.iter().fold(0x811c_9dc5u32, |h, b| (h ^ u32::from(*b)).wrapping_mul(0x0100_0193));
+        println!("hair sim: state (slot 33) {} B at {:#x}, {} non-zero after the chain, fnv {fnv:08x}", c.sim.len(), c.sim_at, c.sim.iter().filter(|b| **b != 0).count());
+    }
     if std::env::var("XNW_HAIR_DUMP").is_ok() {
         for at in [0x1680000usize, 0x1688a60, 0x1689ee0, 0x168aa68, 0x2cf8740, 0x2cfc380] {
             let w: Vec<String> = (0..24).map(|i| { let x = le32(&c.pool, at + 4 * i); format!("{x:08x}={:.3}", f32::from_bits(x)) }).collect();
@@ -595,6 +713,37 @@ pub fn chain_cmd(dir: &std::path::Path) -> Result<Chain, String> {
                     }
                 }
             }
+        }
+    }
+    // HAIR5: every record, drawn or not, at LOD 0 and 1: strands with more
+    // than one point position, mean root and tip (the record's box space),
+    // mean strand length.
+    let first = dispatches(&p, &crate::audit::program_names(&p.dir).unwrap_or_default()).first().map_or(0, |d| d.0);
+    let records = p.slot_bytes(first, 0, xnw_world::hair::GROUPS_SLOT).map(|r| r.1).unwrap_or_default();
+    for (i, rec) in records.chunks_exact(xnw_world::hair::GROUP_BYTES).enumerate() {
+        let g = xnw_world::hair::Group::parse(rec);
+        for lod in [0, 1] {
+            let (_, n) = g.layout(lod);
+            let (mut open, mut root, mut tip, mut length) = (0u32, [0f32; 3], [0f32; 3], 0f32);
+            for k in 0..g.strands {
+                let (at, len) = g.strand_bytes(lod, k);
+                let Some(b) = c.pool.get(at as usize..(at + len) as usize) else { continue };
+                let pts: Vec<[f32; 3]> = b.chunks_exact(16).map(|q| g.position(q)).collect();
+                if pts.iter().all(|q| *q == pts[0]) {
+                    continue;
+                }
+                open += 1;
+                for a in 0..3 {
+                    root[a] += pts[0][a];
+                    tip[a] += pts[pts.len() - 1][a];
+                }
+                length += pts.windows(2).map(|w| (0..3).map(|a| (w[1][a] - w[0][a]).powi(2)).sum::<f32>().sqrt()).sum::<f32>();
+            }
+            let m = open.max(1) as f32;
+            println!(
+                "  record {i} lod {lod} ({} strands x {n} points, world {}): {open} open; root ({:.3},{:.3},{:.3}) tip ({:.3},{:.3},{:.3}) length {:.3}",
+                g.strands, g.world, root[0] / m, root[1] / m, root[2] / m, tip[0] / m, tip[1] / m, tip[2] / m, length / m
+            );
         }
     }
     let (draws, census) = crate::hair::strands(&p, Some((c.pool_at, &c.pool)));

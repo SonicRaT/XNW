@@ -604,7 +604,7 @@ fn draw_words(pack: &Pack, sink: u32, at: u32, out: &mut Loaded) -> bool {
             continue;
         }
         match v.kind {
-            view::TEXTURE | view::PLACED => match pack.view_texels(&v) {
+            view::TEXTURE | view::PLACED => match pack.view_texels_shaped(&v) {
                 Ok(t) => {
                     out.heap.push((v.slot, LSlot::Texture(t)));
                     tex += 1;
@@ -612,7 +612,7 @@ fn draw_words(pack: &Pack, sink: u32, at: u32, out: &mut Loaded) -> bool {
                 Err(why) => {
                     // A texture the program samples must be a texture view:
                     // a 1x1 grey (0.5) stands in.
-                    out.heap.push((v.slot, LSlot::Texture(Provided { width: 1, height: 1, format: 28, rows: vec![128, 128, 128, 255], row_bytes: 4, row_count: 1, dim: xnw_world::textures::TEX_2D, depth: 1 })));
+                    out.heap.push((v.slot, LSlot::Texture(Provided { width: 1, height: 1, format: 28, rows: vec![128, 128, 128, 255], row_bytes: 4, row_count: 1, dim: xnw_world::textures::TEX_2D, depth: 1, mips: 1 })));
                     missing.push(format!("{} ({why})", v.slot));
                 }
             },
@@ -656,21 +656,38 @@ pub fn samplers(pack: &Pack, sink: u32, lacks: &mut Vec<String>) -> Option<Vec<(
 
 /// The translated pair of sink `sink`, the table slots the two programs
 /// name (root, slot) with their strides, and the two container hashes.
+/// Whether the pixel program may run on an adapter is [`pixel_refused`]'s
+/// to say, asked where it is about to run: the mesh half alone is not
+/// refused (CARD5 c0: with the refusal here, `--bridgems b31c5ed5` on the
+/// card prepared 0 rows, its only pixel program being on the deny list).
 pub fn programs(pack: &Pack, sink: u32) -> Result<(bridge::Programs, HashMap<(u16, u32), u32>, [u128; 2]), String> {
     let pipeline = pack.data.sinks.iter().find(|s| s.index == sink).ok_or("no such sink")?.pipeline;
     let stage = |name: &str| pack.data.programs.iter().find(|p| p.pipeline == pipeline && p.stage == name).ok_or_else(|| format!("sink {sink}: the pipeline has no {name} program"));
     let (msr, psr) = (stage("mesh")?, stage("pixel")?);
     let code = |h: u128| pack.blob(h).ok_or_else(|| format!("no container bytes for {h:032x}"));
     let (msc, psc) = (code(msr.container)?, code(psr.container)?);
-    let (ms, layout) = emit::mesh::translate_fallback(&msc, bridge::options()).map_err(|e| format!("mesh program {:032x}: {e}", msr.container))?;
-    let ps = emit::translate_with(&psc, bridge::options()).map_err(|e| format!("pixel program {:032x}: {e}", psr.container))?;
-    let vs = emit::mesh::passthrough_vs(&layout, Some(&ps.dxil)).map_err(|e| format!("pass-through vertex shader: {e}"))?;
-    let mut used = HashMap::new();
-    let mut wave = 32;
-    for c in [&msc, &psc] {
-        named(c, &mut used, &mut wave)?;
+
+    // bridgeps's own translation (`XNW_HEAP_NONUNIFORM` included), so that
+    // `--bridge-dump` writes the programs a bridgeps row runs (HANG2).
+    let (p, used) = xnw_world::bridged::translate(&msc, &psc).map_err(|e| format!("{e} ({:032x}, {:032x})", msr.container, psr.container))?;
+    Ok((p, used, [msr.container, psr.container]))
+}
+
+/// Why the title's pixel program of the pair `hashes` (mesh, pixel
+/// containers) is not run on this adapter by the single-draw bridge,
+/// bridgems or the pixel audit (None: it may): it is on the bridge's deny
+/// list (`bridge::DENY_HW`), or the pair samples cube images, for which
+/// these three bind 2D views and 2D nulls (bridgeps binds a stand-in of the
+/// title's dimension).
+pub fn pixel_refused(pack: &Pack, hashes: &[u128; 2], software: bool) -> Option<String> {
+    if software {
+        return None;
     }
-    Ok((bridge::Programs { ms, layout, vs, ps, wave, vertex: None }, used, [msr.container, psr.container]))
+    if let Some(why) = bridge::denied(hashes[1], software) {
+        return Some(why);
+    }
+    let (msc, psc) = (pack.blob(hashes[0])?, pack.blob(hashes[1])?);
+    (xnw_world::bridged::dims_read(&[&msc, &psc]) & 1 << 9 != 0).then(|| format!("pixel program {:08x} (mesh {:08x}) samples cube images and this path binds 2D views only: not run on the hardware adapter (bridgeps binds the title's dimension)", hashes[1] >> 96, hashes[0] >> 96))
 }
 
 /// The table slots a console container's programs name, with the widest
@@ -700,7 +717,7 @@ pub fn mesh_program(pack: &Pack, container: u128) -> Result<(bridge::Programs, H
     let vs = emit::mesh::passthrough_vs(&layout, None).map_err(|e| format!("pass-through vertex shader: {e}"))?;
     let (mut used, mut wave) = (HashMap::new(), 32);
     named(&msc, &mut used, &mut wave)?;
-    let ps = emit::HostShader { stage: xnw_shader::HwStage::Ps, dxil: Vec::new(), user_data: Vec::new(), samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: Vec::new(), root_srvs: Vec::new(), root_uavs: Vec::new(), address_map: false, descriptor_words: false };
+    let ps = emit::HostShader { stage: xnw_shader::HwStage::Ps, dxil: Vec::new(), user_data: Vec::new(), samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: Vec::new(), root_srvs: Vec::new(), root_uavs: Vec::new(), half_views: Vec::new(), address_map: false, descriptor_words: false };
     Ok((bridge::Programs { ms, layout, vs, ps, wave, vertex: None }, used))
 }
 
@@ -709,15 +726,20 @@ pub fn mesh_program(pack: &Pack, container: u128) -> Result<(bridge::Programs, H
 /// vertex program translated as it is, no pixel program (HAIR1: the strand
 /// draws, whose pixel program writes the visibility buffer).
 pub fn vertex_program(pack: &Pack, sink: u32, vertices: u32, instances: u32, strip: bool) -> Result<(bridge::Programs, HashMap<(u16, u32), u32>, u128), String> {
-    let pipeline = pack.data.sinks.iter().find(|s| s.index == sink).ok_or("no such sink")?.pipeline;
-    let container = pack.data.programs.iter().find(|p| p.pipeline == pipeline && p.stage == "vertex").ok_or_else(|| format!("sink {sink}: the pipeline has no vertex program"))?.container;
+    let container = vertex_container(pack, sink)?;
     let vsc = pack.blob(container).ok_or_else(|| format!("no container bytes for {container:032x}"))?;
     let ms = emit::translate_with(&vsc, bridge::options()).map_err(|e| format!("vertex program {container:032x}: {e}"))?;
     let (mut used, mut wave) = (HashMap::new(), 32);
     named(&vsc, &mut used, &mut wave)?;
-    let none = || emit::HostShader { stage: xnw_shader::HwStage::Ps, dxil: Vec::new(), user_data: Vec::new(), samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: Vec::new(), root_srvs: Vec::new(), root_uavs: Vec::new(), address_map: false, descriptor_words: false };
+    let none = || emit::HostShader { stage: xnw_shader::HwStage::Ps, dxil: Vec::new(), user_data: Vec::new(), samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: Vec::new(), root_srvs: Vec::new(), root_uavs: Vec::new(), half_views: Vec::new(), address_map: false, descriptor_words: false };
     let layout = emit::mesh::Layout { max_vertices: 0, max_prims: 0, rows: 1, elements: Vec::new() };
     Ok((bridge::Programs { ms, layout, vs: Vec::new(), ps: none(), wave, vertex: Some((vertices, instances, strip)) }, used, container))
+}
+
+/// The container hash of a draw sink's vertex program.
+pub fn vertex_container(pack: &Pack, sink: u32) -> Result<u128, String> {
+    let pipeline = pack.data.sinks.iter().find(|s| s.index == sink).ok_or("no such sink")?.pipeline;
+    Ok(pack.data.programs.iter().find(|p| p.pipeline == pipeline && p.stage == "vertex").ok_or_else(|| format!("sink {sink}: the pipeline has no vertex program"))?.container)
 }
 
 /// The G-buffer stage: what a decal row is drawn as for its depth.
@@ -1101,6 +1123,9 @@ pub fn cli(args: &[String], dir: &Path, index: &str, host: &xnw_gpu::host::Host,
     let draw = *pack.list_draws().ok_or("no list-draws.tsv")?.get(k).ok_or("list-draws.tsv is shorter than list.tsv")?;
     let sink = pack.sink_of(draw).ok_or_else(|| format!("hook draw {draw} is not paired 1:1 with a sink"))?;
     let (p, used, hashes) = programs(&pack, sink)?;
+    if let Some(why) = pixel_refused(&pack, &hashes, host.caps.software) {
+        return Err(format!("bridge: {why}"));
+    }
     let triangles = geoms.get(&row.geom).map_or(0, |g| g.1.len() / 3);
     println!("bridge: list row {k} = hook draw {draw} = sink {sink}: stage {}, {triangles} triangles; mesh {:032x} as compute (records of {} B: {} vertices x {} B, {} primitives), pixel {:032x}", row.stage, hashes[0], p.layout.record_bytes(), p.layout.max_vertices, p.layout.vertex_stride(), p.layout.max_prims, hashes[1]);
     for (name, c) in [("mesh (compute form)", &p.ms.dxil), ("pass-through vertex", &p.vs), ("pixel", &p.ps.dxil)] {
@@ -1253,7 +1278,7 @@ mod tests {
         let pack = Pack::open(&dir).unwrap().unwrap();
         let row = Row { mesh_at: 0x5000, vb_at: 0x8000, handles: vec![0x4_0000 + 32 * 300, 0], palette: None, window: None };
         let used: HashMap<(u16, u32), u32> = [((1, 2), 0), ((1, 0), 0), ((0, BINDLESS_SLOT), 0)].into();
-        let mut texels: Provider = Box::new(|h| (h == 0x4_0000 + 32 * 300).then(|| Provided { width: 1, height: 1, format: 28, rows: vec![0; 4], row_bytes: 4, row_count: 1, dim: xnw_world::textures::TEX_2D, depth: 1 }));
+        let mut texels: Provider = Box::new(|h| (h == 0x4_0000 + 32 * 300).then(|| Provided { width: 1, height: 1, format: 28, rows: vec![0; 4], row_bytes: 4, row_count: 1, dim: xnw_world::textures::TEX_2D, depth: 1, mips: 1 }));
         let l = load(&pack, 0, &row, Some(&[5; 24]), &used, &mut texels);
         let d = l.draw();
         assert_eq!(d.groups, 3);

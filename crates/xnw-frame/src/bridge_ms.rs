@@ -66,9 +66,7 @@ fn median(mut v: Vec<f64>) -> f64 {
 
 /// `--bridgems`.
 pub fn bridgems_cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, pass: &mut Pass, wanted: &[u32], wanted_ps: &[u32]) -> Result<(), String> {
-    if !host.caps.software && std::env::var("XNW_BRIDGE_HW").ok().as_deref() != Some("1") {
-        return Err("bridgems: the title's translated programs run on the software adapter; the hardware adapter needs XNW_BRIDGE_HW=1 (a scheduled run)".into());
-    }
+    xnw_world::bridge::title_programs_here(host).map_err(|e| format!("bridgems: {e}"))?;
     let (mut list, geoms) = load_list(dir)?;
     let pack = Pack::open(dir)?.ok_or("--bridgems needs a v2 capture (pack\\manifest.tsv)")?;
     let mut args = args.to_vec();
@@ -91,9 +89,14 @@ pub fn bridgems_cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, pas
     let dev = &host.device;
     let t0 = std::time::Instant::now();
     let mut batch = pass.bridge_ms.take().unwrap_or_default();
+    // The uploads' submissions under the watchdog, with their line.
+    crate::replay::watchdog_arm();
     batch.begin(dev)?;
     let mut progs: HashMap<u64, Result<_, String>> = HashMap::new();
-    let empty_ps = xnw_shader::emit::HostShader { stage: xnw_shader::HwStage::Ps, dxil: Vec::new(), user_data: Vec::new(), samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: Vec::new(), root_srvs: Vec::new(), root_uavs: Vec::new(), address_map: false, descriptor_words: false };
+    // Pipelines whose title pixel program this adapter may not run, and those said so.
+    let mut refused: HashMap<u64, Option<String>> = HashMap::new();
+    let mut noted: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let empty_ps = xnw_shader::emit::HostShader { stage: xnw_shader::HwStage::Ps, dxil: Vec::new(), user_data: Vec::new(), samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: Vec::new(), root_srvs: Vec::new(), root_uavs: Vec::new(), half_views: Vec::new(), address_map: false, descriptor_words: false };
     let (mut bridged, mut failed, mut other) = (Vec::new(), Vec::new(), 0u32);
     let mut layouts: Vec<u32> = Vec::new();
     // `XNW_ZEROCOPY` (ZC2): the title ranges every row will bind, first, so
@@ -127,7 +130,15 @@ pub fn bridgems_cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, pas
             other += 1;
             continue;
         }
-        let title_ps = wanted_ps.contains(&((hs[1] >> 96) as u32));
+        // The row's mesh program runs either way; the title's pixel program
+        // only where this adapter may run it (else ours shades the records).
+        let mut title_ps = wanted_ps.contains(&((hs[1] >> 96) as u32));
+        if title_ps && let Some(why) = refused.entry(pipeline).or_insert_with(|| crate::bridge::pixel_refused(&pack, hs, host.caps.software)) {
+            if noted.insert(pipeline) {
+                println!("bridgems: {why}: its rows are shaded by our pixel program");
+            }
+            title_ps = false;
+        }
         if args.iter().any(|a| a == "--bridgems-layouts") && !layouts.contains(&ms) {
             layouts.push(ms);
             let lay = &p.layout;
@@ -155,6 +166,8 @@ pub fn bridgems_cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, pas
         }
     }
     batch.finish(dev, &host.queue)?;
+    crate::replay::watchdog_disarm();
+    println!("  {}", crate::replay::watch_line("bridgems uploads"));
     let st = batch.stats.clone();
     println!(
         "bridgems: {} rows of {} mesh programs ({} with the title's pixel program), {} groups; {} pipelines made in {:.0} ms; bindings {:.1} MB ({:.1} MB shared, {} large buffers merged, largest view heap {}; new MB by kind: large views {:.1}, small views {:.1}, textures {:.1}, root views {:.1}) in {:.0} ms; ring {:.1} MB; {} failed; {other} rows of other programs; prepared in {:.2} s; title memory (XNW_ZEROCOPY): in place {} views, on title spans {} views ({:.1} MB made of {} spans, {:.1} MB), {} conflicts",
@@ -212,14 +225,26 @@ pub fn bridgems_cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, pas
         let st = st?;
         Ok((st, pass.read_rgba()?))
     };
-    let (st_ours, ours) = run(pass, &mut list, false)?;
-    let (_, ours_id) = run(pass, &mut list, true)?;
-    let into = pass.bridge_into();
-    let ours_z = read_depth(host, &into.depth, w, h)?;
-    pass.bridge_ms = Some(batch);
     crate::replay::watchdog_arm();
     let r = run(pass, &mut list, false).and_then(|a| run(pass, &mut list, true).map(|b| (a, b)));
     crate::replay::watchdog_disarm();
+    println!("  {}", crate::replay::watch_line("bridgems ours (colour, ids)"));
+    let ((st_ours, ours), (_, ours_id)) = r?;
+    let into = pass.bridge_into();
+    let ours_z = read_depth(host, &into.depth, w, h)?;
+    pass.bridge_ms = Some(batch);
+    // `--warm`: the bridged frame once first (its pictures thrown away), then the timed one.
+    if args.iter().any(|a| a == "--warm") {
+        crate::replay::watchdog_arm();
+        let r = run(pass, &mut list, false);
+        crate::replay::watchdog_disarm();
+        println!("  {}", crate::replay::watch_line("bridgems bridged warm-up"));
+        r?;
+    }
+    crate::replay::watchdog_arm();
+    let r = run(pass, &mut list, false).and_then(|a| run(pass, &mut list, true).map(|b| (a, b)));
+    crate::replay::watchdog_disarm();
+    println!("  {}", crate::replay::watch_line("bridgems bridged (colour, ids)"));
     let ((st_br, theirs), (_, theirs_id)) = r?;
     let theirs_z = read_depth(host, &into.depth, w, h)?;
     println!("bridgems: ours {} draws; bridged {} rows from records ({} with the title's pixel program) + {} of ours", st_ours.draws, st_br.bridged, st_br.bridged_title_ps, st_br.draws);
@@ -291,6 +316,7 @@ pub fn bridgems_cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, pas
         crate::replay::watchdog_arm();
         let br = time(pass, &mut list);
         crate::replay::watchdog_disarm();
+        println!("  {}", crate::replay::watch_line(&format!("bridgems repeat x{reps}")));
         let br = br?;
         println!("bridgems: GPU ms per frame (median of {reps}) on {}: ours {full:.3}, ours without the {} rows {less:.3}, bridged {br:.3}; the rows cost ours {:.3} ms, bridged {:.3} ms ({:.1} us a row)", host.caps.adapter, bridged.len(), full - less, br - less, (br - less) * 1e3 / bridged.len().max(1) as f64);
     }

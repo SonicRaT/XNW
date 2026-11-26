@@ -79,10 +79,14 @@ fn dxc() -> Option<PathBuf> {
 }
 
 fn compile(dxc: &Path, threads: u32, ws: u32, exit: bool) -> Vec<u8> {
+    compile_src(dxc, "w", SRC, threads, ws, exit)
+}
+
+fn compile_src(dxc: &Path, name: &str, text: &str, threads: u32, ws: u32, exit: bool) -> Vec<u8> {
     let dir = std::env::temp_dir().join(format!("xnw-wave-packing-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let (src, out) = (dir.join("w.hlsl"), dir.join(format!("w{threads}-{ws}-{}-{}.dxil", u8::from(exit), k())));
-    std::fs::write(&src, SRC).unwrap();
+    let (src, out) = (dir.join(format!("{name}.hlsl")), dir.join(format!("{name}{threads}-{ws}-{}-{}.dxil", u8::from(exit), k())));
+    std::fs::write(&src, text).unwrap();
     let run = Command::new(dxc).args(["-nologo", "-O3", "-T", "cs_6_6", "-E", "main"]).arg(format!("-DWS={ws}")).arg(format!("-DNT={threads}")).arg(format!("-DEXIT={}", u8::from(exit))).arg(format!("-DK={}", k())).arg("-Fo").arg(&out).arg(&src).output().unwrap();
     assert!(run.status.success(), "dxc: {}", String::from_utf8_lossy(&run.stderr));
     std::fs::read(out).unwrap()
@@ -179,5 +183,85 @@ fn wave_packing() {
     assert!(wrong.iter().all(|&(_, ws, _)| ws != 0), "native waves ran wrong: {wrong:?}");
     if !soft {
         assert!(wrong.is_empty(), "the hardware adapter ran waves wrong: {wrong:?}");
+    }
+}
+
+/// `WaveReadLaneAt` with a lane index each lane computes, every lane
+/// running: what a translated `ds_swizzle_b32` (rotate, FFT order) and DPP
+/// rotation become. Lane i holds i + 1 and reads lane (i + 1) % n, i ^ 3,
+/// i ^ n/2, the bit-reversed i, and lane 7 (the same index in every lane).
+const READS: &str = r#"
+RWByteAddressBuffer o : register(u0);
+[RootSignature("UAV(u0)")]
+#if WS
+[WaveSize(WS)]
+#endif
+[numthreads(NT, 1, 1)]
+void main(uint t : SV_GroupIndex, uint3 g : SV_GroupID) {
+    uint at = (g.x * NT + t) * 32;
+    uint lane = WaveGetLaneIndex();
+    uint n = WaveGetLaneCount();
+    uint x = lane + 1;
+    uint rev = reversebits(lane) >> (32 - firstbithigh(n));
+    o.Store4(at, uint4(t, lane, n, WaveReadLaneAt(x, (lane + 1) % n)));
+    o.Store4(at + 16, uint4(WaveReadLaneAt(x, lane ^ 3), WaveReadLaneAt(x, lane ^ (n >> 1)), WaveReadLaneAt(x, rev), WaveReadLaneAt(x, 7)));
+}
+"#;
+
+/// The reads of [`READS`] that came back wrong, by name, with the first
+/// wrong lane of each: (lane, got, want).
+fn judge_reads(w: &[u32]) -> Vec<(&'static str, u32, u32, u32)> {
+    let mut bad: Vec<(&'static str, u32, u32, u32)> = Vec::new();
+    for r in w.chunks_exact(8) {
+        let (lane, n) = (r[1], r[2]);
+        let rev = lane.reverse_bits() >> (32 - n.trailing_zeros());
+        let want = [("rotate", (lane + 1) % n), ("xor 3", lane ^ 3), ("xor half", lane ^ (n >> 1)), ("bit-reversed", rev), ("lane 7", 7)];
+        for (k, (name, src)) in want.into_iter().enumerate() {
+            if r[3 + k] != src + 1 && !bad.iter().any(|b| b.0 == name) {
+                bad.push((name, lane, r[3 + k], src + 1));
+            }
+        }
+    }
+    bad
+}
+
+/// WARP 1.0.22 (2026-11-25, V on both PCs; this is the minimal case): with
+/// `WaveSize(32)` or `WaveSize(64)` (waves emulated over its native 8
+/// lanes) a `WaveReadLaneAt` whose lane index differs between lanes reads
+/// wrong lanes: rotate, lane 6 reads 16 (lane 7 holds 8) and lane 7 reads 1
+/// (lane 8 holds 9); bit-reversed, lane 1 reads 1 (want 17, or 33 of 64).
+/// The same index in every lane (`7`) and `lane ^ 3`, `lane ^ n/2` are
+/// right, and every read on its native waves (no `WaveSize`) is right.
+/// Every lane runs: this is not the partial-exec case of `wave_packing`.
+/// The translated `ds_swizzle_b32` gives the same lists, which is why
+/// `xnw-shader`'s `ds_swizzle_rotate_mode`, `_fft_mode` and
+/// `_masked_rotations` differ on that adapter (not asserted there).
+#[test]
+fn lane_reads() {
+    let agility = std::env::var_os("XNW_AGILITY").map(PathBuf::from).filter(|d| !d.as_os_str().is_empty());
+    let host = match Host::new(agility.as_deref()) {
+        Ok(h) if h.caps.shader_model >= (6, 6) => h,
+        Ok(h) => return println!("SKIPPED: shader model {:?} < 6.6", h.caps.shader_model),
+        Err(e) => return println!("SKIPPED: no device ({e})"),
+    };
+    let Some(dxc) = dxc() else { return println!("SKIPPED: no dxc") };
+    let soft = host.caps.wave_lanes.0 < 32;
+    let mut wrong = Vec::new();
+    for ws in [64u32, 32, 0] {
+        if ws > 0 && !(host.caps.wave_lanes.0..=host.caps.wave_lanes.1).contains(&ws) {
+            continue;
+        }
+        let threads = ws.max(64);
+        let cs = compile_src(&dxc, "r", READS, threads, ws, false);
+        let w = run(&host, &cs, threads).expect("dispatch");
+        let bad = judge_reads(&w);
+        println!("WaveSize({ws:2}) lanes {:3}: reads wrong (name, lane, got, want) {bad:?}", w[2]);
+        if !bad.is_empty() {
+            wrong.push(ws);
+        }
+    }
+    assert!(!wrong.contains(&0), "native waves read lanes wrong");
+    if !soft {
+        assert!(wrong.is_empty(), "the hardware adapter read lanes wrong: WaveSize {wrong:?}");
     }
 }

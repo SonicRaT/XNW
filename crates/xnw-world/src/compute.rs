@@ -283,6 +283,46 @@ pub fn by_program<'a>(job: &Job<'a>, uses: &[Use]) -> Job<'a> {
     out
 }
 
+/// The unsigned integer format with the layout of a 16-bit float or signed
+/// integer buffer format (one, two or four channels), if `format` is one.
+/// From a victory-fork open pull request (`descriptor::host::half_format`, head
+/// 5a55384, GPL-3.0-or-later).
+pub fn half_format(format: i32) -> Option<i32> {
+    match format {
+        // R16G16B16A16_FLOAT and _SINT: R16G16B16A16_UINT.
+        10 | 14 => Some(12),
+        // R16G16_FLOAT and _SINT: R16G16_UINT.
+        34 | 38 => Some(36),
+        // R16_FLOAT and _SINT: R16_UINT.
+        54 | 59 => Some(57),
+        _ => None,
+    }
+}
+
+/// `job` as a program that moves 16-bit channels as unsigned integers
+/// through the table views at `half` ([`HostShader::half_views`]: root
+/// parameter, dword in the table) is shown it: a typed buffer view there
+/// in a 16-bit float or signed format in the unsigned format of the same
+/// layout, through which every 16-bit pattern goes as it is (victory-fork
+/// 5a55384, the host's `half_view`). Other views as they are.
+pub fn with_half_views<'a>(job: &Job<'a>, half: &[(u8, u32)]) -> Job<'a> {
+    let mut out = job.clone();
+    for &(root, dword) in half {
+        let Some(Arg::Table(t)) = out.roots.get_mut(usize::from(root)) else { continue };
+        for (k, x) in t.iter_mut() {
+            if *k != dword / 8 {
+                continue;
+            }
+            if let Res::Buffer(Buffer { kind: Kind::Typed { format, .. }, .. }) = x
+                && let Some(f) = half_format(*format)
+            {
+                *format = f;
+            }
+        }
+    }
+    out
+}
+
 /// The card-safety rules (pure): `typed_uav(format)` says whether the
 /// device stores typed to a texture view of that format.
 pub fn check(job: &Job, uses: &[Use], typed_uav: &dyn Fn(u32) -> bool) -> Result<(), Dropped> {
@@ -358,6 +398,9 @@ pub fn typed(format: u32) -> u32 {
         f => f,
     }
 }
+
+/// [`Runner`]'s formats never unordered on the hardware adapter (VIctory).
+pub const CARD_NO_UAV: [u32; 3] = [67, 86, 115];
 
 /// The format a kept texture's resource is made in: a 32-bit
 /// single-channel one typeless, so its views read it as float or as uint
@@ -491,12 +534,22 @@ fn footprints(dev: &ID3D12Device, desc: &D3D12_RESOURCE_DESC) -> (Vec<(D3D12_PLA
 
 impl<'h> Runner<'h> {
     /// A runner on `host`: the title's translated programs run on the
-    /// software adapter only.
+    /// software adapter; on the hardware adapter only as a scheduled card
+    /// sample under the GPU watchdog ([`bridge::title_programs_here`]),
+    /// each submission then given 2 s before the runner stops waiting (the
+    /// watchdog exits at its budget first).
     pub fn new(host: &'h xnw_gpu::host::Host) -> Result<Runner<'h>, String> {
-        if !host.caps.software {
-            return Err("the title's translated programs run on the software adapter only".into());
-        }
-        Ok(Runner { host, kept: HashMap::new(), pipes: HashMap::new(), dropped: BTreeMap::new(), ran: 0, seconds: 0.0, limit: 600.0 })
+        bridge::title_programs_here(host)?;
+        let limit = if host.caps.software { 600.0 } else { 2.0 };
+        Ok(Runner { host, kept: HashMap::new(), pipes: HashMap::new(), dropped: BTreeMap::new(), ran: 0, seconds: 0.0, limit })
+    }
+
+    /// Drops every kept resource and the counts; the pipelines stay (HAIR6:
+    /// one runner for the live path's chains, a frame each).
+    pub fn forget(&mut self) {
+        self.kept.clear();
+        self.dropped.clear();
+        (self.ran, self.seconds) = (0, 0.0);
     }
 
     /// What the runner holds at title address `key`.
@@ -513,6 +566,9 @@ impl<'h> Runner<'h> {
 
     /// Whether the device stores typed to a texture UAV of `format`.
     pub fn typed_uav(&self, format: u32) -> bool {
+        if self.no_uav(format) {
+            return false;
+        }
         let init = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: DXGI_FORMAT(format as i32), ..Default::default() };
         xnw_gpu::host::feature(&self.host.device, D3D12_FEATURE_FORMAT_SUPPORT, init).is_some_and(|f| f.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0 && f.Support2.0 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0 != 0)
     }
@@ -534,9 +590,21 @@ impl<'h> Runner<'h> {
         let s1 = f.Support1.0;
         let has = |b: D3D12_FORMAT_SUPPORT1| s1 & b.0 != 0;
         if uav {
+            if self.no_uav(format) {
+                return false;
+            }
             return has(D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) && f.Support2.0 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0 != 0;
         }
         has(D3D12_FORMAT_SUPPORT1_SHADER_LOAD) && (buffer && has(D3D12_FORMAT_SUPPORT1_BUFFER) || !buffer && (has(D3D12_FORMAT_SUPPORT1_TEXTURE2D) || has(D3D12_FORMAT_SUPPORT1_TEXTURE3D)))
+    }
+
+    /// Formats never made unordered on the hardware adapter, whatever it
+    /// reports: R9G9B9E5_SHAREDEXP 67, B5G5R5A1_UNORM 86, B4G4R4A4_UNORM 115
+    /// as render target or UAV were 14 of 20 card crashes upstream
+    /// (VIctory, after #2719/#2725). A view not made is a
+    /// dropped dispatch, named in the runner's drop reasons.
+    fn no_uav(&self, format: u32) -> bool {
+        !self.host.caps.software && CARD_NO_UAV.contains(&format)
     }
 
     fn submit(&self, list: &ID3D12GraphicsCommandList) -> Result<(), String> {
@@ -552,6 +620,7 @@ impl<'h> Runner<'h> {
             while fence.GetCompletedValue() < 1 {
                 self.host.device.GetDeviceRemovedReason().map_err(|x| format!("device removed: {}", e(x)))?;
                 if t.elapsed().as_secs_f64() > self.limit {
+                    xnw_gpu::gpuwatch::abandon("compute", self.limit, xnw_gpu::gpuwatch::GRACE);
                     return Err(format!("the submission took over {} s", self.limit));
                 }
                 std::thread::yield_now();
@@ -647,6 +716,13 @@ impl<'h> Runner<'h> {
     /// is a device or pipeline failure.
     pub fn dispatch(&mut self, shader: &HostShader, wave: u32, uses: &[Use], job: &Job) -> Result<Outcome, String> {
         let job = &by_program(job, uses);
+        let twins;
+        let job = if shader.half_views.is_empty() {
+            job
+        } else {
+            twins = with_half_views(job, &shader.half_views);
+            &twins
+        };
         match self.prepare(shader, wave, uses, job) {
             Err(d) => {
                 *self.dropped.entry(d.reason).or_default() += 1;
@@ -724,7 +800,7 @@ impl<'h> Runner<'h> {
             })
             .collect();
         let draw = Draw { roots, heap: job.heap.iter().map(|(k, r)| (*k, slot(r))).collect(), samplers: job.samplers.clone(), sampler_slots: job.sampler_slots, groups: job.groups[0] };
-        let none = HostShader { stage: HwStage::Ps, dxil: Vec::new(), user_data: Vec::new(), samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: Vec::new(), root_srvs: Vec::new(), root_uavs: Vec::new(), address_map: false, descriptor_words: false };
+        let none = HostShader { stage: HwStage::Ps, dxil: Vec::new(), user_data: Vec::new(), samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: Vec::new(), root_srvs: Vec::new(), root_uavs: Vec::new(), half_views: Vec::new(), address_map: false, descriptor_words: false };
         bridge::bind_at(shader, &none, &draw, 0).map_err(|e| dropped(why::BINDING, e))
     }
 
@@ -1034,6 +1110,15 @@ impl<'h> Runner<'h> {
         Ok(ran)
     }
 
+    /// `len` bytes at title address `at` from the held buffer that covers
+    /// them (a record at an offset of a buffer an earlier dispatch wrote:
+    /// an indirect dispatch's group counts, LIT6); None when none does.
+    pub fn read_at(&mut self, at: u64, len: u64) -> Option<Vec<u8>> {
+        let base = covering(self.kept.iter().map(|(k, v)| (*k, v.held)), at, len)?;
+        let b = self.read(base).ok()?;
+        b.get((at - base) as usize..(at - base + len) as usize).map(<[u8]>::to_vec)
+    }
+
     /// The bytes held at `key`: a buffer's whole length, a texture's mip 0
     /// as unpadded rows, slices in order (the layout [`Image::texels`] takes).
     pub fn read(&mut self, key: u64) -> Result<Vec<u8>, String> {
@@ -1126,8 +1211,14 @@ impl<'h> Runner<'h> {
         };
         let row_count = height * depth;
         let row_bytes = (rows.len() / row_count as usize) as u32;
-        Ok(Provided { width, height, format, rows, row_bytes, row_count, dim, depth })
+        Ok(Provided { width, height, format, rows, row_bytes, row_count, dim, depth, mips: 1 })
     }
+}
+
+/// The key of the held buffer (the nearest start at or below `at`) whose
+/// length covers `len` bytes at `at`.
+fn covering(held: impl Iterator<Item = (u64, Held)>, at: u64, len: u64) -> Option<u64> {
+    held.filter(|(k, h)| matches!(h, Held::Buffer { len: l } if *k <= at && at + len <= k + l)).map(|(k, _)| k).max()
 }
 
 fn upload(dev: &ID3D12Device, bytes: &[u8], size: u64) -> Result<ID3D12Resource, String> {
@@ -1241,6 +1332,15 @@ mod tests {
         let j = by_program(&job([0.0; 4], image(0x10, true, &[]), image(0x20, false, &[])), &u);
         let Arg::Table(t) = &j.roots[1] else { panic!("table") };
         assert_eq!(t.iter().map(|(_, r)| r.uav()).collect::<Vec<_>>(), vec![false, true]);
+    }
+
+    #[test]
+    fn covering_finds_the_buffer_around_a_record() {
+        let held = [(0x100, Held::Buffer { len: 64 }), (0x120, Held::Buffer { len: 16 }), (0x200, Held::Image { shape: Shape::Tex2D, format: 2, width: 4, height: 4, depth: 1 })];
+        assert_eq!(covering(held.into_iter(), 0x120, 12), Some(0x120), "the nearest start wins");
+        assert_eq!(covering(held.into_iter(), 0x134, 12), Some(0x100), "past the small one: the big one");
+        assert_eq!(covering(held.into_iter(), 0x13c, 12), None, "runs past the end");
+        assert_eq!(covering(held.into_iter(), 0x200, 4), None, "textures hold no records");
     }
 
     #[test]

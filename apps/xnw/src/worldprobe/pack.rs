@@ -111,8 +111,10 @@ const HAIR_INPUTS: [u128; 89] = [
     0x70a718878bf903a26d2254b40f2c1e59, 0xbc6245e7b8c8f1ccef4638bbd2773c71, 0x243b071d6ae57113c5644a5a5c80c351, 0x165335c899403b82cc192eaeb577ea56,
     0x364355050c195f360c4910d9769b95ce,
 ];
-/// `smh_sim_*` CS_InitSimBuffer, CS_Solve*, CS_LodBlend: sinks for their
-/// order only (roots, no tables) [V shader_index.py].
+/// `smh_sim_*` CS_InitSimBuffer, CS_Solve*, CS_LodBlend: sinks with their
+/// roots and (v2.10) their table roots to HAIR_SLOTS as the inputs
+/// (the sim state at root 0 slot 33 is an unordered view: address only)
+/// [V shader_index.py].
 const HAIR_ORDER: [u128; 17] = [
     0x1a130b269cd47ef4812dd15752152b23, 0xbd4d55900c5e927c7ca235af566c08a2, 0x5adcf5cccaed9253d6719718e7193013, 0x102ab06d66c15a80f376c0879fe18ffa,
     0x8ba39ba05b199d96d56762ed7d3c9b48, 0x25b63d3d14678cbcc520266ff95684f0, 0x5ff30f5ba243ec03a8f14f42c416b792, 0x9aafa53ac20e837b14cd31dda3ca3157,
@@ -178,7 +180,7 @@ const HEAD_PROGRAMS: [u128; 73] = [
     0x0b542c4f4837d965b09fada63177f82c,
 ];
 /// A direct dispatch's pipeline: not a sink, a pre-skin program, a
-/// strand-hair input program, a strand-hair program kept for order only.
+/// strand-hair input program, a strand-hair sim program (Init/Solve/LodBlend).
 const PIPE_NONE: u8 = 0;
 const PIPE_PED: u8 = 1;
 const PIPE_HAIR: u8 = 2;
@@ -272,7 +274,129 @@ fn want_dispatch_at(frame: u64, pipeline: usize, class: impl Fn(usize) -> u8) ->
         let Some(acc) = acc_of(&mut accs, frame) else { return false };
         acc.dispatches_seen += 1;
     }
-    *lock(&DISPATCH_PIPES).get_or_insert_with(HashMap::new).entry(pipeline).or_insert_with(|| class(pipeline)) != PIPE_NONE
+    let c = *lock(&DISPATCH_PIPES).get_or_insert_with(HashMap::new).entry(pipeline).or_insert_with(|| class(pipeline));
+    c != PIPE_NONE && (!live() || hair_live() && (matches!(c, PIPE_HAIR | PIPE_HAIR_ORDER) || (c == PIPE_PED && face_pipeline(pipeline))))
+}
+
+/// Pipeline object -> its compute program is the face pre-skin (variant 11):
+/// the live hair mode records those dispatches too, whose bind positions
+/// stand in for the head table (`XNW_HAIR_STANDIN=on`, HAIR3's `scalp`).
+static FACE_PIPES: Mutex<Option<HashMap<usize, bool>>> = Mutex::new(None);
+
+fn face_pipeline(pipeline: usize) -> bool {
+    *lock(&FACE_PIPES).get_or_insert_with(HashMap::new).entry(pipeline).or_insert_with(|| tap::stages(pipeline).iter().any(|s| s.name == "compute" && s.hash == PED_SKINNING[11]))
+}
+
+/// HAIR6, the live strand hair (`XNW_WORLD_RENDER=...,hair=on` without a
+/// capture): the writer records every frame, only the strand chain's
+/// dispatches (HAIR_INPUTS, HAIR_ORDER) and the main-view strand draws,
+/// with the hook draws' palette spans; no frame is written: [`take_live`]
+/// hands each frame's pack over in memory.
+static HAIR_LIVE: AtomicBool = AtomicBool::new(false);
+
+pub(super) fn hair_live() -> bool {
+    HAIR_LIVE.load(Ordering::Relaxed)
+}
+
+/// Pipeline object -> it draws with the main-view strand vertex program.
+static STRAND_PIPES: Mutex<Option<HashMap<usize, bool>>> = Mutex::new(None);
+
+fn strand_draw_want(pipeline: usize) -> bool {
+    *lock(&STRAND_PIPES).get_or_insert_with(HashMap::new).entry(pipeline).or_insert_with(|| tap::stages(pipeline).iter().any(|s| s.name == "vertex" && s.hash == xnw_world::hair::STRAND_VS))
+}
+
+/// UI1, the live UI (`XNW_WORLD_RENDER=...,ui=on` without a capture): the
+/// writer records every frame's Draw/DrawIndexed sinks of UI-class pipelines
+/// (their pixel program's name, `xnw_frame::ui::ui_name`) with their IA
+/// records; [`take_live`] hands the frame over as for hair.
+static UI_LIVE: AtomicBool = AtomicBool::new(false);
+
+pub(super) fn ui_live() -> bool {
+    UI_LIVE.load(Ordering::Relaxed)
+}
+
+/// A live mode (hair or UI) is on: the writer records only its sinks.
+pub(super) fn live() -> bool {
+    hair_live() || ui_live()
+}
+
+/// Container -> program name, for the UI test (set by [`enable_ui`]).
+static NAMES: Mutex<Option<HashMap<u128, String>>> = Mutex::new(None);
+/// Pipeline object -> its pixel program is of the UI class.
+static UI_PIPES: Mutex<Option<HashMap<usize, bool>>> = Mutex::new(None);
+
+fn ui_draw_want(pipeline: usize) -> bool {
+    if let Some(&w) = lock(&UI_PIPES).as_ref().and_then(|m| m.get(&pipeline)) {
+        return w;
+    }
+    let ps = tap::stages(pipeline).iter().find(|s| s.name == "pixel").map(|s| s.hash);
+    let w = ps.is_some_and(|h| lock(&NAMES).as_ref().and_then(|n| n.get(&h)).is_some_and(|n| xnw_frame::ui::ui_name(n)));
+    lock(&UI_PIPES).get_or_insert_with(HashMap::new).insert(pipeline, w);
+    w
+}
+
+/// The live modes' draw filter (tap.rs `set_tap_want`).
+fn live_draw_want(pipeline: usize) -> bool {
+    (hair_live() && strand_draw_want(pipeline)) || (ui_live() && ui_draw_want(pipeline))
+}
+
+/// Registers the sink tap in the live UI mode (once; not with a capture's
+/// `pack=2`), with the program names the UI test reads.
+pub(super) fn enable_ui(names: HashMap<u128, String>) {
+    if ON.load(Ordering::Relaxed) && !live() {
+        return;
+    }
+    *lock(&NAMES) = Some(names);
+    UI_LIVE.store(true, Ordering::Relaxed);
+    tap::set_tap_want(Some(live_draw_want));
+    enable();
+    xnw_core::info!("world probe: pack: live UI mode: UI-class draws read every frame with their IA records, kept in memory (no frame written)");
+}
+
+/// Registers the sink tap in the live hair mode (once; not with a capture's `pack=2`).
+pub(super) fn enable_hair() {
+    if ON.load(Ordering::Relaxed) && !live() {
+        return;
+    }
+    HAIR_LIVE.store(true, Ordering::Relaxed);
+    tap::set_tap_want(Some(live_draw_want));
+    enable();
+    xnw_core::info!("world probe: pack: live hair mode: strand chain dispatches and strand draws read every frame, kept in memory (no frame written)");
+}
+
+/// The live hair mode's frame `frame`: its pack and blobs, in memory (older
+/// open frames dropped). Its blobs are not counted as stored: the next
+/// frame keeps its own copy of what it reads.
+pub(super) fn take_live(frame: u64) -> Option<(FramePack, HashMap<u128, Vec<u8>>)> {
+    if !live() {
+        return None;
+    }
+    let mut accs = lock(&ACCS);
+    SENT.fetch_max(frame.saturating_add(1), Ordering::Relaxed);
+    let mut taken = None;
+    accs.retain_mut(|a| {
+        if a.frame == frame {
+            taken = Some(std::mem::take(a));
+            false
+        } else {
+            a.frame > frame
+        }
+    });
+    drop(accs);
+    // The resolved tables by content grow with the run: start again past a bound.
+    {
+        let mut run = lock(&RUN);
+        if run.as_ref().is_some_and(|r| r.resolved.len() + r.texels.len() > 16_384) {
+            *run = None;
+        }
+    }
+    let acc = taken?;
+    let sinks: Vec<fp::Sink> = acc.sinks.iter().enumerate().map(|(i, s)| fp::Sink { index: i as u32, thread: s.thread, hook_draw: None, op: s.op, count: s.count, pipeline: s.pipeline }).collect();
+    let mut textures: Vec<fp::Texture> = acc.textures.into_values().collect();
+    textures.sort_by_key(|t| t.at);
+    let manifest = fp::Manifest { version: fp::VERSION, frame, ..Default::default() };
+    let blobs: HashMap<u128, Vec<u8>> = acc.blobs.into_iter().map(|(h, (_, b))| (h, b)).collect();
+    Some((FramePack { manifest, refs: acc.refs, sinks, programs: acc.programs, textures }, blobs))
 }
 
 /// A dispatch sink's class (`want_dispatch`); a pipeline never asked about
@@ -351,7 +475,7 @@ pub(super) fn hook_objects(frame: u64, seq: u32, palette: (u64, u32), previous: 
 /// record R = 0x145248630(type) and its atlas ids need a call into title
 /// code: not taken.
 pub(super) fn imposter(frame: u64, args: [u64; 6], icrec: u64) {
-    if !on() {
+    if !on() || live() {
         return;
     }
     let mut accs = lock(&ACCS);
@@ -531,7 +655,7 @@ const HANDLER_BYTES: u64 = 0x400;
 /// replay found 0 of 705. Also the draw's vertex and meshlet streams
 /// (address, bytes), for the root views over them (`root_view_at`).
 pub(super) fn hook_views(frame: u64, handles: &[u64], streams: &[(u64, u64)]) {
-    if !on() || (handles.iter().all(|h| *h == 0) && streams.iter().all(|s| s.0 == 0 || s.1 == 0)) {
+    if !on() || live() || (handles.iter().all(|h| *h == 0) && streams.iter().all(|s| s.0 == 0 || s.1 == 0)) {
         return;
     }
     let mut accs = lock(&ACCS);
@@ -652,6 +776,8 @@ struct Acc {
     streams: BTreeMap<u64, u64>,
     /// Pipelines of the displacing pre-skin programs.
     displaced: HashSet<u64>,
+    /// UI1: Draw and DrawIndexed sinks with an IA record.
+    ia_sinks: u32,
     /// Draw and DrawIndexed sinks with their DRAW_ARGS.
     draw_args: u32,
     /// Hair: input dispatch sinks, order-only sinks, strand group records,
@@ -800,8 +926,6 @@ fn sink_at(frame: u64, d: &TapDraw) {
                 acc.alias[3] += u32::from(how == ROOT_WINDOWED);
                 acc.refs.push(reference_cut(owner, kind::ROOT_VIEW, slot, at, len, got, full > len || how == ROOT_WINDOWED));
             }
-            // A hair program kept for its order: its roots, not its tables.
-            TapRoot::Table { .. } if class == PIPE_HAIR_ORDER => {}
             TapRoot::Table { handle, slots, .. } => {
                 // The frame table (root 0) to tap::TABLE_SLOTS for draws and
                 // lighting dispatches (the lighting reads its slots up to 181);
@@ -809,7 +933,7 @@ fn sink_at(frame: u64, d: &TapDraw) {
                 let cap = match (compute && !lit, class, i) {
                     (false, _, 0) => tap::TABLE_SLOTS,
                     (false, _, _) => fp::TABLE_ROW,
-                    (true, PIPE_HAIR | PIPE_HEAD, _) => HAIR_SLOTS,
+                    (true, PIPE_HAIR | PIPE_HAIR_ORDER | PIPE_HEAD, _) => HAIR_SLOTS,
                     _ => DISPATCH_SLOTS,
                 };
                 let mode = match (compute, class) {
@@ -850,10 +974,18 @@ fn sink_at(frame: u64, d: &TapDraw) {
         let h = keep(acc, run, kind::DRAW_ARGS, bytes);
         acc.refs.push(reference(owner, kind::DRAW_ARGS, 0, 0, fp::DRAW_ARGS_BYTES as u64, Ok(h)));
         acc.draw_args += 1;
+        if let Some(ia) = tap::ia() {
+            ia_records(acc, run, owner, d, ia, &read);
+        }
     }
     acc.head_sinks += u32::from(class == PIPE_HEAD);
     acc.sky_sinks += u32::from(class == PIPE_SKY);
     acc.indirect_dispatches += u32::from(indirect);
+    if indirect && d.args[..2] != [0, 0] {
+        // Address only: the GPU writes the counts (LIT6).
+        let at = u64::from(d.args[0]) | u64::from(d.args[1]) << 32;
+        acc.refs.push(reference(owner, kind::INDIRECT_ARGS, d.args[2].min(u32::from(u16::MAX)) as u16, at, 12, Err(reason::GPU_OUTPUT)));
+    }
     if d.op == fp::op::DISPATCH {
         let bytes: Vec<u8> = [d.count, d.yz[0], d.yz[1]].iter().flat_map(|w| w.to_le_bytes()).collect();
         let h = keep(acc, run, kind::GROUPS, bytes);
@@ -993,7 +1125,7 @@ fn hookin_blob(tls: u64, geom: u64, globals: [u64; 3]) -> Vec<u8> {
 /// At the hook (`hookin=1`): hook draw `seq`'s HOOKIN record, and once per
 /// frame the HOOK_GLOBALS record. Its cost on the title's thread is counted.
 pub(super) fn hook_inputs(frame: u64, seq: u32, tls: u64, geom: u64) {
-    if !on() || seq == 0 || tls == 0 || !HOOKIN.load(Ordering::Relaxed) {
+    if !on() || live() || seq == 0 || tls == 0 || !HOOKIN.load(Ordering::Relaxed) {
         return;
     }
     let t0 = std::time::Instant::now();
@@ -1469,6 +1601,11 @@ fn programs(acc: &mut Acc, run: &mut Run, pipeline: usize) {
         }
         acc.programs.push(row);
     }
+    if let Some(bytes) = tap::graphics_state(pipeline) {
+        let len = bytes.len() as u64;
+        let h = keep(acc, run, kind::GSTATE, bytes);
+        acc.refs.push(reference(fp::FRAME_SCOPE, kind::GSTATE, 0, pipeline as u64, len, Ok(h)));
+    }
     if let Some((targets, depth)) = tap::targets(pipeline) {
         let mut words = vec![targets.len() as u32];
         words.extend((0..8).map(|i| targets.get(i).copied().unwrap_or(0)));
@@ -1477,6 +1614,68 @@ fn programs(acc: &mut Acc, run: &mut Run, pipeline: usize) {
         let h = keep(acc, run, kind::TARGETS, bytes);
         acc.refs.push(reference(fp::FRAME_SCOPE, kind::TARGETS, 0, pipeline as u64, fp::TARGETS_BYTES as u64, Ok(h)));
     }
+}
+
+/// Bytes per index of a DXGI index format (R16_UINT 57, R32_UINT 42).
+fn index_bytes(format: u32) -> u64 {
+    if format == 57 { 2 } else { 4 }
+}
+
+/// UI1 (v2.12): what a Draw or DrawIndexed sink's IA_DATA records hold:
+/// the index range (address, bytes) the draw reads, and per vertex slot
+/// the bytes from the view's start to the last vertex it reads (capped at
+/// the view and `fp::IA_VERTEX_CAP`; a slot without a view: 0). `indices`:
+/// the index bytes, when read. Per-instance slots read to the view's end.
+fn ia_ranges(ia: &tap::TapIa, op: u8, count: u32, args: [u32; 4], indices: Option<&[u8]>) -> ((u64, u64), [u64; tap::IA_SLOTS]) {
+    let [_, first, base, _] = args;
+    let indexed = op == fp::op::INDEXED;
+    let elem = index_bytes(ia.index.2);
+    let index = if indexed && ia.index.0 != 0 {
+        let at = u64::from(first) * elem;
+        let n = (u64::from(count) * elem).min(u64::from(ia.index.1).saturating_sub(at));
+        (ia.index.0 + at, n)
+    } else {
+        (0, 0)
+    };
+    // The highest vertex read + 1.
+    let top = if indexed {
+        let max = indices.map_or(0, |b| b.chunks_exact(elem as usize).map(|c| if elem == 2 { u64::from(u16::from_le_bytes([c[0], c[1]])) } else { u64::from(u32::from_le_bytes([c[0], c[1], c[2], c[3]])) }).max().unwrap_or(0));
+        (max as i64 + i64::from(base as i32)).max(0) as u64 + 1
+    } else {
+        u64::from(first) + u64::from(count)
+    };
+    let vertex = std::array::from_fn(|k| {
+        let (at, size, stride) = ia.vertex[k];
+        if ia.slots & 1 << k == 0 || at == 0 {
+            return 0;
+        }
+        let want = if stride == 0 || indices.is_none() && indexed { u64::from(size) } else { top * u64::from(stride) };
+        want.min(u64::from(size)).min(fp::IA_VERTEX_CAP)
+    });
+    (index, vertex)
+}
+
+/// UI1 (v2.12): a Draw or DrawIndexed sink's IA record (views, the title's
+/// pass phase and stage) and its IA_DATA (the indices and vertices it reads).
+fn ia_records(acc: &mut Acc, run: &mut Run, owner: u32, d: &TapDraw, ia: tap::TapIa, read: &dyn Fn(u64, u64) -> Result<Vec<u8>, u32>) {
+    let (phase, stage) = tap::title_stage().unwrap_or((u32::MAX - 1, u32::MAX));
+    let rec = fp::Ia { index: ia.index, vertex: ia.vertex, phase, stage, topology: ia.topology };
+    let h = keep(acc, run, kind::IA, rec.encode());
+    acc.refs.push(reference(owner, kind::IA, 0, 0, fp::IA_BYTES as u64, Ok(h)));
+    let (index, _) = ia_ranges(&ia, d.op, d.count, d.args, None);
+    let indices = (index.1 > 0).then(|| read(index.0, index.1));
+    if let Some(got) = &indices {
+        let got = got.clone().map(|b| keep(acc, run, kind::IA_DATA, b));
+        acc.refs.push(reference(owner, kind::IA_DATA, 0, index.0, index.1, got));
+    }
+    let bytes = indices.as_ref().and_then(|r| r.as_ref().ok()).map(|b| b.as_slice());
+    let (_, vertex) = ia_ranges(&ia, d.op, d.count, d.args, bytes);
+    for (k, &n) in vertex.iter().enumerate().filter(|v| *v.1 > 0) {
+        let at = ia.vertex[k].0;
+        let got = read(at, n).map(|b| keep(acc, run, kind::IA_DATA, b));
+        acc.refs.push(reference_cut(owner, kind::IA_DATA, 1 + k as u16, at, n, got, n == fp::IA_VERTEX_CAP));
+    }
+    acc.ia_sinks += 1;
 }
 
 /// Instanced vehicle programs (wheels, tyres; mesh container hash): the
@@ -1862,7 +2061,7 @@ pub(super) fn write(dir: &Path, frame: u64, seqs: &[u32], taken: Option<Taken>) 
     let dispatch_ms = acc.dispatch_ns as f64 / 1e6;
     let seen = acc.dispatches_seen;
     let (imposters, imp_parts, wheel_windows) = (acc.imposters, acc.imposter_parts, acc.wheel_windows);
-    let (words, sampler_counts, sampler_heaps, alias, disp_maps, draw_args, hair) = (acc.draw_words, acc.sampler_counts, acc.sampler_heaps.len(), acc.alias, acc.disp_maps, acc.draw_args, acc.hair);
+    let (words, sampler_counts, sampler_heaps, alias, disp_maps, draw_args, hair, ia_sinks) = (acc.draw_words, acc.sampler_counts, acc.sampler_heaps.len(), acc.alias, acc.disp_maps, acc.draw_args, acc.hair, acc.ia_sinks);
     let hookin = acc.hookin;
     let (n, ns) = (HOOKIN_COST[0].swap(0, Ordering::Relaxed), HOOKIN_COST[1].swap(0, Ordering::Relaxed));
     let hookin_line = if HOOKIN.load(Ordering::Relaxed) { format!("; hook inputs {hookin} (cost {:.2} us a hook draw over {n})", ns as f64 / 1e3 / n.max(1) as f64) } else { String::new() };
@@ -1922,7 +2121,7 @@ pub(super) fn write(dir: &Path, frame: u64, seqs: &[u32], taken: Option<Taken>) 
         disp_maps[1]
     );
     xnw_core::info!(
-        "world probe: pack frame {frame}: draw args on {draw_args} Draw/DrawIndexed sinks; hair: {} input dispatch sinks, {} order-only, strand group records {} (heap views {} with bytes, {} without; palette windows {} with bytes, {} without; collision spans {} with bytes, {} without); lighting: {light_sinks} dispatch sinks ({sky_sinks} sky/ambient), {indirect_dispatches} indirect dispatch sinks, scene lights {lights}; head graph: {head_sinks} dispatch sinks (unordered buffer views {} read, {} not){hookin_line}",
+        "world probe: pack frame {frame}: draw args on {draw_args} Draw/DrawIndexed sinks ({ia_sinks} with IA views); hair: {} input dispatch sinks, {} order-only, strand group records {} (heap views {} with bytes, {} without; palette windows {} with bytes, {} without; collision spans {} with bytes, {} without); lighting: {light_sinks} dispatch sinks ({sky_sinks} sky/ambient), {indirect_dispatches} indirect dispatch sinks, scene lights {lights}; head graph: {head_sinks} dispatch sinks (unordered buffer views {} read, {} not){hookin_line}",
         hair[0],
         hair[1],
         hair[2],
@@ -2485,10 +2684,41 @@ pub(super) mod tests {
         assert!(DISPLACED.contains(&0xdcfc_c6a8_03ab_0b26_3a10_b1c5_61d7_ba77) && PED_SKINNING.iter().filter(|h| DISPLACED.contains(h)).count() == 2);
     }
 
+    /// UI1 (v2.12): a DrawIndexed sink keeps its IA views, the indices it
+    /// reads (from its first index) and each vertex slot to the last vertex
+    /// those name plus the base vertex; a plain Draw to first + count.
+    #[test]
+    fn ia_records_hold_the_indices_and_vertices_a_draw_reads() {
+        let ia = tap::TapIa { index: (0x10_0000, 64, 57), vertex: [(0x20_0000, 4000, 20), (0x30_0000, 100, 4), (0, 0, 0), (0x40_0000, 8, 8)], slots: 0b1011, topology: 4 };
+        // 6 indices from index 2: [0, 1, 2, 2, 1, 9]; base vertex 3 -> vertices 0..=12.
+        let idx: Vec<u8> = [7u16, 7, 0, 1, 2, 2, 1, 9].iter().flat_map(|i| i.to_le_bytes()).collect();
+        let (index, vertex) = ia_ranges(&ia, fp::op::INDEXED, 6, [1, 2, 3, 0], Some(&idx[4..]));
+        assert_eq!(index, (0x10_0004, 12));
+        assert_eq!(vertex, [13 * 20, 13 * 4, 0, 8]);
+        let (index, vertex) = ia_ranges(&ia, fp::op::DRAW, 6, [1, 4, 0, 0], None);
+        assert_eq!((index, vertex), ((0, 0), [10 * 20, 40, 0, 8]));
+        let mut acc = Acc::default();
+        let mut run = Run::default();
+        let read = |at: u64, n: u64| -> Result<Vec<u8>, u32> {
+            match at {
+                0x10_0004 => Ok(idx[4..4 + n as usize].to_vec()),
+                0x40_0000 => Err(reason::UNREADABLE),
+                _ => Ok(vec![at as u8; n as usize]),
+            }
+        };
+        let d = TapDraw { op: fp::op::INDEXED, count: 6, yz: [0; 2], args: [1, 2, 3, 0], pipeline: 0, view_heap: 0, sampler_heap: 0, roots: &[] };
+        ia_records(&mut acc, &mut run, 5, &d, ia, &read);
+        let got: Vec<(u16, u16, u64, u32, u32)> = acc.refs.iter().map(|r| (r.kind, r.slot, r.addr, r.len, r.reason)).collect();
+        assert_eq!(got, [(kind::IA, 0, 0, fp::IA_BYTES as u32, 0), (kind::IA_DATA, 0, 0x10_0004, 12, 0), (kind::IA_DATA, 1, 0x20_0000, 260, 0), (kind::IA_DATA, 2, 0x30_0000, 52, 0), (kind::IA_DATA, 4, 0x40_0000, 8, reason::UNREADABLE)]);
+        let rec = fp::Ia::decode(&acc.blobs[&acc.refs[0].hash].1).unwrap();
+        assert_eq!((rec.index, rec.vertex[0]), (ia.index, ia.vertex[0]));
+        assert_eq!(acc.ia_sinks, 1);
+    }
+
     /// Strand hair: an input program's dispatch sink keeps
     /// the views at the heap indices of each strand group record's words
-    /// with their bytes, once per record buffer; an order-only program keeps
-    /// its roots and no table; a Draw keeps its instance count and firsts.
+    /// with their bytes, once per record buffer; a sim program keeps its
+    /// roots and its table (v2.10); a Draw keeps its instance count and firsts.
     #[test]
     fn hair_programs_keep_strand_groups_and_draw_args() {
         let _one = fresh();
@@ -2533,8 +2763,8 @@ pub(super) mod tests {
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
         write(&dir, frame, &[seq], take(frame, true)).unwrap();
         let p = FramePack::open(&dir).unwrap().unwrap();
-        // The order-only sink: its constants, no table.
-        assert_eq!(p.refs_of(0).map(|r| (r.kind, r.slot)).collect::<Vec<_>>(), [(kind::ROOTS, 1), (kind::SAMPLERS, 0), (kind::GROUPS, 0)]);
+        // The sim sink: its table (4 empty slots: no views) and its constants.
+        assert_eq!(p.refs_of(0).map(|r| (r.kind, r.slot)).collect::<Vec<_>>(), [(kind::ROOTS, 1), (kind::TABLE, 0), (kind::SAMPLERS, 0), (kind::GROUPS, 0)]);
         let a = p.refs_of(1).find(|r| r.kind == kind::DRAW_ARGS).unwrap();
         let words: Vec<u32> = FramePack::blob(&dir, a.hash).unwrap().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
         assert_eq!(words, [9724, 0, 0, 12]);
@@ -2626,6 +2856,7 @@ pub(super) mod tests {
     /// unpaired, its tables resolved as a lighting dispatch's (frame table
     /// past one row, other tables one row, no unordered bytes); a direct
     /// dispatch keeps its group counts; sky programs are lighting sinks.
+    /// The indirect one keeps where its counts sit (INDIRECT_ARGS).
     #[test]
     fn indirect_dispatch_keeps_its_tables_and_direct_its_groups() {
         let _one = fresh();
@@ -2634,7 +2865,7 @@ pub(super) mod tests {
         let table = vec![0u8; 4 * 32];
         let roots = [TapRoot::Table { handle: table.as_ptr() as u64, heap_start: table.as_ptr() as u64, slots: 4 }, TapRoot::Table { handle: table.as_ptr() as u64, heap_start: table.as_ptr() as u64, slots: 4 }];
         // Pipeline 0 (no stages to read) for both.
-        sink_at(frame, &TapDraw { op: fp::op::INDIRECT_DISPATCH, count: 1, yz: [0; 2], args: [0; 4], pipeline: 0, view_heap: 0, sampler_heap: 0, roots: &roots });
+        sink_at(frame, &TapDraw { op: fp::op::INDIRECT_DISPATCH, count: 1, yz: [0; 2], args: [0x8f2c_9aa0, 0x9, 12, 0], pipeline: 0, view_heap: 0, sampler_heap: 0, roots: &roots });
         assert!(want_dispatch_at(frame, 0, |_| PIPE_SKY));
         sink_at(frame, &TapDraw { op: fp::op::DISPATCH, count: 8, yz: [4, 2], args: [0; 4], pipeline: 0, view_heap: 0, sampler_heap: 0, roots: &[] });
         let dir = std::env::temp_dir().join(format!("xnw-pk8i-{}", std::process::id())).join(format!("frame-{frame}"));
@@ -2647,6 +2878,10 @@ pub(super) mod tests {
         let g = p.refs_of(1).find(|r| r.kind == kind::GROUPS).unwrap();
         assert_eq!(FramePack::blob(&dir, g.hash).unwrap(), [8u32, 4, 2].iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>());
         assert!(p.refs_of(0).all(|r| r.kind != kind::GROUPS));
+        // Where the indirect dispatch reads its counts: address and stride, no bytes (LIT6).
+        let a = p.refs_of(0).find(|r| r.kind == kind::INDIRECT_ARGS).unwrap();
+        assert_eq!((a.addr, a.slot, a.reason), (0x9_8f2c_9aa0, 12, reason::GPU_OUTPUT));
+        assert!(p.refs_of(1).all(|r| r.kind != kind::INDIRECT_ARGS));
         assert_eq!((pipe_class(SKY_PROGRAMS[0]), pipe_class(SKY_PROGRAMS[15]), pipe_class(LIGHT_PROGRAMS[0])), (PIPE_SKY, PIPE_SKY, PIPE_LIGHT));
         assert!(SKY_PROGRAMS.iter().all(|h| !LIGHT_PROGRAMS.contains(h) && !HEAD_PROGRAMS.contains(h)));
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());

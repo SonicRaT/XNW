@@ -30,13 +30,28 @@ use xnw_gpu::d3d12x::descriptor::{self, View};
 use xnw_gpu::d3d12x::{host, resource, texture};
 
 /// SRVs in our table (the shader's `albedoTex` array and its root range);
-/// `tex=<n>` uses fewer. The most distinct slots (albedo and layers)
-/// one frame asked for over every frame of two captures is 756
-/// (the replay's `asked`), all list rows at most 821:
-/// 1024 leaves 35 % over the first, 25 % over the second.
-pub const TEX_SLOTS: u32 = 1024;
+/// `tex=<n>` uses fewer. The most distinct slots one frame asks for:
+/// 821 in the card runs without bridged rows, 1,501 with
+/// them, 1,427 in the burst (pk7a3 f961,
+/// Entries stay with their slot across frames, so the table
+/// holds what several frames ask: 4096 is 2.7 x the largest frame. The
+/// views cost 4096 descriptors of the pass heap; textures are bounded by
+/// the layer's budget, not by entries.
+pub const TEX_SLOTS: u32 = 4096;
 /// Entries used unless `tex=<n>` says otherwise.
 pub const TEX_DEFAULT: u32 = TEX_SLOTS;
+/// Entries below this are the layers' (the shader's 8-bit field, k[50]);
+/// albedo and bridged textures take entries from here up first.
+pub const TEX_LOW: u32 = 256;
+
+/// `XNW_TEX_STABLE` (default on; `off`: every frame assigns its entries
+/// afresh, the rule before): a slot keeps its entry while it stays
+/// resident, its view is written only when it changes, the least
+/// recently used entries go when the table is full.
+pub fn stable_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("XNW_TEX_STABLE").as_deref().map(str::trim), Ok("off" | "0")))
+}
 
 /// A layer's entry as the shader's 8-bit field takes it: entries past 255
 /// draw the layer as the base colour (0), never another texture. Layers
@@ -69,11 +84,18 @@ pub struct Provided {
     /// Bytes of one row and the number of rows in `rows`.
     pub row_bytes: u32,
     pub row_count: u32,
-    /// The draw bridge's view of it: [`TEX_2D`], [`TEX_1D`] or
-    /// [`TEX_3D`] or [`TEX_2D_ARRAY`] (`depth` slices, `row_count` = height x depth). The
-    /// pass takes 2D only.
+    /// Its shape: [`TEX_2D`], [`TEX_1D`], [`TEX_3D`], [`TEX_2D_ARRAY`] or
+    /// [`TEX_CUBE`] (`depth` slices, `row_count` = height x depth). Our
+    /// pass samples 2D only; the title's own programs get the others
+    /// through [`TexTable::host_view`] and the draw bridge.
     pub dim: u8,
     pub depth: u32,
+    /// Mips in `rows` (0 or 1: the one mip the fields above describe).
+    /// More: `rows` holds every subresource in D3D12 order (slice after
+    /// slice, each its mips from `width` x `height` down; a 3D texture mip
+    /// after mip, each with its depth slices), every row at its own mip's
+    /// length, nothing between them ([`provided_fill`]).
+    pub mips: u32,
 }
 
 /// [`Provided::dim`] (D3D12 resource dimensions).
@@ -83,9 +105,16 @@ pub const TEX_3D: u8 = 4;
 /// A 2D array (LIT5): `depth` slices, `row_count` = height x depth, the
 /// slices' rows in order (D3D12 has no array dimension; past the three).
 pub const TEX_2D_ARRAY: u8 = 5;
+/// A cube (BUG3): `depth` = 6 faces in the console's and D3D12's slice order
+/// (+x, -x, +y, -y, +z, -z), viewed as a cube; a cube array gives its first cube.
+pub const TEX_CUBE: u8 = 6;
 
 /// What gives a slot's texels in [`TexMode::Provided`].
 pub type Provider = Box<dyn FnMut(u64) -> Option<Provided> + Send>;
+/// A slot's content key in [`TexMode::Provided`] (cheap: no texels read):
+/// equal keys give equal texels, so a texture made for one frame's pack
+/// serves the next frames'. None: no texels for the slot.
+pub type Keys = Box<dyn FnMut(u64) -> Option<u64> + Send>;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TexOptions {
@@ -204,6 +233,23 @@ struct Known {
     ready: bool,
     ours: bool,
     used: u64,
+    /// `srv` is a view of another dimension ([`wide_srv`]): for the bridged rows only.
+    wide: bool,
+    /// A slot of this generation that is flat for good (not a plain
+    /// 2D texture, or the title's GPU output): no read, no layer lookup again.
+    flat: Option<Flat>,
+    /// The frame a partly streamed copy (pending, texels shown, no
+    /// upload) was last looked at: looked at again [`recheck_frames`] later.
+    partial_at: Option<u64>,
+}
+
+/// Frames between looks at a partly streamed copy that showed no new
+/// page (`XNW_TEX_RECHECK=<n>`, default 4; 1: every frame, the rule before).
+/// About 800 such asks a frame went through the layer's locks and
+/// the staging's page check with bridgeps on.
+fn recheck_frames() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("XNW_TEX_RECHECK").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4).max(1))
 }
 
 /// Why a drawn draw is flat (the `TEX-REASONS:` names, in order).
@@ -258,6 +304,200 @@ pub struct TexStats {
     pub not_2d: u64,
     pub no_copy: u64,
     pub full: u64,
+    /// Entries: resident after the last frame; views written, kept as
+    /// they were, written null; entries evicted for room.
+    pub resident: u64,
+    pub written: u64,
+    pub kept: u64,
+    pub nulls: u64,
+    pub evicted: u64,
+    /// Provided textures taken again by their key (no read, no upload).
+    pub provided_kept: u64,
+    /// Live resolves by path (known, flat known, partial kept, looked
+    /// up, waited past the read time) and their milliseconds.
+    pub paths: [u64; 5],
+    pub path_ms: [f64; 5],
+}
+
+/// The table's entries across frames (pure: no device). An entry stays
+/// with its slot while the slot resolves; a new slot takes a free entry,
+/// else the least recently used eighth of its pool not used this frame
+/// goes at once (hysteresis: one scan frees room for many asks). Entries
+/// below `low` are the layers' pool; the others take entries from `low`
+/// up, then from the layers' pool.
+pub(crate) struct Entries {
+    slots: u32,
+    low: u32,
+    /// Per entry: its slot (0: free), the view it holds (identity), the
+    /// frame it was last used.
+    owner: Vec<(u64, u64, u64)>,
+    at: HashMap<u64, u32>,
+    /// Free entries of the layers' pool and of the rest; popped lowest first.
+    free: [Vec<u32>; 2],
+    frame: u64,
+    /// Entries let go since the frame began (written null if still free).
+    pub(crate) nulls: Vec<u32>,
+    /// Counters: views written, views kept, entries evicted (for room).
+    pub(crate) written: u64,
+    pub(crate) kept: u64,
+    pub(crate) evicted: u64,
+}
+
+impl Entries {
+    pub(crate) fn new(slots: u32) -> Entries {
+        let low = TEX_LOW.min(slots);
+        Entries { slots, low, owner: vec![(0, 0, 0); slots as usize], at: HashMap::new(), free: [(1..low).rev().collect(), (low..slots).rev().collect()], frame: 0, nulls: Vec::new(), written: 0, kept: 0, evicted: 0 }
+    }
+
+    /// A new frame; `fresh` lets every entry go first (the old rule).
+    pub(crate) fn begin(&mut self, frame: u64, fresh: bool) {
+        self.frame = frame;
+        if fresh {
+            let held: Vec<u64> = self.at.keys().copied().collect();
+            for slot in held {
+                self.release(slot);
+            }
+            for f in &mut self.free {
+                f.sort_unstable_by(|a, b| b.cmp(a));
+            }
+        }
+    }
+
+    /// The entry `slot` has (none: not resident).
+    pub(crate) fn entry(&self, slot: u64) -> Option<u32> {
+        self.at.get(&slot).copied()
+    }
+
+    /// Lets `slot`'s entry go (a view it holds is written null at the
+    /// frame's end).
+    pub(crate) fn release(&mut self, slot: u64) {
+        if let Some(e) = self.at.remove(&slot) {
+            if self.owner[e as usize].1 != 0 {
+                self.nulls.push(e);
+            }
+            self.owner[e as usize] = (0, 0, 0);
+            self.free[usize::from(e >= self.low)].push(e);
+        }
+    }
+
+    /// Frees the least recently used eighth (at least one) of pool `p`'s
+    /// entries not used this frame; false when every one is in use.
+    fn evict(&mut self, p: usize) -> bool {
+        let range = if p == 0 { 1..self.low } else { self.low..self.slots };
+        let mut old: Vec<(u64, u32)> = range.clone().filter(|&e| self.owner[e as usize].0 != 0 && self.owner[e as usize].2 < self.frame).map(|e| (self.owner[e as usize].2, e)).collect();
+        if old.is_empty() {
+            return false;
+        }
+        let n = (range.len() / 8).max(1).min(old.len());
+        old.select_nth_unstable(n - 1);
+        for &(_, e) in &old[..n] {
+            let slot = self.owner[e as usize].0;
+            self.release(slot);
+            self.evicted += 1;
+        }
+        true
+    }
+
+    /// A new entry: a layer's from its pool; albedo's from its own pool,
+    /// then the layers'. Each pool: a free entry, else (with `evict`) the
+    /// least recently used go. Without `evict`, from albedo's pool only.
+    fn alloc(&mut self, low: bool, evict: bool) -> Option<u32> {
+        let pools: &[usize] = match (low, evict) {
+            (true, _) => &[0],
+            (false, true) => &[1, 0],
+            (false, false) => &[1],
+        };
+        for &p in pools {
+            if let Some(e) = self.free[p].pop() {
+                return Some(e);
+            }
+            if evict && self.evict(p) {
+                return self.free[p].pop();
+            }
+        }
+        None
+    }
+
+    /// The entry `slot` uses this frame (a layer's below `low`): its own,
+    /// else a new one; None when the table is full of this frame's.
+    pub(crate) fn reserve(&mut self, slot: u64, low: bool) -> Option<u32> {
+        self.reserve_with(slot, low, true)
+    }
+
+    /// As [`Self::reserve`], a new entry only from the free ones.
+    pub(crate) fn reserve_free(&mut self, slot: u64, low: bool) -> Option<u32> {
+        self.reserve_with(slot, low, false)
+    }
+
+    /// Whether `slot` holds an entry it may use as asked.
+    pub(crate) fn holds(&self, slot: u64, low: bool) -> bool {
+        self.entry(slot).is_some_and(|e| !low || e < self.low)
+    }
+
+    fn reserve_with(&mut self, slot: u64, low: bool, evict: bool) -> Option<u32> {
+        if let Some(e) = self.entry(slot) {
+            if !low || e < self.low {
+                self.owner[e as usize].2 = self.frame;
+                return Some(e);
+            }
+            // A layer's slot held above the layers' pool moves down.
+            let n = self.alloc(true, evict)?;
+            self.release(slot);
+            return Some(self.take(slot, n));
+        }
+        let n = self.alloc(low, evict)?;
+        Some(self.take(slot, n))
+    }
+
+    fn take(&mut self, slot: u64, e: u32) -> u32 {
+        self.owner[e as usize] = (slot, 0, self.frame);
+        self.at.insert(slot, e);
+        e
+    }
+
+    /// Entry `e` holds `view` now: true when its descriptor must be written.
+    pub(crate) fn hold(&mut self, e: u32, view: u64) -> bool {
+        let o = &mut self.owner[e as usize];
+        if o.1 == view && view != 0 {
+            self.kept += 1;
+            return false;
+        }
+        o.1 = view;
+        self.written += 1;
+        true
+    }
+
+    /// Lets go of every entry for which `keep(slot, last used)` is false.
+    pub(crate) fn sweep(&mut self, keep: &dyn Fn(u64, u64) -> bool) {
+        let gone: Vec<u64> = self.owner.iter().filter(|o| o.0 != 0 && !keep(o.0, o.2)).map(|o| o.0).collect();
+        for slot in gone {
+            self.release(slot);
+        }
+    }
+
+    /// Entries let go since the last call and not taken again (to be
+    /// written null).
+    pub(crate) fn take_nulls(&mut self) -> Vec<u32> {
+        let mut v: Vec<u32> = std::mem::take(&mut self.nulls).into_iter().filter(|&e| self.owner[e as usize].0 == 0).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    pub(crate) fn resident(&self) -> usize {
+        self.at.len()
+    }
+}
+
+/// An identity of a view: the resource and the view's description.
+fn view_id(r: &ID3D12Resource, srv: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (windows::core::Interface::as_raw(r) as usize, srv.Format.0, srv.ViewDimension.0, srv.Shader4ComponentMapping).hash(&mut h);
+    // SAFETY: every view we make is a 2D texture view.
+    let t = unsafe { srv.Anonymous.Texture2D };
+    (t.MostDetailedMip, t.MipLevels, t.PlaneSlice, t.ResourceMinLODClamp.to_bits()).hash(&mut h);
+    h.finish() | 1
 }
 
 /// Our table of albedo SRVs and what it knows about slots.
@@ -269,23 +509,44 @@ pub struct TexTable {
     frame: HashMap<u64, (u32, bool)>,
     /// This frame: slot -> why it is flat (slots with an entry are absent).
     why: HashMap<u64, Flat>,
-    next: u32,
-    /// Table entries written last frame (rewritten null when unused).
-    written: u32,
+    /// Entries across frames, and the resource each one's view names
+    /// (held while the view stands).
+    entries: Entries,
+    res: Vec<Option<ID3D12Resource>>,
     known: HashMap<u64, Known>,
+    /// This frame's title textures that are not plain 2D (arrays,
+    /// cubes, 3D) with a view of their own dimension: for the bridged rows
+    /// only (our draws read the table as 2D and stay flat on them).
+    wide: HashMap<u64, (ID3D12Resource, D3D12_SHADER_RESOURCE_VIEW_DESC)>,
     /// Copies sampled this frame and uploads recorded (kept to the fence).
     held: Vec<Arc<resource::HostTexture>>,
     uploads: Vec<(Arc<resource::HostTexture>, texture::PassUpload)>,
     checkers: HashMap<u64, (ID3D12Resource, Option<ID3D12Resource>)>,
-    /// The provider and its textures (texture, upload until copied, format).
+    /// The provider, its content keys, and its textures by key (texture,
+    /// upload until copied, format, frame last used); this provider's
+    /// slot -> key.
     provider: Option<Provider>,
-    provided: HashMap<u64, (ID3D12Resource, Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)>, u32)>,
+    keys: Option<Keys>,
+    provided: HashMap<u64, ProvidedTex>,
+    slot_key: HashMap<u64, Option<u64>>,
+    /// Keys whose texels did not decode (they never will: same inputs).
+    provided_none: std::collections::HashSet<u64>,
     frame_no: u64,
     pub stats: TexStats,
     last_log: std::time::Instant,
     /// This frame's entries: their texture and view (the title's own
     /// programs in our pass make their own views of them, `bridged`).
     views: HashMap<u32, (ID3D12Resource, D3D12_SHADER_RESOURCE_VIEW_DESC)>,
+}
+
+/// A provided texture by its key: the upload is kept until its copy ran.
+struct ProvidedTex {
+    texture: ID3D12Resource,
+    upload: Option<ID3D12Resource>,
+    srv: D3D12_SHADER_RESOURCE_VIEW_DESC,
+    /// Not a plain 2D texture (a cube, an array, 3D): among [`TexTable::wide`].
+    shaped: bool,
+    used: u64,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the table is used by its pass's owner.
@@ -302,15 +563,19 @@ impl TexTable {
             base,
             frame: HashMap::new(),
             why: HashMap::new(),
-            next: 1,
-            // Entries past `slots` may lie outside the heap (terrain's own table).
-            written: slots,
+            // Entries past `slots` may lie outside the heap (terrain's own table): never written.
+            entries: Entries::new(slots),
+            res: vec![None; slots as usize],
             known: HashMap::new(),
+            wide: HashMap::new(),
             held: Vec::new(),
             uploads: Vec::new(),
             checkers: HashMap::new(),
             provider: None,
+            keys: None,
             provided: HashMap::new(),
+            slot_key: HashMap::new(),
+            provided_none: std::collections::HashSet::new(),
             frame_no: 0,
             stats: TexStats::default(),
             last_log: std::time::Instant::now(),
@@ -325,13 +590,30 @@ impl TexTable {
 
     /// The table index and sRGB flag of `slot` this frame (0: flat).
     pub fn lookup(&self, slot: u64) -> (u32, bool) {
-        let (i, srgb) = self.frame.get(&slot).copied().unwrap_or((0, false));
-        if i < self.next { (i, srgb) } else { (0, false) }
+        self.frame.get(&slot).copied().unwrap_or((0, false))
     }
 
     /// The texture and view of `slot` this frame (None: flat).
     pub fn host_view(&self, slot: u64) -> Option<(ID3D12Resource, D3D12_SHADER_RESOURCE_VIEW_DESC)> {
-        self.views.get(&self.lookup(slot).0).cloned()
+        self.views.get(&self.lookup(slot).0).cloned().or_else(|| self.wide.get(&slot).cloned())
+    }
+
+    /// `slot`'s cube, array or 3D view for this frame's [`Self::host_view`].
+    /// `XNW_TEX_SHAPED=off`: none is kept, and the title's programs get
+    /// the stand-in of the dimension there, as before BUG3;
+    /// `cube`, `array` or `3d`: only those are kept (A/B switches).
+    fn keep_wide(&mut self, slot: u64, texture: ID3D12Resource, srv: D3D12_SHADER_RESOURCE_VIEW_DESC) {
+        static ONLY: std::sync::OnceLock<Option<D3D12_SRV_DIMENSION>> = std::sync::OnceLock::new();
+        let only = *ONLY.get_or_init(|| match std::env::var("XNW_TEX_SHAPED").as_deref().map(str::trim) {
+            Ok("off" | "0") => Some(D3D12_SRV_DIMENSION_UNKNOWN),
+            Ok("cube") => Some(D3D12_SRV_DIMENSION_TEXTURECUBE),
+            Ok("array") => Some(D3D12_SRV_DIMENSION_TEXTURE2DARRAY),
+            Ok("3d") => Some(D3D12_SRV_DIMENSION_TEXTURE3D),
+            _ => None,
+        });
+        if only.is_none_or(|d| d == srv.ViewDimension) {
+            self.wide.insert(slot, (texture, srv));
+        }
     }
 
     /// Why `slot` is flat this frame (asked for draws `lookup` gave 0).
@@ -363,63 +645,87 @@ impl TexTable {
         self.uploads.clear();
     }
 
-    /// Builds this frame's table for `slots` (each draw's albedo slot, 0 for
-    /// none) on the open `list`: SRVs into the heap at `cpu(base + i)`,
-    /// uploads recorded, then every sampled copy moved to a shader-resource
-    /// state.
-    pub(crate) fn prepare(&mut self, device: &ID3D12Device, list: &ID3D12GraphicsCommandList, slots: &mut dyn Iterator<Item = u64>, cpu: &dyn Fn(u32) -> D3D12_CPU_DESCRIPTOR_HANDLE) {
+    /// Builds this frame's table for `layers` (entries below [`TEX_LOW`])
+    /// and `slots` (each draw's albedo slot, 0 for none) on the open
+    /// `list`: SRVs into the heap at `cpu(base + i)` for entries whose view
+    /// changed, uploads recorded, then every sampled copy moved to a
+    /// shader-resource state. Called after the last frame's fence: an
+    /// entry rewritten here is read by no submission in flight.
+    pub(crate) fn prepare(&mut self, device: &ID3D12Device, list: &ID3D12GraphicsCommandList, layers: &mut dyn Iterator<Item = u64>, slots: &mut dyn Iterator<Item = u64>, cpu: &dyn Fn(u32) -> D3D12_CPU_DESCRIPTOR_HANDLE) {
         self.frame.clear();
+        self.wide.clear();
         self.why.clear();
-        self.next = 1;
         self.held.clear();
         self.uploads.clear();
         self.frame_no += 1;
+        // A new entry count (`tex=<n>`, the replay's `--tex`): every entry starts over.
+        let want = self.opts.slots.clamp(1, self.res.len() as u32);
+        if want != self.entries.slots {
+            let mut fresh = Entries::new(want);
+            fresh.nulls = (1..self.res.len() as u32).filter(|&e| self.res[e as usize].is_some()).collect();
+            self.entries = fresh;
+        }
+        self.entries.begin(self.frame_no, !stable_on() || self.opts.mode == TexMode::Off);
         let mut budget = Budget::timed(self.opts.frame_ms);
         let mut waiting = 0u64;
         let mut demand = 0u64;
+        let mut placed = 0u64;
         let mut copies: Vec<Arc<resource::HostTexture>> = Vec::new();
         let mut checker_copies: Vec<(ID3D12Resource, ID3D12Resource)> = Vec::new();
-        let mut provided_copies: Vec<(ID3D12Resource, ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> = Vec::new();
+        let mut provided_copies: Vec<(ID3D12Resource, ID3D12Resource, Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>)> = Vec::new();
         let mut made = HashMap::new();
         if self.opts.mode != TexMode::Off {
             let base = self.base;
-            demand = self.fill(
-                slots,
-                &mut |t, slot| match t.opts.mode {
-                    // A new checker or provided texture past the time cap waits (the first goes).
+            let mut get = |t: &mut Self, slot: u64| {
+                // A new provided texture past the time cap waits (the first goes).
+                let provided_new = t.opts.mode == TexMode::Provided && !t.provided_has(slot);
+                match t.opts.mode {
+                    // A new checker texture past the time cap waits (the first goes).
                     TexMode::Checker if !t.checkers.contains_key(&slot) && !checker_copies.is_empty() && budget.late() => Err(Flat::Waiting),
                     TexMode::Checker => t.checker(device, slot, &mut checker_copies).map(|(r, v, s)| ((r, v), s)).ok_or(Flat::Other),
-                    TexMode::Provided if !t.provided.contains_key(&slot) && !provided_copies.is_empty() && budget.late() => Err(Flat::Waiting),
-                    TexMode::Provided => t.provide(device, slot, &mut provided_copies).map(|(r, v, s)| ((r, v), s)).ok_or(Flat::Other),
-                    _ => t.resolve(slot, &mut budget, &mut waiting, &mut copies).map(|(r, v, s)| ((r, v), s)),
-                },
-                &mut |(resource, srv), i| {
+                    TexMode::Provided if provided_new && !provided_copies.is_empty() && budget.late() => Err(Flat::Waiting),
+                    TexMode::Provided => t.provide(device, slot, &mut provided_copies).map(|(r, v, s)| ((r, v), s)),
+                    _ => {
+                        let (t0, n) = (std::time::Instant::now(), t.stats.paths);
+                        let r = t.resolve(slot, &mut budget, &mut waiting, &mut copies).map(|(r, v, s)| ((r, v), s));
+                        let k = (0..5).find(|&i| t.stats.paths[i] != n[i]).unwrap_or(3);
+                        t.stats.path_ms[k] += t0.elapsed().as_secs_f64() * 1e3;
+                        r
+                    }
+                }
+            };
+            let mut place = |t: &mut Self, (resource, srv): (ID3D12Resource, D3D12_SHADER_RESOURCE_VIEW_DESC), i: u32| {
+                if t.entries.hold(i, view_id(&resource, &srv)) {
                     // SAFETY: a live resource and a slot of our heap's table.
                     unsafe { device.CreateShaderResourceView(&resource, Some(&srv), cpu(base + i)) };
-                    made.insert(i, (resource, srv));
-                },
-            );
+                    t.res[i as usize] = Some(resource.clone());
+                }
+                made.insert(i, (resource, srv));
+            };
+            demand = self.fill(layers, true, &mut get, &mut place);
+            demand += self.fill(slots, false, &mut get, &mut place);
+            placed = made.len() as u64;
         }
         self.views = made;
-        // Entries used last frame and not now: null views (the table is
-        // bound whole).
-        let null = D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
-            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: 0, MipLevels: 1, PlaneSlice: 0, ResourceMinLODClamp: 0.0 } },
-        };
+        // Entries let go and not taken again: null views (the table is
+        // bound whole), and their resources go.
+        let null = null_view();
+        let nulls = self.entries.take_nulls();
         // SAFETY: slots of our heap's table; a null resource makes a null view.
         unsafe {
             device.CreateShaderResourceView(None, Some(&null), cpu(self.base));
-            for i in self.next..self.written.max(self.next) {
+            for &i in &nulls {
                 device.CreateShaderResourceView(None, Some(&null), cpu(self.base + i));
             }
         }
-        self.written = self.next;
+        for &i in &nulls {
+            self.res[i as usize] = None;
+        }
+        self.stats.nulls += nulls.len() as u64;
         self.stats.waiting = waiting;
-        self.stats.distinct = u64::from(self.next - 1);
+        self.stats.distinct = placed;
         self.stats.demand = demand;
+        self.stats.resident = self.entries.resident() as u64;
         // Barriers: uploaded copies to COPY_DEST, the copies, then every
         // sampled or uploaded copy to a shader-resource state (the copy's
         // state word is the truth; the title's lists read it too).
@@ -446,7 +752,7 @@ impl TexTable {
             copy_checker(list, t, up);
         }
         for (t, up, f) in &provided_copies {
-            copy_footprint(list, t, up, *f);
+            copy_footprints(list, t, up, f);
         }
         let mut after = Vec::new();
         for copy in copies.iter().chain(ups.iter().map(|(c, _)| c)) {
@@ -467,36 +773,68 @@ impl TexTable {
         resource::resident(copies.iter().chain(ups.iter().map(|(c, _)| c)));
         self.held.extend(copies);
         self.uploads = ups;
-        // Slots not seen for 120 frames go (their copies with them).
+        // Slots not seen for 120 frames go (their copies and entries with
+        // them; a live entry never outlasts its known copy). Provided
+        // textures no frame used for 8 frames go (an entry holds its own).
         if self.frame_no.is_multiple_of(60) {
             let now = self.frame_no;
             self.known.retain(|_, k| now - k.used <= 120);
+            let (live, known) = (self.opts.mode == TexMode::Live, &self.known);
+            self.entries.sweep(&|slot, used| now - used <= 120 && (!live || known.contains_key(&slot)));
         }
+        let now = self.frame_no;
+        self.provided.retain(|_, p| now - p.used <= 8);
     }
 
-    /// This frame's entries: each distinct non-zero slot in order gets the
-    /// next entry (`place`d) when `get` resolves it and the table has room,
-    /// else its flat reason. Returns the distinct slots asked for.
-    fn fill<R>(&mut self, slots: &mut dyn Iterator<Item = u64>, get: &mut dyn FnMut(&mut Self, u64) -> Result<(R, bool), Flat>, place: &mut dyn FnMut(R, u32)) -> u64 {
+    /// This frame's entries: each distinct non-zero slot in order keeps its
+    /// entry or takes one (`place`d) when `get` resolves it and the table
+    /// has room, else its flat reason; `low`: the layers' (entries below
+    /// [`TEX_LOW`]). A slot that does not resolve lets its entry go.
+    /// Returns the distinct slots asked for.
+    fn fill<R>(&mut self, slots: &mut dyn Iterator<Item = u64>, low: bool, get: &mut dyn FnMut(&mut Self, u64) -> Result<(R, bool), Flat>, place: &mut dyn FnMut(&mut Self, R, u32)) -> u64 {
         let mut demand = 0;
+        // Pools found full this frame: [layers', albedo's].
+        let mut full = [false; 2];
         for slot in slots {
-            if slot == 0 || self.frame.contains_key(&slot) {
+            if slot == 0 {
                 continue;
             }
+            // Asked again: a layer's slot placed above the layers' pool this frame moves down.
+            if let Some(&(i, _)) = self.frame.get(&slot) {
+                if !(low && i >= self.entries.low) {
+                    continue;
+                }
+                demand -= 1;
+            }
             demand += 1;
-            if self.next >= self.opts.slots {
+            // A slot without an entry takes a free one before its read, else
+            // one made by eviction once it resolves (a slot that does not
+            // resolve evicts nothing); past a full pool, none is read.
+            let have = self.entries.holds(slot, low);
+            if !have && full[usize::from(!low)] {
                 self.stats.full += 1;
                 self.frame.insert(slot, (0, false));
                 self.why.insert(slot, Flat::Full);
                 continue;
             }
+            let e = if have { self.entries.reserve(slot, low) } else { self.entries.reserve_free(slot, low) };
             match get(self, slot) {
                 Ok((r, srgb)) => {
-                    place(r, self.next);
-                    self.frame.insert(slot, (self.next, srgb));
-                    self.next += 1;
+                    let Some(e) = e.or_else(|| self.entries.reserve(slot, low)) else {
+                        // A layer found its pool full, albedo both.
+                        full[0] = true;
+                        full[1] |= !low;
+                        self.stats.full += 1;
+                        self.frame.insert(slot, (0, false));
+                        self.why.insert(slot, Flat::Full);
+                        continue;
+                    };
+                    place(self, r, e);
+                    self.frame.insert(slot, (e, srgb));
+                    self.why.remove(&slot);
                 }
                 Err(why) => {
+                    self.entries.release(slot);
                     self.frame.insert(slot, (0, false));
                     self.why.insert(slot, why);
                 }
@@ -542,19 +880,48 @@ impl TexTable {
             }
         };
         // Known, same generation, contents complete: no refresh (no hashing
-        // of title memory every frame).
+        // of title memory every frame).: flat for good, or partly
+        // streamed and looked at less than `recheck_frames` ago: as it was.
         if let Some(k) = self.known.get_mut(&slot)
             && k.id == id
-            && let Some(copy) = &k.copy
-            && k.ready
-            && !copy.pending.load(std::sync::atomic::Ordering::Relaxed)
         {
-            k.used = frame;
-            let (copy, srv, srgb) = (copy.clone(), k.srv, k.srgb);
-            let t = copy.texture.clone();
-            copies.push(copy);
-            return Ok((t, srv, srgb));
+            if let Some(why) = k.flat {
+                k.used = frame;
+                self.stats.paths[1] += 1;
+                if why == Flat::Not2d {
+                    self.stats.not_2d += 1;
+                }
+                return Err(why);
+            }
+            if let Some(copy) = &k.copy
+                && k.ready
+                && (!copy.pending.load(std::sync::atomic::Ordering::Relaxed) || k.partial_at.is_some_and(|at| frame < at + recheck_frames()))
+            {
+                k.used = frame;
+                self.stats.paths[if k.partial_at.is_some() { 2 } else { 0 }] += 1;
+                let (copy, srv, srgb, wide) = (copy.clone(), k.srv, k.srgb, k.wide);
+                let t = copy.texture.clone();
+                copies.push(copy);
+                if wide {
+                    self.stats.not_2d += 1;
+                    self.keep_wide(slot, t, srv);
+                    return Err(Flat::Not2d);
+                }
+                return Ok((t, srv, srgb));
+            }
         }
+        // The frame's read time spent, a slot with no texels yet waits
+        // without the layer's lookups (each would be refused by the budget).
+        if budget.late() && !self.known.get(&slot).is_some_and(|k| k.id == id && k.ready) {
+            self.stats.paths[4] += 1;
+            *waiting += 1;
+            return Err(Flat::Waiting);
+        }
+        self.stats.paths[3] += 1;
+        let flat = |t: &mut Self, why: Flat| {
+            t.known.insert(slot, Known { id, copy: None, srv: D3D12_SHADER_RESOURCE_VIEW_DESC::default(), srgb: false, ready: false, ours: false, used: frame, wide: false, flat: Some(why), partial_at: None });
+            Err(why)
+        };
         // Ask our layer: the resource (held for the call) and its copy.
         let (this, _held_placed, _held_live) = match &view {
             View::Placed(..) => {
@@ -566,8 +933,7 @@ impl TexTable {
             _ => return Err(Flat::Other),
         };
         if texture::gpu_output(this as xnw_gpu::d3d12x::object::This) {
-            self.known.remove(&slot);
-            return Err(Flat::GpuOut);
+            return flat(self, Flat::GpuOut);
         }
         let o = self.opts;
         // With `async_reads` the read goes to the pass's reader thread (the hold with it).
@@ -596,13 +962,31 @@ impl TexTable {
         if pt.waiting {
             *waiting += 1;
         }
-        let Some((srv, srgb)) = srv else {
-            self.stats.not_2d += 1;
-            return Err(Flat::Not2d);
+        let (srv, srgb, wide) = match srv {
+            Some((srv, srgb)) => (srv, srgb, false),
+            None => {
+                self.stats.not_2d += 1;
+                // Not plain 2D: a view of its own dimension for the bridged
+                // rows (their programs sample 2D arrays: a 2D view there read
+                // zeros, black roads and window frames in a test run); else
+                // flat for good (its upload, if any, was recorded above).
+                let Some(w) = wide_srv(&d, words, pt.first_mip, pt.copy.dropped) else {
+                    return flat(self, Flat::Not2d);
+                };
+                (w, false, true)
+            }
         };
         // `pt.ready` alone: an upload none of whose mips is whole is recorded, not sampled.
         let ready = pt.ready;
-        self.known.insert(slot, Known { id, copy: Some(pt.copy.clone()), srv, srgb, ready, ours: uploading || ours_before, used: frame });
+        let partial_at = (ready && !uploading && pt.copy.pending.load(std::sync::atomic::Ordering::Relaxed)).then_some(frame);
+        self.known.insert(slot, Known { id, copy: Some(pt.copy.clone()), srv, srgb, ready, ours: uploading || ours_before, used: frame, wide, flat: None, partial_at });
+        if wide {
+            if ready {
+                self.keep_wide(slot, pt.copy.texture.clone(), srv);
+                copies.push(pt.copy);
+            }
+            return Err(Flat::Not2d);
+        }
         if !ready {
             return Err(Flat::Waiting);
         }
@@ -633,29 +1017,73 @@ impl TexTable {
 
     /// A new provider (a new frame's pack): its textures are made afresh.
     pub fn set_provider(&mut self, p: Option<Provider>) {
-        self.provider = p;
-        self.provided.clear();
+        self.set_provider_keyed(p, None);
     }
 
-    /// A provided slot's texture, made and its upload queued on first use.
-    fn provide(&mut self, device: &ID3D12Device, slot: u64, uploads: &mut Vec<(ID3D12Resource, ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)>) -> Option<(ID3D12Resource, D3D12_SHADER_RESOURCE_VIEW_DESC, bool)> {
-        let srv = |format: u32| D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: DXGI_FORMAT(format as i32),
-            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
-            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: 0, MipLevels: 1, PlaneSlice: 0, ResourceMinLODClamp: 0.0 } },
-        };
-        if let Some((t, up, format)) = self.provided.get_mut(&slot) {
-            *up = None;
-            return Some((t.clone(), srv(*format), false));
+    /// A new provider with its content keys: a slot whose key a texture
+    /// already holds takes it again (no read, no upload); without keys
+    /// every texture is made afresh.
+    /// `XNW_TEX_KEYS=off`: keys are dropped (every frame's pack makes its
+    /// textures afresh, the rule before).
+    pub fn set_provider_keyed(&mut self, p: Option<Provider>, keys: Option<Keys>) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ON.get_or_init(|| !matches!(std::env::var("XNW_TEX_KEYS").as_deref().map(str::trim), Ok("off" | "0")));
+        let keys = keys.filter(|_| on);
+        if keys.is_none() || self.keys.is_none() {
+            self.provided.clear();
+            self.provided_none.clear();
         }
-        let p = self.provider.as_mut()?(slot)?;
-        let (t, up, f) = make_provided(device, &p)?;
-        uploads.push((t.clone(), up.clone(), f));
-        self.provided.insert(slot, (t.clone(), Some((up, f)), p.format));
-        self.stats.uploads += 1;
-        self.stats.upload_bytes += p.rows.len() as u64;
-        Some((t, srv(p.format), false))
+        self.provider = p;
+        self.keys = keys;
+        self.slot_key.clear();
+    }
+
+    /// `slot`'s key with this provider (the slot itself without keys).
+    fn key_of(&mut self, slot: u64) -> Option<u64> {
+        let Some(keys) = self.keys.as_mut() else { return Some(slot) };
+        *self.slot_key.entry(slot).or_insert_with(|| keys(slot))
+    }
+
+    /// Whether a texture for `slot` is made already.
+    fn provided_has(&mut self, slot: u64) -> bool {
+        self.key_of(slot).is_some_and(|k| self.provided.contains_key(&k))
+    }
+
+    /// A provided slot's texture, made and its upload queued on first use
+    /// of its key. A cube, an array or a 3D texture goes to
+    /// [`Self::wide`] and is `Not2d` here.
+    fn provide(&mut self, device: &ID3D12Device, slot: u64, uploads: &mut Vec<(ID3D12Resource, ID3D12Resource, Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>)>) -> Result<(ID3D12Resource, D3D12_SHADER_RESOURCE_VIEW_DESC, bool), Flat> {
+        let key = self.key_of(slot).ok_or(Flat::Other)?;
+        let frame = self.frame_no;
+        let (texture, srv, shaped) = if let Some(p) = self.provided.get_mut(&key) {
+            // The upload buffer is kept one frame past its copy (it ran: the last frame's fence).
+            if p.used != frame {
+                p.upload = None;
+            }
+            p.used = frame;
+            self.stats.provided_kept += 1;
+            (p.texture.clone(), p.srv, p.shaped)
+        } else {
+            if self.keys.is_some() && self.provided_none.contains(&key) {
+                return Err(Flat::Other);
+            }
+            let Some(p) = self.provider.as_mut().ok_or(Flat::Other)?(slot) else {
+                self.provided_none.insert(key);
+                return Err(Flat::Other);
+            };
+            let (t, up, f, srv) = make_provided(device, &p).ok_or(Flat::Other)?;
+            let shaped = p.dim != TEX_2D;
+            uploads.push((t.clone(), up.clone(), f));
+            self.provided.insert(key, ProvidedTex { texture: t.clone(), upload: Some(up), srv, shaped, used: frame });
+            self.stats.uploads += 1;
+            self.stats.upload_bytes += p.rows.len() as u64;
+            (t, srv, shaped)
+        };
+        if shaped {
+            self.keep_wide(slot, texture, srv);
+            return Err(Flat::Not2d);
+        }
+        Ok((texture, srv, false))
     }
 
     /// The per-second lines (and the counters, the waiting exits),
@@ -665,19 +1093,51 @@ impl TexTable {
             return None;
         }
         self.last_log = std::time::Instant::now();
-        let s = std::mem::take(&mut self.stats);
+        let mut s = std::mem::take(&mut self.stats);
+        let e = &mut self.entries;
+        (s.written, s.kept, s.evicted) = (std::mem::take(&mut e.written), std::mem::take(&mut e.kept), std::mem::take(&mut e.evicted));
         Some([
             {
                 let (p, r, n, ms) = texture::pass_reader_counts();
                 format!("world render: textures: bound {}, flat {} ({}), uploaded {} ({:.1} MiB), waiting {}; reads off the frame: pending {p}, ready {r}, done {n}, read {ms:.0} ms in total; copies refused (bounds) {}", s.bound_draws, s.flat_draws, Self::flat_split(&s), s.uploads, s.upload_bytes as f64 / (1 << 20) as f64, s.waiting, texture::PASS_COPY_REFUSED.load(std::sync::atomic::Ordering::Relaxed))
             },
             format!(
-                "world render: textures: {} distinct in the last frame of {} asked (table {}); slots placed {}, shader {}, other {}, stale {}, no record {}; uploads from pack {}, pages {}, memory {}, hashed memory {}, unknown {}, again {}; not 2D {}, no copy {}, table full {}",
-                s.distinct, s.demand, self.opts.slots, s.placed, s.shader, s.other, s.stale, s.no_record, s.sources[0], s.sources[1], s.sources[2], s.sources[3], s.sources[4], s.again, s.not_2d, s.no_copy, s.full
+                "world render: textures: {} distinct in the last frame of {} asked (table {}); slots placed {}, shader {}, other {}, stale {}, no record {}; uploads from pack {}, pages {}, memory {}, hashed memory {}, unknown {}, again {}; not 2D {}, no copy {}, table full {}; entries ({}): resident {}, views written {}, kept {}, nulled {}, evicted {}; provided kept {}; resolves (count/ms): known {}/{:.1}, flat known {}/{:.1}, partial kept {}/{:.1}, looked up {}/{:.1}, waited past the read time {}/{:.1}",
+                s.distinct, s.demand, self.opts.slots, s.placed, s.shader, s.other, s.stale, s.no_record, s.sources[0], s.sources[1], s.sources[2], s.sources[3], s.sources[4], s.again, s.not_2d, s.no_copy, s.full, if stable_on() { "stable" } else { "per frame" }, s.resident, s.written, s.kept, s.nulls, s.evicted, s.provided_kept,
+                s.paths[0], s.path_ms[0], s.paths[1], s.path_ms[1], s.paths[2], s.path_ms[2], s.paths[3], s.path_ms[3], s.paths[4], s.path_ms[4]
             ),
             // Why asks gave no new texels (the exits).
             texture::exits_text(),
         ])
+    }
+}
+
+/// The null view of a table entry: a 2D texture that reads zeros.
+fn null_view() -> D3D12_SHADER_RESOURCE_VIEW_DESC {
+    D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: 0, MipLevels: 1, PlaneSlice: 0, ResourceMinLODClamp: 0.0 } },
+    }
+}
+
+/// A null view at every one of the `declared` entries of a table whose
+/// first heap slot is `base`, once, when its heap is made. The table is
+/// bound whole as the root signature declares it, and [`TexTable::prepare`]
+/// writes only the entries draws take or let go: an entry no draw had taken
+/// yet was never written. Under the debug layer that was id 646 "has not
+/// been initialized" for the pass's `albedoTex` range at every draw (1024
+/// stored messages on pk6 f1205) since the table went from 1024 to 4096
+/// entries; the layer's text: on resource binding tier 2 hardware a
+/// declared table must be populated and initialised.
+pub(crate) fn null_table(device: &ID3D12Device, cpu: &dyn Fn(u32) -> D3D12_CPU_DESCRIPTOR_HANDLE, base: u32, declared: u32) {
+    let null = null_view();
+    // SAFETY: `declared` slots of the caller's heap from `base`; a null resource makes a null view.
+    unsafe {
+        for i in 0..declared {
+            device.CreateShaderResourceView(None, Some(&null), cpu(base + i));
+        }
     }
 }
 
@@ -712,6 +1172,58 @@ fn srv_desc(d: &D3D12_RESOURCE_DESC, words: Option<[u32; 10]>, first_mip: u32, d
         },
         is_srgb(format),
     ))
+}
+
+/// A view of a host copy that is not plain 2D, of the dimension the
+/// title's view has (its words: 5 2D array, 8 3D, 9 cube, 10 cube array;
+/// a shader view without words: the resource's own shape), all slices,
+/// mips as [`srv_desc`]. `None`: a multisampled or depth copy, or a kind
+/// none of these.
+fn wide_srv(d: &D3D12_RESOURCE_DESC, words: Option<[u32; 10]>, first_mip: u32, dropped: u32) -> Option<D3D12_SHADER_RESOURCE_VIEW_DESC> {
+    const ARRAY: u32 = 5;
+    const VOLUME: u32 = 8;
+    const CUBE: u32 = 9;
+    const CUBE_ARRAY: u32 = 10;
+    if d.SampleDesc.Count > 1 || d.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) {
+        return None;
+    }
+    let kind = match (words.map(|w| w[1]), d.Dimension) {
+        (Some(k), _) => k,
+        (None, D3D12_RESOURCE_DIMENSION_TEXTURE3D) => VOLUME,
+        (None, D3D12_RESOURCE_DIMENSION_TEXTURE2D) if d.DepthOrArraySize > 1 => ARRAY,
+        _ => return None,
+    };
+    let host = d.Format.0 as u32;
+    let format = if resource::is_typeless(host) {
+        let v = words.map_or(0, |w| resource::pc_format(w[0]));
+        if v != 0 && resource::family(v) == host { v } else { resource::first_concrete(host) }
+    } else {
+        host
+    };
+    let mips = u32::from(d.MipLevels).max(1);
+    let most = first_mip.max(words.map_or(0, |w| w[4]).saturating_sub(dropped)).min(mips - 1);
+    let slices = u32::from(d.DepthOrArraySize).max(1);
+    let mut v = D3D12_SHADER_RESOURCE_VIEW_DESC { Format: DXGI_FORMAT(format as i32), Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, ..Default::default() };
+    match (kind, d.Dimension) {
+        (ARRAY, D3D12_RESOURCE_DIMENSION_TEXTURE2D) => {
+            v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+            v.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV { MostDetailedMip: most, MipLevels: mips - most, FirstArraySlice: 0, ArraySize: slices, PlaneSlice: 0, ResourceMinLODClamp: 0.0 };
+        }
+        (CUBE, D3D12_RESOURCE_DIMENSION_TEXTURE2D) if slices >= 6 => {
+            v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+            v.Anonymous.TextureCube = D3D12_TEXCUBE_SRV { MostDetailedMip: most, MipLevels: mips - most, ResourceMinLODClamp: 0.0 };
+        }
+        (CUBE_ARRAY, D3D12_RESOURCE_DIMENSION_TEXTURE2D) if slices >= 6 => {
+            v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
+            v.Anonymous.TextureCubeArray = D3D12_TEXCUBE_ARRAY_SRV { MostDetailedMip: most, MipLevels: mips - most, First2DArrayFace: 0, NumCubes: slices / 6, ResourceMinLODClamp: 0.0 };
+        }
+        (VOLUME, D3D12_RESOURCE_DIMENSION_TEXTURE3D) => {
+            v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+            v.Anonymous.Texture3D = D3D12_TEX3D_SRV { MostDetailedMip: most, MipLevels: mips - most, ResourceMinLODClamp: 0.0 };
+        }
+        _ => return None,
+    }
+    Some(v)
 }
 
 fn barrier(r: &ID3D12Resource, from: u32, to: u32) -> D3D12_RESOURCE_BARRIER {
@@ -782,42 +1294,105 @@ fn copy_checker(list: &ID3D12GraphicsCommandList, t: &ID3D12Resource, up: &ID3D1
     drop(ManuallyDrop::into_inner(src.pResource));
 }
 
-/// A 2D texture of `p`'s size and format and an upload buffer holding
-/// its rows at 256-byte aligned pitch.
-fn make_provided(device: &ID3D12Device, p: &Provided) -> Option<(ID3D12Resource, ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
+/// The host texture of a provided texture: its description, its
+/// subresources and the view of its shape. A cube is a 2D texture of six
+/// slices with a cube view (a cube array's first cube); an array one
+/// subresource a slice and mip; a 3D texture one a mip.
+pub(crate) fn provided_shape(p: &Provided) -> (D3D12_RESOURCE_DESC, u32, D3D12_SHADER_RESOURCE_VIEW_DESC) {
     let format = DXGI_FORMAT(p.format as i32);
-    let d = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: u64::from(p.width), Height: p.height, DepthOrArraySize: 1, MipLevels: 1, Format: format, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() };
-    let pitch = p.row_bytes.div_ceil(256) * 256;
-    if p.rows.len() < (p.row_bytes * p.row_count) as usize {
+    let mips = p.mips.clamp(1, 15);
+    let slices = p.depth.clamp(1, u32::from(u16::MAX));
+    let (dimension, height, depth, subs) = match p.dim {
+        TEX_1D => (D3D12_RESOURCE_DIMENSION_TEXTURE1D, 1, 1, mips),
+        TEX_3D => (D3D12_RESOURCE_DIMENSION_TEXTURE3D, p.height, slices, mips),
+        TEX_2D_ARRAY | TEX_CUBE => (D3D12_RESOURCE_DIMENSION_TEXTURE2D, p.height, slices, slices * mips),
+        _ => (D3D12_RESOURCE_DIMENSION_TEXTURE2D, p.height, 1, mips),
+    };
+    let desc = D3D12_RESOURCE_DESC { Dimension: dimension, Width: u64::from(p.width), Height: height, DepthOrArraySize: depth as u16, MipLevels: mips as u16, Format: format, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() };
+    let (view, a) = match p.dim {
+        TEX_1D => (D3D12_SRV_DIMENSION_TEXTURE1D, D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture1D: D3D12_TEX1D_SRV { MipLevels: mips, ..Default::default() } }),
+        TEX_3D => (D3D12_SRV_DIMENSION_TEXTURE3D, D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture3D: D3D12_TEX3D_SRV { MipLevels: mips, ..Default::default() } }),
+        TEX_2D_ARRAY => (D3D12_SRV_DIMENSION_TEXTURE2DARRAY, D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2DArray: D3D12_TEX2D_ARRAY_SRV { MipLevels: mips, ArraySize: slices, ..Default::default() } }),
+        TEX_CUBE if slices >= 6 => (D3D12_SRV_DIMENSION_TEXTURECUBE, D3D12_SHADER_RESOURCE_VIEW_DESC_0 { TextureCube: D3D12_TEXCUBE_SRV { MipLevels: mips, ..Default::default() } }),
+        _ => (D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MipLevels: mips, ..Default::default() } }),
+    };
+    (desc, subs, D3D12_SHADER_RESOURCE_VIEW_DESC { Format: format, ViewDimension: view, Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, Anonymous: a })
+}
+
+/// `GetCopyableFootprints` of the first `subs` subresources of `desc`:
+/// the footprints, each one's rows and row bytes, and the bytes in all.
+pub(crate) fn footprints(device: &ID3D12Device, desc: &D3D12_RESOURCE_DESC, subs: u32) -> (Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>, Vec<u32>, Vec<u64>, u64) {
+    let n = subs as usize;
+    let (mut fps, mut rows, mut row_size, mut total) = (vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); n], vec![0u32; n], vec![0u64; n], 0u64);
+    // SAFETY: outputs for `subs` subresources.
+    unsafe { device.GetCopyableFootprints(desc, 0, subs, 0, Some(fps.as_mut_ptr()), Some(rows.as_mut_ptr()), Some(row_size.as_mut_ptr()), Some(&mut total)) };
+    (fps, rows, row_size, total)
+}
+
+/// Copies `p`'s rows to the mapped upload buffer `to` at [`footprints`]'
+/// places, subresource after subresource. One mip: the source rows are
+/// `row_bytes` apart, `row_count` of them (slices and depth slices follow
+/// one another). More mips: packed, each row its own mip's length. Rows
+/// the source does not hold stay as the buffer has them.
+///
+/// # Safety
+/// `to` is writable for the footprints' total bytes.
+pub(crate) unsafe fn provided_fill(p: &Provided, fps: &[D3D12_PLACED_SUBRESOURCE_FOOTPRINT], rows: &[u32], row_size: &[u64], to: *mut u8) {
+    let packed = p.mips > 1;
+    let end = if packed { p.rows.len() } else { p.rows.len().min(p.row_bytes as usize * p.row_count as usize) };
+    let mut from = 0usize;
+    for (i, fp) in fps.iter().enumerate() {
+        let stride = if packed { row_size[i] as usize } else { p.row_bytes as usize };
+        let n = (row_size[i] as usize).min(stride);
+        let count = rows[i] as usize * fp.Footprint.Depth as usize;
+        for y in 0..count {
+            let at = from + y * stride;
+            if at + n > end {
+                break;
+            }
+            // SAFETY: row `y` of subresource `i` lies inside the footprints' bytes (the caller's `to`).
+            unsafe { std::ptr::copy_nonoverlapping(p.rows[at..].as_ptr(), to.add(fp.Offset as usize + y * fp.Footprint.RowPitch as usize), n) };
+        }
+        from += count * stride;
+    }
+}
+
+/// A texture of `p`'s shape and format and an upload buffer holding its
+/// subresources at their footprints, with the view of its shape.
+fn make_provided(device: &ID3D12Device, p: &Provided) -> Option<(ID3D12Resource, ID3D12Resource, Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>, D3D12_SHADER_RESOURCE_VIEW_DESC)> {
+    let (d, subs, srv) = provided_shape(p);
+    if p.mips <= 1 && p.rows.len() < (p.row_bytes * p.row_count) as usize {
         return None;
     }
-    let footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: 0, Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: format, Width: p.width, Height: p.height, Depth: 1, RowPitch: pitch } };
-    let b = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: u64::from(pitch) * u64::from(p.row_count), Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default() };
+    let (fps, rows, row_size, total) = footprints(device, &d, subs);
+    if total == 0 || total == u64::MAX {
+        return None;
+    }
+    let b = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: total, Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default() };
     let mut t: Option<ID3D12Resource> = None;
     let mut up: Option<ID3D12Resource> = None;
-    // SAFETY: descriptions outlive the calls; the mapping covers `row_count` rows of `pitch` bytes.
+    // SAFETY: descriptions outlive the calls; the mapping covers the footprints' `total` bytes.
     unsafe {
         device.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, None, &mut t).ok()?;
         device.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &b, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut up).ok()?;
         let up = up?;
         let mut m: *mut std::ffi::c_void = std::ptr::null_mut();
         up.Map(0, None, Some(&mut m)).ok()?;
-        let rb = p.row_bytes as usize;
-        for row in 0..p.row_count as usize {
-            std::ptr::copy_nonoverlapping(p.rows[row * rb..row * rb + rb].as_ptr(), m.cast::<u8>().add(row * pitch as usize), rb);
-        }
+        provided_fill(p, &fps, &rows, &row_size, m.cast());
         up.Unmap(0, None);
-        Some((t?, up, footprint))
+        Some((t?, up, fps, srv))
     }
 }
 
-fn copy_footprint(list: &ID3D12GraphicsCommandList, t: &ID3D12Resource, up: &ID3D12Resource, footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT) {
-    let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: ManuallyDrop::new(Some(t.clone())), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
-    let src = D3D12_TEXTURE_COPY_LOCATION { pResource: ManuallyDrop::new(Some(up.clone())), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint } };
-    // SAFETY: an open list; both locations name live resources.
-    unsafe { list.CopyTextureRegion(&dst, 0, 0, 0, &src, None) };
-    drop(ManuallyDrop::into_inner(dst.pResource));
-    drop(ManuallyDrop::into_inner(src.pResource));
+fn copy_footprints(list: &ID3D12GraphicsCommandList, t: &ID3D12Resource, up: &ID3D12Resource, footprints: &[D3D12_PLACED_SUBRESOURCE_FOOTPRINT]) {
+    for (i, f) in footprints.iter().enumerate() {
+        let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: ManuallyDrop::new(Some(t.clone())), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: i as u32 } };
+        let src = D3D12_TEXTURE_COPY_LOCATION { pResource: ManuallyDrop::new(Some(up.clone())), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *f } };
+        // SAFETY: an open list; both locations name live resources.
+        unsafe { list.CopyTextureRegion(&dst, 0, 0, 0, &src, None) };
+        drop(ManuallyDrop::into_inner(dst.pResource));
+        drop(ManuallyDrop::into_inner(src.pResource));
+    }
 }
 
 #[cfg(test)]
@@ -916,8 +1491,114 @@ mod tests {
         assert!(srv_desc(&d(70, 6, 1), Some(w), 0, 0).is_none());
     }
 
+    /// A provided cube and a provided array on the device (WARP): made,
+    /// uploaded and viewed as the table does it, then sampled by a compute
+    /// program. Each face's texels answer the direction of that face in
+    /// D3D12's order (+x, -x, +y, -y, +z, -z = slices 0-5, the console's
+    /// order too), each mip its own level, each array slice its index.
+    #[test]
+    fn provided_cube_and_array_texels_reach_a_sampler() {
+        if !xnw_gpu::host::device_allowed() {
+            return;
+        }
+        let (_gpu, host) = crate::tests::warp_host();
+        let dev = &host.device;
+        // 4x4 then 2x2 RGBA8 a slice, packed: red = 40 x slice + 10, green = 100 x mip + 50.
+        let rows = |slices: u32| (0..slices).flat_map(|s| [(0u8, 16), (1, 4)].into_iter().flat_map(move |(m, n)| std::iter::repeat_n([40 * s as u8 + 10, 100 * m + 50, 0, 255], n).flatten())).collect::<Vec<u8>>();
+        let cube = Provided { width: 4, height: 4, format: 28, rows: rows(6), row_bytes: 16, row_count: 24, dim: TEX_CUBE, depth: 6, mips: 2 };
+        let array = Provided { width: 4, height: 4, format: 28, rows: rows(3), row_bytes: 16, row_count: 12, dim: TEX_2D_ARRAY, depth: 3, mips: 2 };
+        let src = "#define RS \"DescriptorTable(SRV(t0, numDescriptors = 2)), UAV(u0), StaticSampler(s0, filter = FILTER_MIN_MAG_MIP_POINT)\"
+TextureCube<float4> c : register(t0); Texture2DArray<float4> a : register(t1); SamplerState s : register(s0); RWByteAddressBuffer o : register(u0);
+static const float3 D[6] = { float3(1, 0, 0), float3(-1, 0, 0), float3(0, 1, 0), float3(0, -1, 0), float3(0, 0, 1), float3(0, 0, -1) };
+[RootSignature(RS)][numthreads(1, 1, 1)] void cs() { for (uint i = 0; i < 12; i++) { float4 v = c.SampleLevel(s, D[i % 6], i / 6); o.Store(4 * i, uint(v.x * 255 + 0.5) | uint(v.y * 255 + 0.5) << 8); } for (uint k = 0; k < 6; k++) { float4 v = a.SampleLevel(s, float3(0.5, 0.5, k % 3), k / 3); o.Store(48 + 4 * k, uint(v.x * 255 + 0.5) | uint(v.y * 255 + 0.5) << 8); } }
+";
+        let cs = crate::compile_source(src, c"cs", c"cs_5_1").expect("compile");
+        let e = |e: windows::core::Error| e.to_string();
+        // SAFETY: our device, list and live resources; the readback is mapped after the fence.
+        let got: Vec<u32> = unsafe {
+            let bytes = std::slice::from_raw_parts(cs.GetBufferPointer().cast::<u8>(), cs.GetBufferSize());
+            let root: ID3D12RootSignature = dev.CreateRootSignature(0, bytes).map_err(e).expect("root");
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC { pRootSignature: std::mem::transmute_copy(&root), CS: D3D12_SHADER_BYTECODE { pShaderBytecode: cs.GetBufferPointer(), BytecodeLength: cs.GetBufferSize() }, ..Default::default() };
+            let pso: ID3D12PipelineState = dev.CreateComputePipelineState(&desc).map_err(e).expect("pso");
+            let out = crate::bridge::buffer(dev, 256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON).expect("out");
+            let rb = crate::bridge::buffer(dev, 256, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST).expect("rb");
+            let heap: ID3D12DescriptorHeap = dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, NumDescriptors: 2, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, ..Default::default() }).map_err(e).expect("heap");
+            let step = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).map_err(e).expect("queue");
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e).expect("fence");
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e).expect("alloc");
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(e).expect("list");
+            let mut keep = Vec::new();
+            for (i, p) in [&cube, &array].into_iter().enumerate() {
+                let (t, up, fps, srv) = make_provided(dev, p).expect("texture");
+                assert_eq!(fps.len(), p.depth as usize * 2);
+                submit_barriers(&list, vec![barrier(&t, D3D12_RESOURCE_STATE_COMMON.0 as u32, COPY_DEST)]);
+                copy_footprints(&list, &t, &up, &fps);
+                submit_barriers(&list, vec![barrier(&t, COPY_DEST, PS_STATE)]);
+                dev.CreateShaderResourceView(&t, Some(&srv), D3D12_CPU_DESCRIPTOR_HANDLE { ptr: heap.GetCPUDescriptorHandleForHeapStart().ptr + i * step });
+                keep.push((t, up));
+            }
+            submit_barriers(&list, vec![barrier(&out, D3D12_RESOURCE_STATE_COMMON.0 as u32, D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32)]);
+            list.SetDescriptorHeaps(&[Some(heap.clone())]);
+            list.SetComputeRootSignature(&root);
+            list.SetPipelineState(&pso);
+            list.SetComputeRootDescriptorTable(0, heap.GetGPUDescriptorHandleForHeapStart());
+            list.SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+            list.Dispatch(1, 1, 1);
+            submit_barriers(&list, vec![barrier(&out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32)]);
+            list.CopyBufferRegion(&rb, 0, &out, 0, 72);
+            list.Close().map_err(e).expect("close");
+            queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).map_err(e).expect("cast"))]);
+            queue.Signal(&fence, 1).map_err(e).expect("signal");
+            while fence.GetCompletedValue() < 1 {
+                dev.GetDeviceRemovedReason().map_err(e).expect("device kept");
+                std::thread::yield_now();
+            }
+            let mut p = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut p)).map_err(e).expect("map");
+            let v = std::slice::from_raw_parts(p.cast::<u32>(), 18).to_vec();
+            rb.Unmap(0, None);
+            v
+        };
+        let want = |slice: u32, mip: u32| (40 * slice + 10) | (100 * mip + 50) << 8;
+        assert_eq!(got[..12], std::array::from_fn::<u32, 12, _>(|i| want(i as u32 % 6, i as u32 / 6)), "cube: face by direction, then mip 1");
+        assert_eq!(got[12..], std::array::from_fn::<u32, 6, _>(|k| want(k as u32 % 3, k as u32 / 3)), "array: slice, then mip 1");
+    }
+
+    /// A provided cube is six slices with their mips and a cube view; its
+    /// packed rows land subresource by subresource, each row at its own
+    /// mip's length. One mip keeps the rule the draw bridge had.
+    #[test]
+    fn provided_shapes_and_their_rows() {
+        let p = |dim: u8, depth: u32, mips: u32, rows: Vec<u8>| Provided { width: 4, height: 4, format: 28, rows, row_bytes: 16, row_count: 4 * depth, dim, depth, mips };
+        let (d, subs, v) = provided_shape(&p(TEX_CUBE, 6, 3, Vec::new()));
+        assert_eq!((d.Dimension, d.DepthOrArraySize, d.MipLevels, subs, v.ViewDimension), (D3D12_RESOURCE_DIMENSION_TEXTURE2D, 6, 3, 18, D3D12_SRV_DIMENSION_TEXTURECUBE));
+        let (d, subs, v) = provided_shape(&p(TEX_3D, 4, 2, Vec::new()));
+        assert_eq!((d.Dimension, d.DepthOrArraySize, subs, v.ViewDimension), (D3D12_RESOURCE_DIMENSION_TEXTURE3D, 4, 2, D3D12_SRV_DIMENSION_TEXTURE3D));
+        let (d, subs, v) = provided_shape(&p(TEX_2D_ARRAY, 5, 1, Vec::new()));
+        assert_eq!((d.DepthOrArraySize, subs, v.ViewDimension), (5, 5, D3D12_SRV_DIMENSION_TEXTURE2DARRAY));
+        let (d, subs, v) = provided_shape(&p(TEX_2D, 1, 1, Vec::new()));
+        assert_eq!((d.DepthOrArraySize, d.MipLevels, subs, v.ViewDimension), (1, 1, 1, D3D12_SRV_DIMENSION_TEXTURE2D));
+        // Two slices of two mips (4x4 then 2x2 RGBA8), packed: 64 + 16 bytes a slice; footprints at a 256-byte pitch.
+        let fp = |offset: u64, w: u32| D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: offset, Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: DXGI_FORMAT(28), Width: w, Height: w, Depth: 1, RowPitch: 256 } };
+        let fps = [fp(0, 4), fp(1024, 2), fp(2048, 4), fp(3072, 2)];
+        let src: Vec<u8> = (0..160u32).map(|i| i as u8).collect();
+        let mut to = vec![0xEEu8; 4096];
+        // SAFETY: `to` holds the footprints' bytes.
+        unsafe { provided_fill(&p(TEX_2D_ARRAY, 2, 2, src.clone()), &fps, &[4, 2, 4, 2], &[16, 8, 16, 8], to.as_mut_ptr()) };
+        assert_eq!((&to[..16], &to[256..272], to[16]), (&src[..16], &src[16..32], 0xEE));
+        assert_eq!((&to[1024..1032], &to[1024 + 256..1024 + 264]), (&src[64..72], &src[72..80]));
+        assert_eq!((&to[2048..2064], &to[3072 + 256..3072 + 264]), (&src[80..96], &src[152..160]));
+        // One mip, two slices: rows `row_bytes` apart, slice after slice; a short source leaves the rest.
+        let mut to = vec![0xEEu8; 2048];
+        // SAFETY: as above.
+        unsafe { provided_fill(&p(TEX_2D_ARRAY, 2, 1, src[..112].to_vec()), &[fp(0, 4), fp(1024, 4)], &[4, 4], &[16, 16], to.as_mut_ptr()) };
+        assert_eq!((&to[768..784], &to[1024..1040], &to[1024 + 512..1024 + 528], to[1024 + 768]), (&src[48..64], &src[64..80], &src[96..112], 0xEE));
+    }
+
     /// Every flat draw is counted under one reason; the table's entries
     /// go in slot order, the rest are `full`; textured draws are not split.
+    /// The next frame keeps each slot's entry and writes no view again.
     #[test]
     fn flat_draws_split_by_reason() {
         let mut t = TexTable::new(TexOptions { mode: TexMode::Checker, slots: 3, ..Default::default() }, 0);
@@ -928,12 +1609,23 @@ mod tests {
             14 => Err(Flat::Waiting),
             15 => Err(Flat::Other),
             19 => Err(Flat::GpuOut),
-            _ => Ok(((), s == 11)),
+            _ => Ok((s, s == 11)),
         };
-        let mut placed = Vec::new();
         let asked = [10u64, 0, 12, 10, 13, 14, 15, 19, 18, 11, 16, 17, 16];
-        let demand = t.fill(&mut asked.iter().copied(), &mut |_, s| why(s), &mut |(), i| placed.push(i));
-        assert_eq!((demand, placed, t.next), (10, vec![1, 2], 3), "11 comes after the table's last entry");
+        let frame = |t: &mut TexTable, n: u64| {
+            t.frame.clear();
+            t.why.clear();
+            t.entries.begin(n, false);
+            let mut placed = Vec::new();
+            let demand = t.fill(&mut asked.iter().copied(), false, &mut |_, s| why(s), &mut |t, v, i| {
+                if t.entries.hold(i, v) {
+                    placed.push(i);
+                }
+            });
+            (demand, placed)
+        };
+        assert_eq!(frame(&mut t, 1), (10, vec![1, 2]), "11 comes after the table's last entry");
+        assert_eq!(t.entries.resident(), 2);
         assert_eq!((t.lookup(10), t.lookup(18)), ((1, false), (2, false)));
         assert_eq!(t.lookup(11), (0, false));
         assert_eq!(t.flat_reason(11), Flat::Full);
@@ -947,24 +1639,89 @@ mod tests {
         assert_eq!(s.flat_by, [1, 4, 1, 1, 1, 2, 2], "none, full (11, 16, 17 x2), stale, not2d, waiting, other (15 and the never-asked 99), gpuout (19 x2)");
         assert_eq!(s.flat_by.iter().sum::<u64>(), s.flat_draws);
         assert_eq!(TexTable::flat_split(&s), "none 1, full 4, stale 1, not2d 1, waiting 1, other 2, gpuout 2");
-        // A table with room: nothing is full, the second frame starts over.
-        t.opts.slots = 64;
-        t.frame.clear();
-        t.why.clear();
-        t.next = 1;
-        let mut placed = Vec::new();
-        t.fill(&mut asked.iter().copied(), &mut |_, s| why(s), &mut |(), i| placed.push(i));
-        assert_eq!(placed, vec![1, 2, 3, 4, 5]);
+        // The next frame: 10 and 18 keep entries 1 and 2, no view is written again.
+        assert_eq!(frame(&mut t, 2), (10, vec![]));
+        assert_eq!((t.lookup(10), t.lookup(18), t.entries.kept), ((1, false), (2, false), 2));
+        // A table with room: nothing is full.
+        t.entries = Entries::new(64);
+        assert_eq!(frame(&mut t, 3), (10, vec![1, 2, 3, 4, 5]));
         assert_eq!(t.flat_reason(19), Flat::GpuOut);
         assert_eq!((t.lookup(11), t.flat_reason(14)), ((3, true), Flat::Waiting));
         assert!(!t.why.values().any(|w| *w == Flat::Full));
     }
 
-    /// A table smaller than `TEX_SLOTS` (terrain's) never nulls past its own entries.
+    /// Entries stay with their slots across frames; a full pool lets go of
+    /// its least recently used eighth at once (never an entry this frame
+    /// uses) and the next new slots take the rest of that room; a slot
+    /// that stops resolving lets its entry go, written null once.
+    #[test]
+    fn entries_stay_and_the_least_recently_used_go() {
+        let mut e = Entries::new(TEX_LOW + 16);
+        e.begin(1, false);
+        let first: Vec<u32> = (1..=16u64).map(|s| e.reserve(s, false).unwrap()).collect();
+        assert_eq!(first, (TEX_LOW..TEX_LOW + 16).collect::<Vec<_>>(), "albedo entries from TEX_LOW up, lowest first");
+        for (i, &x) in first.iter().enumerate() {
+            assert!(e.hold(x, 100 + i as u64));
+        }
+        assert!(e.take_nulls().is_empty());
+        // Frame 2 uses 1..=8 and a new slot: the high pool is full, two of 9..=16 go.
+        e.begin(2, false);
+        for s in 1..=8u64 {
+            assert_eq!(e.reserve(s, false), Some(first[s as usize - 1]));
+            assert!(!e.hold(first[s as usize - 1], 100 + s - 1), "same view: not written");
+        }
+        let n = e.reserve(100, false).unwrap();
+        e.hold(n, 200);
+        assert!(n >= TEX_LOW && first[8..].contains(&n));
+        assert_eq!(e.evicted, 2, "one eighth of 16");
+        let m = e.reserve(101, false).unwrap();
+        e.hold(m, 201);
+        assert_eq!(e.evicted, 2, "the second takes the room the first made");
+        assert!(first[8..].contains(&m) && m != n);
+        for s in 1..=8u64 {
+            assert_eq!(e.entry(s), Some(first[s as usize - 1]), "this frame's entries stay");
+        }
+        assert!(e.take_nulls().is_empty(), "both freed entries were taken again");
+        // Frame 3: slot 1 stops resolving; its entry is written null.
+        e.begin(3, false);
+        e.reserve(1, false);
+        e.release(1);
+        assert_eq!(e.take_nulls(), vec![first[0]]);
+        assert_eq!(e.entry(1), None);
+        // The per-frame rule (`XNW_TEX_STABLE=off`): every entry goes, new ones from the lowest.
+        e.begin(4, true);
+        assert_eq!(e.resident(), 0);
+        assert_eq!(e.reserve(7, false), Some(TEX_LOW));
+        assert_eq!(e.take_nulls().len(), 15, "the 15 resident before; 7 takes an entry freed in frame 3");
+    }
+
+    /// Layers take entries below TEX_LOW (the shader's 8 bits): a slot held
+    /// above moves down; albedo past its pool falls back below; a pool
+    /// full of this frame's entries is full.
+    #[test]
+    fn layers_stay_below_their_bound() {
+        let mut e = Entries::new(TEX_LOW + 1);
+        e.begin(1, false);
+        assert_eq!(e.reserve(5, false), Some(TEX_LOW));
+        e.hold(TEX_LOW, 9);
+        assert_eq!(e.reserve(6, false), Some(1), "albedo past its pool");
+        e.begin(2, false);
+        assert_eq!(e.reserve(5, true), Some(2), "a layer's slot moves below TEX_LOW");
+        assert_eq!(e.take_nulls(), vec![TEX_LOW]);
+        let mut small = Entries::new(3);
+        small.begin(1, false);
+        assert_eq!((small.reserve(1, true), small.reserve(2, false), small.reserve(3, true)), (Some(1), Some(2), None));
+    }
+
+    /// A table smaller than `TEX_SLOTS` (terrain's) never writes past its own entries.
     #[test]
     fn table_writes_stay_within_its_entries() {
-        let t = TexTable::new(TexOptions { slots: 40, ..Default::default() }, 0);
-        assert_eq!(t.written, 40);
+        let mut t = TexTable::new(TexOptions { slots: 40, ..Default::default() }, 0);
+        assert_eq!((t.entries.slots, t.res.len()), (40, 40));
+        t.entries.begin(1, false);
+        let got: Vec<u32> = (1..100u64).filter_map(|s| t.entries.reserve(s, s % 2 == 0)).collect();
+        assert_eq!(got.len(), 39);
+        assert!(got.iter().all(|&e| (1..40).contains(&e)));
         assert_eq!(TexTable::new(TexOptions { slots: u32::MAX, ..Default::default() }, 0).opts.slots, TEX_SLOTS);
     }
 
@@ -975,7 +1732,7 @@ mod tests {
         assert!(src.contains(&format!("Texture2D albedoTex[{TEX_SLOTS}] : register(t3);")));
         assert!(src.contains(&format!("SRV(t3, numDescriptors={TEX_SLOTS})")));
         assert!(src.contains(&format!("albedoTex[min(texIndex, {})]", TEX_SLOTS - 1)));
-        assert_eq!((layer_entry(0), layer_entry(255), layer_entry(256), layer_entry(TEX_SLOTS - 1)), (0, 255, 0, 0));
+        assert_eq!((layer_entry(0), layer_entry(255), layer_entry(TEX_LOW), layer_entry(TEX_SLOTS - 1)), (0, 255, 0, 0));
     }
 
     #[test]

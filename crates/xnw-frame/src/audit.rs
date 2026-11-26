@@ -1374,7 +1374,29 @@ pub fn one_bone_streams(vb: &mut Vec<u8>, word0: u32, verts: u32) -> bool {
     if !whole && shift > 1 {
         return false;
     }
-    let at = s.indices[0].offset as usize;
+    one_bone_append(vb, s.indices[0].offset as usize, whole, field, verts)
+}
+
+/// [`one_bone_streams`]'s choice from the data alone, without the mesh
+/// program (the live hook has none): no weight and no index stream (all four
+/// strides 0), and the meshlet word 0 in the whole-mesh form (bits 29 and
+/// 30), or the array form (shift 0 or 1) at an offset past the stream table
+/// with all `verts` elements inside the buffer. Census (`vehicle skin` line,
+/// `data rule`): see the vehicle notes.
+pub fn one_bone_data_rule(vb: &[u8], word0: u32, verts: u32) -> bool {
+    let Some(s) = Streams::parse(vb) else { return false };
+    if [s.weights[0], s.weights[1], s.indices[0], s.indices[1]].iter().any(|x| x.stride != 0) {
+        return false;
+    }
+    if word0 >> 29 & 3 == 3 {
+        return true;
+    }
+    let (shift, at) = (word0 >> 17 & 31, u64::from(s.indices[0].offset));
+    shift <= 1 && at >= 0x80 && at + (u64::from(verts) << shift) <= vb.len() as u64
+}
+
+fn one_bone_append(vb: &mut Vec<u8>, at: usize, whole: bool, field: u32, verts: u32) -> bool {
+    let shift = field & 31;
     let bone = |v: u32| -> u32 {
         if whole {
             return field;
@@ -1430,6 +1452,8 @@ pub fn vehicle_skin(dir: &std::path::Path, list: &mut FrameList, geoms: &mut Has
     let (mut ped_off, mut rigid_off, mut mask_rows, mut no_words, mut no_rec) = (0usize, 0usize, 0usize, 0usize, 0usize);
     let (mut forms, mut no_blob) = ([0usize; 3], 0usize);
     let mut patched: HashMap<GeomKey, bool> = HashMap::new();
+    let (mut hidden, mut part_hidden): (Vec<(usize, u32)>, usize) = (Vec::new(), 0);
+    let (mut word0s, mut rule_fires, mut rule_quiet): (HashMap<GeomKey, Option<bool>>, [usize; 4], [usize; 4]) = (HashMap::new(), [0; 4], [0; 4]);
     let mut tables: HashMap<(u32, u32, u128), u32> = HashMap::new();
     for i in 0..list.draws.len() {
         let r = list.draws[i];
@@ -1447,6 +1471,16 @@ pub fn vehicle_skin(dir: &std::path::Path, list: &mut FrameList, geoms: &mut Has
         };
         let class = prog_class(name);
         class_n[class as usize] += 1;
+        // The data rule the live pass uses (no program there), against the class.
+        // (Per geometry at its first row, before any row's streams are appended.)
+        let fires = *word0s.entry(r.geom).or_insert_with(|| {
+            let w0 = pack.data.refs_of(sink).find(|x| x.kind == kind::BUFFER && x.addr as u32 == r.geom.mesh_at as u32 && u64::from(x.len) == r.geom.mesh_len as u64).and_then(|x| pack.blob(x.hash)).as_deref().and_then(|b| u(b, 0));
+            Some((w0?, geoms.get(&r.geom)?)).map(|(w0, (vb, idx))| one_bone_data_rule(vb, w0, idx.iter().max().map_or(0, |m| m + 1)))
+        });
+        if let Some(fires) = fires {
+            let k = if fires { &mut rule_fires } else { &mut rule_quiet };
+            k[class as usize] += 1;
+        }
         if rules & SKIN_PROGRAM_CLASS != 0 {
             let ped = class == ProgClass::Ped || r.remap != NO_REMAP;
             ped_off += usize::from(r.ped && !ped);
@@ -1504,9 +1538,27 @@ pub fn vehicle_skin(dir: &std::path::Path, list: &mut FrameList, geoms: &mut Has
             start
         });
         list.draws[i].remap = at;
+        // A one-bone row whose every vertex lands on a bone with a zero 3x3
+        // (the compacted palette's zero entry, or a bone scaled to zero) is
+        // a part the title does not show.
+        if class == ProgClass::OneBone
+            && let Some((vb, idx)) = geoms.get(&r.geom)
+            && let Some(s) = Streams::parse(vb).filter(|s| s.indices[0].stride == 4)
+        {
+            let pal = &list.palettes[p];
+            let entry = |v: u32| u(vb, (s.indices[0].offset + 4 * v) as usize).and_then(|b| pal.get(at as usize + (b & 0xFFF) as usize)).map_or(0, |e| e.to_bits() & 0xFFF);
+            let flat = |t: u32| pal.get((r.bone_first + t) as usize * 12..(r.bone_first + t) as usize * 12 + 12).is_none_or(|m| [0, 1, 2, 4, 5, 6, 8, 9, 10].iter().all(|&k| m[k].abs() < 1e-6));
+            let verts = idx.iter().max().map_or(0, |m| m + 1);
+            let zero = (0..verts).filter(|&v| flat(entry(v))).count() as u32;
+            if zero == verts && verts > 0 {
+                hidden.push((i, r.stage));
+            } else if zero > 0 {
+                part_hidden += 1;
+            }
+        }
     }
     println!(
-        "vehicle skin (rules {rules:#x}): skinned rows by program: ped {}, one-bone {}, blend {}, rigid {}; no 1:1 sink {no_sink}, unnamed {unnamed}; ped flag dropped {ped_off}, palette dropped (rigid program) {rigid_off}; one-bone geometries: whole-mesh {}, u8 array {}, u16 array {}, rows not decoded {no_blob}; mask on {mask_rows} rows ({} tables, {no_words} without words, {no_rec} without a record)",
+        "vehicle skin (rules {rules:#x}): skinned rows by program: ped {}, one-bone {}, blend {}, rigid {}; no 1:1 sink {no_sink}, unnamed {unnamed}; ped flag dropped {ped_off}, palette dropped (rigid program) {rigid_off}; one-bone geometries: whole-mesh {}, u8 array {}, u16 array {}, rows not decoded {no_blob}; mask on {mask_rows} rows ({} tables, {no_words} without words, {no_rec} without a record); data rule (ped/one-bone/blend/rigid rows): fires {rule_fires:?}, quiet {rule_quiet:?}; one-bone rows hidden by the mask (row, stage) {hidden:?}, partly {part_hidden}",
         class_n[0], class_n[1], class_n[2], class_n[3], forms[0], forms[1], forms[2], tables.len()
     );
     Ok(())
@@ -1893,5 +1945,34 @@ mod geo10_tests {
         let before = vb.clone();
         assert!(!one_bone_streams(&mut vb, 0xe154_0001, 2));
         assert_eq!(vb, before);
+    }
+
+    #[test]
+    fn one_bone_data_rule_forms() {
+        let head = |idx_word: u32, tail: &[u8]| {
+            let mut vb = vec![0u8; 0x80];
+            vb[0x20..0x24].copy_from_slice(&idx_word.to_le_bytes());
+            vb.extend_from_slice(tail);
+            vb
+        };
+        // u8 array at 0x80, three vertices: fits; four do not.
+        let vb = head(0x80 << 7, &[7, 0, 9]);
+        assert!(one_bone_data_rule(&vb, 2 << 29 | 5, 3));
+        assert!(!one_bone_data_rule(&vb, 2 << 29 | 5, 4));
+        // u16 array: two vertices need 4 bytes.
+        assert!(!one_bone_data_rule(&vb, 1 << 17, 2));
+        assert!(one_bone_data_rule(&head(0x80 << 7, &[1, 0, 2, 0]), 1 << 17, 2));
+        // An offset inside the stream table (0: no array) or a shift the program has no load for.
+        assert!(!one_bone_data_rule(&head(0, &[0; 8]), 5, 2));
+        assert!(!one_bone_data_rule(&vb, 2 << 17, 1));
+        // Whole mesh: no array needed.
+        assert!(one_bone_data_rule(&head(0, &[]), 0xe154_0001, 100));
+        // A blend mesh (weights with a stride) or streams already appended: never.
+        let mut blend = head(0x80 << 7 | 4 << 3 | 5, &[0; 16]);
+        blend[0x18..0x1C].copy_from_slice(&(0x88u32 << 7 | 4 << 3 | 6).to_le_bytes());
+        assert!(!one_bone_data_rule(&blend, 0xe154_0001, 2));
+        let mut done = head(0, &[]);
+        assert!(one_bone_streams(&mut done, 0xe154_0001, 2));
+        assert!(!one_bone_data_rule(&done, 0xe154_0001, 2));
     }
 }

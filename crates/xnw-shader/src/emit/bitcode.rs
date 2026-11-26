@@ -452,7 +452,13 @@ impl Module {
     pub fn cast(&mut self, block: usize, op: Cast, v: V, to: Ty) -> V {
         self.push(block, to, Op::Cast(op, v))
     }
+    /// `fcmp false` / `fcmp true` become the constant: WARP removes its
+    /// device on a dispatch holding one (VIctory-Belobug-AMD#173, VIctory
+    /// 77053a0, which lower them the same way).
     pub fn cmp(&mut self, block: usize, pred: u8, a: V, b: V) -> V {
+        if pred == pred::FALSE || pred == pred::TRUE {
+            return self.bool(pred == pred::TRUE);
+        }
         let t = self.int(1);
         self.push(block, t, Op::Cmp(pred, a, b))
     }
@@ -1075,6 +1081,18 @@ impl Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No `fcmp false/true` reaches the module: both are constants.
+    #[test]
+    fn always_and_never_compares_are_constants() {
+        let mut m = Module::default();
+        let b = m.new_block();
+        let (x, y) = (m.f32(1.0f32.to_bits()), m.f32(2.0f32.to_bits()));
+        let (never, always) = (m.cmp(b, pred::FALSE, x, y), m.cmp(b, pred::TRUE, x, y));
+        assert_eq!((never, always), (m.bool(false), m.bool(true)));
+        let lt = m.cmp(b, pred::OLT, x, y);
+        assert!(matches!(lt, V::Inst(_)), "{lt:?}");
+    }
 
     #[test]
     fn vbr_and_blocks() {

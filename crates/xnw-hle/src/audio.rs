@@ -327,13 +327,19 @@ pub fn use_console_timers() {
         xnw_core::info!("timers: XNW_TIMERS=off: resolution left at {before:.3} ms");
         return;
     }
-    let keep = win::ProcessPowerThrottlingState { version: 1, control: win::PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, state: 0 };
+    // Also out of the system's efficiency mode (lower clocks, a hybrid
+    // processor's slow cores) while our window is not in front: the console
+    // has eight cores alike and no such mode. `XNW_EFFICIENCY_MODE=1` leaves
+    // the system its choice. (victory-fork a2537066, in VIctory-7900XTX
+    // 51d3f4d, GPL-3.0-or-later.)
+    let speed = if std::env::var("XNW_EFFICIENCY_MODE").is_ok_and(|v| v == "1") { 0 } else { win::PROCESS_POWER_THROTTLING_EXECUTION_SPEED };
+    let keep = win::ProcessPowerThrottlingState { version: 1, control: win::PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION | speed, state: 0 };
     // SAFETY: plain process settings; `keep` outlives the call.
     let r = unsafe {
         win::SetProcessInformation(win::GetCurrentProcess(), win::PROCESS_POWER_THROTTLING, (&raw const keep).cast(), size_of_val(&keep) as u32);
         win::timeBeginPeriod(1)
     };
-    xnw_core::info!("timers: resolution {before:.3} ms -> {:.3} ms (timeBeginPeriod(1) = {r})", resolution());
+    xnw_core::info!("timers: resolution {before:.3} ms -> {:.3} ms (timeBeginPeriod(1) = {r}); efficiency mode {}", resolution(), if speed == 0 { "left to the system (XNW_EFFICIENCY_MODE=1)" } else { "off" });
 }
 
 type CoCreateInstanceFn =unsafe extern "system" fn(*const [u8; 16], *mut c_void, u32, *const [u8; 16], *mut *mut c_void) -> HRESULT;

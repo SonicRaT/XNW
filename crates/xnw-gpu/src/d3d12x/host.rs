@@ -257,8 +257,16 @@ pub(crate) fn phases_text(n: u64, preparing: u64) -> String {
 pub(crate) static SUBMIT_OWNER: AtomicU64 = AtomicU64::new(0);
 
 /// Who holds our locks now, for a stall dump: the submission, the
-/// write guards and traps.
+/// write guards and traps. With `XNW_GPU_CRUMBS=1`, first the crumbs of
+/// the last submissions (REF6: a stall with no removal names the op in
+/// flight; the report was made only at a removal or a deadline).
 pub fn lock_owners() -> String {
+    if super::crumbs::on()
+        && let Some(host) = host()
+    {
+        // SAFETY: a plain query.
+        super::crumbs::report(unsafe { host.fence.GetCompletedValue() }, SIGNALLED.load(Ordering::Relaxed));
+    }
     let guards = super::watch::GUARDS_OWNER.load(Ordering::Relaxed);
     format!(
         "submission lock held by thread {}\nguard/trap lock held by thread {}",
@@ -2030,6 +2038,15 @@ mod batch {
         assert!(!batch.texture_due(&a));
         assert!(!batch.texture_due(&a.clone()));
         assert!(!batch.texture_due(&b));
+    }
+
+    /// The stall notes with crumbs off (tests): the lock lines only, and
+    /// no host device is made for them.
+    #[test]
+    fn stall_notes_name_the_locks() {
+        let notes = super::lock_owners();
+        assert!(notes.starts_with("submission lock held by thread "), "{notes}");
+        assert!(notes.contains("\nguard/trap lock held by thread "), "{notes}");
     }
 
     #[test]

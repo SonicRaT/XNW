@@ -349,6 +349,9 @@ fn put_name<T: Copy + From<u8>>(name: &[T], buffer: *mut T, size: u32) -> u32 {
         fail(ERROR_INSUFFICIENT_BUFFER);
         return size as u32;
     }
+    // A name that fits clears the last error, as the host's does: titles
+    // tell a truncated name from a whole one by it (VIctory main 3c7d845).
+    fail(0);
     n as u32
 }
 
@@ -519,7 +522,10 @@ mod tests {
         let name: Vec<u16> = r"G:\game.exe".encode_utf16().collect();
         assert_eq!(put_name(&name, small.as_mut_ptr(), 4), 4);
         assert_eq!(small, [b'G' as u16, b':' as u16, b'\\' as u16, 0]);
+        assert_eq!(win::last_error().raw_os_error(), Some(ERROR_INSUFFICIENT_BUFFER as i32));
+        // A name that fits clears the error the call before left.
         let mut big = [0u16; 64];
         assert_eq!(put_name(&name, big.as_mut_ptr(), 64), name.len() as u32);
+        assert_eq!(win::last_error().raw_os_error(), Some(0));
     }
 }

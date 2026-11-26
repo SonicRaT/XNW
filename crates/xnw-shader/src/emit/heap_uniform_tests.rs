@@ -94,6 +94,7 @@ fn build(masked: bool) -> HostShader {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        half_views: Vec::new(),
         address_map: lowered.address_map,
         descriptor_words: lowered.descriptor_words,
     };

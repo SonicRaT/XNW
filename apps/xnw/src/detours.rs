@@ -12,6 +12,14 @@
 //! them). Every CPU read of a GPU-written buffer goes through it (21
 //! callers). With `XNW_ROLES=lock` the GPU's results for the locked range
 //! go back to title memory before the caller reads it.
+//!
+//! `stages`: the runner of the title's render stage callbacks,
+//! `title+0x43c3890` (`stagemeter.rs`: `XNW_STAGE_TIME`, `XNW_STAGE_SKIP`).
+//!
+//! `clock`: the game clock's tick `title+0x15120b0` (`levers.rs`: `XNW_CLOCK`).
+//! `cine`: the cinematic instance tick `title+0x50f89c0` (`levers.rs`: `XNW_CINE`).
+//! `fencewait`: the title's wait for a fence token `title+0x4fb0ad0`
+//! (`fencewait.rs`: `XNW_FENCE_WAIT`).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -52,16 +60,54 @@ extern "system" fn lock_hook(resource: usize, lock: usize) -> bool {
 }
 
 /// The detours for this build.
-fn detours() -> [Detour; 1] {
-    [Detour {
-        name: "lock",
-        rva: 0x524dab0,
-        // push r15; push r14; push rsi; push rdi; push rbp; push rbx;
-        // sub rsp, 28h; mov rsi, rdx
-        expect: &[0x41, 0x57, 0x41, 0x56, 0x56, 0x57, 0x55, 0x53, 0x48, 0x83, 0xEC, 0x28, 0x48, 0x89, 0xD6],
-        hook: lock_hook as usize,
-        original: &LOCK_ORIGINAL,
-    }]
+fn detours() -> [Detour; 5] {
+    [
+        Detour {
+            name: "lock",
+            rva: 0x524dab0,
+            // push r15; push r14; push rsi; push rdi; push rbp; push rbx;
+            // sub rsp, 28h; mov rsi, rdx
+            expect: &[0x41, 0x57, 0x41, 0x56, 0x56, 0x57, 0x55, 0x53, 0x48, 0x83, 0xEC, 0x28, 0x48, 0x89, 0xD6],
+            hook: lock_hook as usize,
+            original: &LOCK_ORIGINAL,
+        },
+        Detour {
+            name: "stages",
+            rva: crate::stagemeter::ENTRY_RVA,
+            // mov edx, [rcx+18h]; mov rax, [rcx+8]; mov rcx, [rcx+10h]; jmp rax
+            // (the whole function; its trampoline never comes back).
+            expect: &crate::stagemeter::ENTRY_BYTES,
+            hook: crate::stagemeter::hook as usize,
+            original: &crate::stagemeter::ORIGINAL,
+        },
+        Detour {
+            name: "clock",
+            rva: crate::levers::CLOCK_TICK_RVA,
+            // push rsi; push rdi; push rbp; push rbx; sub rsp, 58h;
+            // vmovaps [rsp+40h], xmm7
+            expect: &crate::levers::CLOCK_TICK_BYTES,
+            hook: crate::levers::clock_hook as usize,
+            original: &crate::levers::CLOCK_ORIGINAL,
+        },
+        Detour {
+            name: "cine",
+            rva: crate::levers::CINE_TICK_RVA,
+            // push r15; push r14; push rsi; push rdi; push rbx; sub rsp, 20h;
+            // mov rsi, rcx
+            expect: &crate::levers::CINE_TICK_BYTES,
+            hook: crate::levers::cine_hook as usize,
+            original: &crate::levers::CINE_ORIGINAL,
+        },
+        Detour {
+            name: "fencewait",
+            rva: crate::fencewait::WAIT_RVA,
+            // push r15; push r14; push r13; push r12; push rsi; push rdi;
+            // push rbp; push rbx; sub rsp, 58h
+            expect: &crate::fencewait::WAIT_BYTES,
+            hook: crate::fencewait::hook as usize,
+            original: &crate::fencewait::ORIGINAL,
+        },
+    ]
 }
 
 /// `jmp qword [rip+0]` followed by the target.
@@ -71,22 +117,34 @@ fn jump(to: usize) -> [u8; 14] {
     j
 }
 
-/// Installs the detours wanted (`XNW_ROLES=lock`: `lock`) on the title at
-/// `base`.
+/// Installs the detours wanted (`XNW_ROLES=lock`: `lock`; `XNW_STAGE_TIME`,
+/// `XNW_STAGE_SKIP`, `XNW_AB` or `XNW_STOP_WORLD_FRAMES`: `stages`; `XNW_CLOCK`: `clock`; `XNW_CINE`: `cine`;
+/// `XNW_FENCE_WAIT`: `fencewait`) on the title at `base`.
 ///
 /// # Safety
 /// `base` is the mapped title and none of its code runs yet.
 pub unsafe fn install(base: usize) {
-    if !xnw_gpu::d3d12x::roles_lock() {
-        return;
-    }
     // SAFETY: forwarded.
     let stamp = unsafe { crate::patches::timestamp(base) };
+    let wanted = [
+        ("lock", xnw_gpu::d3d12x::roles_lock()),
+        // Both read (no short cut): the meter's switches, then the A/B and stop ones that count its frames.
+        ("stages", crate::stagemeter::configure(base) | (stamp == BUILD_1_0_2_1 && crate::ab::configure(base))),
+        // SAFETY: the mapped title of this build (its code is read only then).
+        ("clock", stamp == BUILD_1_0_2_1 && unsafe { crate::levers::clock_configure(base) }),
+        // SAFETY: as above.
+        ("cine", stamp == BUILD_1_0_2_1 && unsafe { crate::levers::cine_configure(base) }),
+        // SAFETY: as above.
+        ("fencewait", stamp == BUILD_1_0_2_1 && unsafe { crate::fencewait::configure(base) }),
+    ];
+    if wanted.iter().all(|w| !w.1) {
+        return;
+    }
     if stamp != BUILD_1_0_2_1 {
         xnw_core::warn!("detours: title timestamp {stamp:#x} is not build 1.0.2.1; none installed");
         return;
     }
-    for d in detours() {
+    for d in detours().into_iter().filter(|d| wanted.iter().any(|w| w.0 == d.name && w.1)) {
         // SAFETY: inside the mapped .text of this build, no code running.
         match unsafe { detour((base + d.rva) as *mut u8, d.expect, d.hook) } {
             Ok(tramp) => {
@@ -104,7 +162,7 @@ pub unsafe fn install(base: usize) {
 ///
 /// # Safety
 /// `at` is code with at least `expect.len()` bytes that nothing runs now.
-unsafe fn detour(at: *mut u8, expect: &[u8], hook: usize) -> Result<usize, &'static str> {
+pub(crate) unsafe fn detour(at: *mut u8, expect: &[u8], hook: usize) -> Result<usize, &'static str> {
     // SAFETY: the caller's code bytes.
     let now = unsafe { std::slice::from_raw_parts(at, expect.len()) };
     if now != expect || expect.len() < 14 {

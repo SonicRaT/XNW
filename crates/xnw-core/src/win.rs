@@ -188,6 +188,7 @@ unsafe extern "system" {
 
 // The console's millisecond timers for the whole run (xnw-hle `audio::use_console_timers`).
 pub const PROCESS_POWER_THROTTLING: u32 = 4;
+pub const PROCESS_POWER_THROTTLING_EXECUTION_SPEED: u32 = 1;
 pub const PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION: u32 = 4;
 
 #[repr(C)]

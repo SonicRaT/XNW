@@ -121,6 +121,24 @@ pub mod kind {
     pub const STRAND_SPAN: u16 = 59;
     /// v2.9, any dispatch sink: 12 B, the x, y, z group counts.
     pub const GROUPS: u16 = 60;
+    /// v2.11, indirect dispatch sink (op INDIRECT_DISPATCH): where
+    /// ExecuteIndirect reads the x, y, z group counts. addr = the first
+    /// argument record, slot = the record stride; no bytes (reason
+    /// GPU_OUTPUT: an earlier dispatch writes them on the GPU).
+    pub const INDIRECT_ARGS: u16 = 61;
+    /// v2.12 (UI1), sink of a Draw or DrawIndexed: the input assembler's
+    /// views and the title's pass phase and stage at the draw (`Ia`,
+    /// `IA_BYTES`); addr 0.
+    pub const IA: u16 = 62;
+    /// v2.12 (UI1), Draw or DrawIndexed sink: slot 0 the index bytes the
+    /// draw reads (from its first index, count x element), addr = their
+    /// address; slot 1 + k the bytes of vertex slot k from the view's start
+    /// to the last vertex the draw reads (capped), addr = the view's start.
+    pub const IA_DATA: u16 = 63;
+    /// v2.12 (UI1), frame scope: a graphics pipeline's host state (the warm
+    /// cache's encoding: blend, rasterizer, depth, topology, targets, input
+    /// layout), once per frame per pipeline; addr = the pipeline.
+    pub const GSTATE: u16 = 64;
 
     pub fn name(k: u16) -> &'static str {
         match k {
@@ -164,6 +182,10 @@ pub mod kind {
             STRAND_PALETTE => "strandpal",
             STRAND_SPAN => "strandspan",
             GROUPS => "groups",
+            INDIRECT_ARGS => "indirectargs",
+            IA => "ia",
+            IA_DATA => "iadata",
+            GSTATE => "gstate",
             _ => "other",
         }
     }
@@ -608,6 +630,48 @@ pub const TARGETS_BYTES: usize = 40;
 /// v2.7 the scene-light array's bytes per buffer (0x1487BAF40 + 374784 *
 /// index [V ]).
 pub const LIGHT_ARRAY_BYTES: usize = 374_784;
+
+/// v2.12 `IA`: index view (u64 address, u32 bytes, u32 DXGI format), four
+/// vertex views (u64 address, u32 bytes, u32 stride), u32 phase, u32 stage,
+/// u32 primitive topology (D3D numbering; v2.12 records before it: 88 B, 0).
+pub const IA_BYTES: usize = 16 * 5 + 12;
+
+/// v2.12 `IA` record of a Draw or DrawIndexed sink.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Ia {
+    pub index: (u64, u32, u32),
+    pub vertex: [(u64, u32, u32); 4],
+    /// The title's pass phase (u32::MAX: outside a pass) and TLS stage.
+    pub phase: u32,
+    pub stage: u32,
+    /// The title's primitive topology (0: not recorded).
+    pub topology: u32,
+}
+
+impl Ia {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(IA_BYTES);
+        for (a, n, f) in std::iter::once(self.index).chain(self.vertex) {
+            out.extend_from_slice(&a.to_le_bytes());
+            out.extend_from_slice(&n.to_le_bytes());
+            out.extend_from_slice(&f.to_le_bytes());
+        }
+        out.extend_from_slice(&self.phase.to_le_bytes());
+        out.extend_from_slice(&self.stage.to_le_bytes());
+        out.extend_from_slice(&self.topology.to_le_bytes());
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Option<Ia> {
+        let b = b.get(..b.len().min(IA_BYTES)).filter(|b| b.len() >= IA_BYTES - 4)?;
+        let u32_at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap_or_default());
+        let view = |k: usize| (u64::from_le_bytes(b[16 * k..16 * k + 8].try_into().unwrap_or_default()), u32_at(16 * k + 8), u32_at(16 * k + 12));
+        Some(Ia { index: view(0), vertex: std::array::from_fn(|k| view(k + 1)), phase: u32_at(80), stage: u32_at(84), topology: if b.len() >= IA_BYTES { u32_at(88) } else { 0 } })
+    }
+}
+
+/// v2.12: at most this many bytes of one vertex slot in `IA_DATA`.
+pub const IA_VERTEX_CAP: u64 = 4 << 20;
 
 /// v2.6 `DRAW_ARGS`: instances, first vertex or index, base vertex, first instance.
 pub const DRAW_ARGS_BYTES: usize = 16;
@@ -1162,6 +1226,19 @@ impl Coverage {
 
 #[cfg(test)]
 mod tests {
+    /// v2.12: an IA record decodes to what was encoded; short bytes do not.
+    #[test]
+    fn ia_record_round_trip() {
+        use super::{IA_BYTES, Ia};
+        let ia = Ia { index: (0x3ead_0000, 156, 57), vertex: [(0x3eac_0000, 4096, 20), (0, 0, 0), (7, 8, 9), (u64::MAX, 1, 2)], phase: u32::MAX, stage: 30, topology: 5 };
+        let b = ia.encode();
+        assert_eq!(b.len(), IA_BYTES);
+        assert_eq!(Ia::decode(&b), Some(ia));
+        // An 88-byte record (before the topology) reads topology 0; shorter is refused.
+        assert_eq!(Ia::decode(&b[..IA_BYTES - 4]), Some(Ia { topology: 0, ..ia }));
+        assert_eq!(Ia::decode(&b[..IA_BYTES - 5]), None);
+    }
+
     /// v2.7: slots past one row (the frame table's upper half) keep their own
     /// ref slots, apart from the next root's; lower slots as before.
     #[test]

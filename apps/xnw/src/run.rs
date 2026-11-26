@@ -315,6 +315,10 @@ pub fn run(args: &[String]) -> Res<()> {
     unsafe { xnw_loader::rewrite::apply(title.base(), title.size) };
     // SAFETY: as above.
     unsafe { crate::detours::install(title.base()) };
+    // SAFETY: as above (`XNW_TITLE_TIME`: the main loop's call sites; off when unset).
+    unsafe { crate::titlemeter::install(title.base()) };
+    // SAFETY: as above (`XNW_LOD_SCALE`: the LOD scale getter's call sites; off when unset).
+    unsafe { crate::levers::lod_install(title.base()) };
     // SAFETY: as above.
     unsafe { crate::watch::start(title.base()) };
     // SAFETY: as above (`XNW_DWATCH`, a DR0 write watch; off when unset).

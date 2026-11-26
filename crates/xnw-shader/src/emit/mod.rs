@@ -2,6 +2,7 @@
 // With VIctory open pull requests (GPL-3.0-or-later) where they touch this file: (8ae232f, d112889), (4c9a922, db20637, 3e8f2d3), (815178d), (fa5189d).
 // With VIctory (head 42538cd, on upstream 4322b61; GPL-3.0-or-later): unknown-stride structured buffers read through the runtime stride table (shader side).
 // With victory-fork (a26859f, GPL-3.0-or-later): the retry of a program refused for a first half of an interpolation.
+// With victory-fork (578d459, emit/mod.rs, GPL-3.0-or-later): the retry of a refused program with threaded joins (`threading`; UP6).
 //! DXIL emission (decision 0003, step 3): a console vertex, pixel, compute
 //! or mesh shader as a PC DXIL container (SM 6.6) that host D3D12 accepts.
 //! Compute shaders keep the console's thread-group size; one that depends
@@ -101,6 +102,7 @@ mod sampler;
 #[cfg(all(test, windows))]
 mod sampler_words_tests;
 mod shader;
+mod threading;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
@@ -190,7 +192,13 @@ pub mod host_copies {
 /// 26: (every heap index that may differ between lanes, or that a
 /// block only some lanes run reads, is declared non-uniform): breaking for
 /// every program with such an index.
-pub const VERSION: u32 = 26;
+/// 27: (victory-fork: 16-bit halves moved through a view of a
+/// table go as unsigned integers, [`HostShader::half_views`]): breaking for
+/// the programs that move halves so.
+/// 28: victory-fork 578d459's lane-mask phi joins (`phi_masks`) where an
+/// edge's mask has no entry of its own: retries the refusals (no program
+/// that translated changes).
+pub const VERSION: u32 = 28;
 
 /// Part of every shader-cache key: raise it when programs that
 /// already translated must be translated again (see [`VERSION`]).
@@ -201,7 +209,9 @@ pub const VERSION: u32 = 26;
 /// scalars as virtual registers). 5: merged at `VERSION` 21 (the
 /// cache record gains root UAVs and the address-map and words flags). 6: (heap indices
 /// bounded). 7: merged at `VERSION` 26 (non-uniform heap indices).
-pub const VERSION_BREAKING: u32 = 7;
+/// 8: merged at `VERSION` 27 (half views, the cache record gains them;
+/// a comparison sampler replaces the reduction).
+pub const VERSION_BREAKING: u32 = 8;
 
 /// The mesh fallback's own translator version, part of the cache key of
 /// mesh programs only (a `VERSION` change retranslates every program,
@@ -513,6 +523,22 @@ pub struct HostShader {
     /// [`DESCRIPTOR_WORDS_SPACE`]. A slot whose words the host cannot give
     /// reads zero (VIctory).
     pub descriptor_words: bool,
+    /// Table descriptors (root parameter, dword offset in the table) whose
+    /// buffer the shader reads or writes sixteen bits a channel
+    /// (`buffer_load_format_d16_*`, `buffer_store_format_d16_*`), in
+    /// order. On the console each channel's 16 bits move as they are
+    /// through a 16-bit float view and through a 16-bit integer one alike
+    /// (the title keeps half floats, and indices beside them, in
+    /// `R16G16B16A16_UINT` and `R16_UINT` buffers). The DXIL moves them as
+    /// unsigned integers, which an unsigned 16-bit view carries unchanged;
+    /// the host shows the shader a 16-bit float or signed buffer view at
+    /// these places as the unsigned format of the same layout.
+    /// shortcut: a view in a normalised 16-bit format, whose values the
+    /// console would convert to halves, is read as its integers; a
+    /// descriptor picked at run time keeps the float path (its slot, and so
+    /// its format, is known only then). (victory-fork open pull
+    /// request, emit/mod.rs, head 5a55384, GPL-3.0-or-later.)
+    pub half_views: Vec<(u8, u32)>,
 }
 
 impl HostShader {
@@ -751,6 +777,23 @@ fn translate_plain(container: &[u8], opts: Options, words: &[(u32, u32)]) -> Res
     lap("resources+io", t);
     let (res, io) = io?;
     let st = structure::structure(&p)?;
+    let original = emit_with(&c, &native, &p, &st, &io, &res, opts);
+    // victory-fork 578d459 (emit/mod.rs, GPL-3.0-or-later): refused
+    // programs only, again with the joins of uniform diamonds whose next
+    // branch one arm's flag decides copied for that arm (`threading`):
+    // registers recycled on that arm then never reach the other successor.
+    // (Not for spilled user SGPRs, whose entry reads renaming would lose.)
+    if !matches!(original, Err(ShaderError::Unsupported { .. })) || spilled {
+        return original;
+    }
+    let edges = threading::constant_edges(&p, &st);
+    if edges.is_empty() {
+        return original;
+    }
+    let p = ir::thread_edges(&p, &edges)?;
+    let st = structure::structure(&p)?;
+    let res = resource::track_with(&p, &native.layout, native.stage, opts.descriptors == Descriptors::Gpu)?;
+    let io = io::raise(&p, &native)?;
     emit_with(&c, &native, &p, &st, &io, &res, opts)
 }
 
@@ -875,7 +918,7 @@ pub fn emit_with(
             .map(|(n, &w)| {
                 let mut s = StaticSampler::from_words(w);
                 if l.cmp_samplers >> n & 1 != 0 {
-                    s.filter |= 0x80;
+                    s.make_comparison();
                 }
                 s
             })
@@ -884,6 +927,7 @@ pub fn emit_with(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        half_views: l.half_views,
         address_map: l.address_map,
         descriptor_words: l.descriptor_words,
     })
@@ -1299,6 +1343,7 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            half_views: Vec::new(),
             address_map: false,
             descriptor_words: false,
         };
@@ -1312,6 +1357,7 @@ mod tests {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                half_views: Vec::new(),
                 address_map: false,
                 descriptor_words: false,
             })
@@ -1608,6 +1654,7 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
+                half_views: l.half_views,
                 address_map: l.address_map,
                 descriptor_words: l.descriptor_words,
             };
@@ -1623,7 +1670,7 @@ mod tests {
                     &root,
                     &pso,
                     &super::host::Dispatch {
-                        roots: vec![(0, super::host::Root::Constants(vec![0, 0, 0, 0, 0]))],
+                        roots: super::host::Host::roots(&cs, vec![0, 0, 0, 0, 0], 2, 0),
                         views: &[
                             super::host::View::Buffer {
                                 data: &inputs,

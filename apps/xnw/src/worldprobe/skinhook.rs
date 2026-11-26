@@ -52,6 +52,15 @@ pub struct HookBones {
     pub masks: VehMasks,
 }
 
+/// `skinrules` bit 5 (VEH4): the MSR one-bone parts (doors, bonnet, boot,
+/// panels: one bone per vertex or per mesh, no weights) are given index and
+/// weight streams at the geometry read (`geomread::read`, the replay's
+/// `vehicle_skin` bit 0x20), so they are posed by their bone; without it
+/// they draw in the bind pose (a closed door inside the open one).
+pub const VEH_ONE_BONE: u32 = 0x20;
+/// Bit 5 since the start: one-bone geometries given streams, and ones left
+/// in the bind pose because their vertex buffer is drawn in place.
+pub static ONE_BONE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// `skinrules` bit 6: `b += rec+0x54` where the vehicle programs do it
 /// (under `rec+0x74 != -1`).
 pub const VEH_OFFSET: u32 = 0x40;
@@ -173,7 +182,11 @@ pub fn vehicle_line(frame: u64, rules: u32, rows: u32, m: &VehMasks, t: &VehTabl
         m.reads,
         t.ns as f64 / 1e6,
         t.kib
-    )
+    ) + &if rules & VEH_ONE_BONE != 0 {
+        format!("; one-bone parts posed {} (in place, not posed {}) since the start", ONE_BONE[0].load(Ordering::Relaxed), ONE_BONE[1].load(Ordering::Relaxed))
+    } else {
+        String::new()
+    }
 }
 
 /// Entries of a vehicle index table (the pass reads `table[b]`, b < 4096).

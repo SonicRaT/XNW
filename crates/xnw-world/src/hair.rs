@@ -261,6 +261,90 @@ impl Census {
     }
 }
 
+/// HAIR6: the strand pixels of a frame as our pass draws them over its
+/// picture: per pixel (x, y, the nearest strand's depth, 0), at the pass's
+/// size. The live path makes them from the title's own strand chain and
+/// strand draws (`apps/xnw` `worldprobe/hairlive.rs`), as the replay does.
+pub type Pixels = Vec<[f32; 4]>;
+
+/// The strand pixel shader: one quad per pixel at its depth, a flat hair
+/// brown (the replay's overlay colour, 96/64/40), depth tested
+/// GREATER_EQUAL against our pass's depth without writing it (reverse
+/// depth: the title's own strand test, HAIR4).
+pub const HAIR_SHADER: &str = r#"
+#define RS "RootConstants(num32BitConstants=4, b0), SRV(t0)"
+cbuffer Size : register(b0) { float2 size; float2 pad; };
+StructuredBuffer<float4> pixels : register(t0);
+[RootSignature(RS)]
+float4 vs(uint v : SV_VertexID) : SV_Position {
+    static const float2 corner[6] = { float2(0, 0), float2(1, 0), float2(1, 1), float2(0, 0), float2(1, 1), float2(0, 1) };
+    float4 p = pixels[v / 6];
+    float2 q = p.xy + corner[v % 6];
+    return float4(q.x / size.x * 2 - 1, 1 - q.y / size.y * 2, p.z, 1);
+}
+[RootSignature(RS)]
+float4 ps() : SV_Target { return float4(96.0 / 255, 64.0 / 255, 40.0 / 255, 1); }
+"#;
+
+/// Our strand pixel pipeline and the upload buffers of the frames in flight.
+pub struct HairPass {
+    root: windows::Win32::Graphics::Direct3D12::ID3D12RootSignature,
+    pso: windows::Win32::Graphics::Direct3D12::ID3D12PipelineState,
+    /// Upload buffers of the last frames (the oldest goes when a fourth comes).
+    bufs: std::collections::VecDeque<windows::Win32::Graphics::Direct3D12::ID3D12Resource>,
+    /// Pixels drawn by the last record.
+    pub drawn: usize,
+}
+
+// SAFETY: D3D12 objects are free-threaded; used by its pass's owner.
+unsafe impl Send for HairPass {}
+
+impl HairPass {
+    pub fn new(device: &windows::Win32::Graphics::Direct3D12::ID3D12Device) -> Result<HairPass, String> {
+        let e = |e: windows::core::Error| e.to_string();
+        let (vs, ps) = (super::compile_source(HAIR_SHADER, c"vs", c"vs_5_1")?, super::compile_source(HAIR_SHADER, c"ps", c"ps_5_1")?);
+        // SAFETY: object creation with descriptions that outlive each call.
+        unsafe {
+            let root: windows::Win32::Graphics::Direct3D12::ID3D12RootSignature = device.CreateRootSignature(0, super::blob_bytes(&vs)).map_err(e)?;
+            // Depth GREATER_EQUAL (7), no write.
+            let state = super::RenderState { depth_enable: true, depth_write: false, depth_func: 7, ..Default::default() };
+            let pso = super::pipeline_state_with(device, &root, &vs, &ps, &state, &[]).map_err(e)?;
+            Ok(HairPass { root, pso, bufs: std::collections::VecDeque::new(), drawn: 0 })
+        }
+    }
+
+    /// Records `pixels` on `l` (open, our colour and depth targets bound).
+    pub fn record(&mut self, device: &windows::Win32::Graphics::Direct3D12::ID3D12Device, l: &windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList, pixels: &[[f32; 4]], size: (u32, u32)) -> Result<(), String> {
+        use windows::Win32::Graphics::Direct3D12::*;
+        self.drawn = 0;
+        if pixels.is_empty() {
+            return Ok(());
+        }
+        let bytes = (pixels.len() * 16) as u64;
+        let buf = super::bridge::buffer(device, bytes.next_multiple_of(256), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ)?;
+        // SAFETY: a mapped upload buffer of `bytes`; an open list and our live objects.
+        unsafe {
+            let mut to = std::ptr::null_mut();
+            buf.Map(0, None, Some(&mut to)).map_err(|e| e.to_string())?;
+            std::ptr::copy_nonoverlapping(pixels.as_ptr().cast::<u8>(), to.cast::<u8>(), bytes as usize);
+            buf.Unmap(0, None);
+            let k = [(size.0 as f32).to_bits(), (size.1 as f32).to_bits(), 0, 0];
+            l.SetGraphicsRootSignature(&self.root);
+            l.SetPipelineState(&self.pso);
+            l.SetGraphicsRoot32BitConstants(0, 4, k.as_ptr().cast(), 0);
+            l.SetGraphicsRootShaderResourceView(1, buf.GetGPUVirtualAddress());
+            l.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            l.DrawInstanced(6 * pixels.len() as u32, 1, 0, 0);
+        }
+        self.bufs.push_back(buf);
+        while self.bufs.len() > 3 {
+            self.bufs.pop_front();
+        }
+        self.drawn = pixels.len();
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

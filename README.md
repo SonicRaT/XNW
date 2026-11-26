@@ -24,7 +24,7 @@ around and interact with the world. The picture is still incomplete, so it is no
 | Story load | Working | About 20-35 seconds after launch. |
 | Intro cinematics | Working | They play through to the end, about six minutes. |
 | Player control | Working | After the cinematics you are given control and can walk around and interact with the world. |
-| Playable | Not yet | Characters and vehicles are drawn; hair, the interface, lighting and the game's own materials are still missing from the picture. |
+| Playable | Not yet | Characters and vehicles are drawn, at about 43 frames per second on the test GPU with the speed switches on. Our own lighting pass exists but is off by default (flat neutral colours); hair, the interface and most of the game's own materials are not in the live picture yet. |
 | Audio | Working | The game's audio plays. |
 | Asset streaming | Working | The game's streaming requests are served as it moves through the world. |
 | Online | Off | Network access is disabled by design. |
@@ -51,18 +51,29 @@ around and interact with the world. The picture is still incomplete, so it is no
 | 2026-11-25 | Best run yet on a real GPU: 3,990 frames in 150 s, 8 slow frames (94 at the start of the day), no device errors. The hook that reads the game's draw lists costs 3.2-3.4 us a draw. |
 | 2026-11-25 | Instance culling on the GPU (a switch, `gpucull=on`): our renderer drops hidden instances in a compute pass (0.6 ms of GPU time) before drawing. |
 | 2026-11-25 | The shader translator reaches 25,530 of 25,889 programs, all valid; it follows the rule for non-uniform descriptor-heap indices. |
+| 2026-11-25 | Our own lighting pass: neutral surface colours lit by a sun and sky taken from the game's time of day (a switch, off by default). |
+| 2026-11-25 | Frame rate on the real GPU from about 25 to about 43 in the world (runs of 2,733 and 4,626 world frames): frame pacing, skipping the game's CPU work our renderer throws away (local-light shadows, the depth prepass, puddles, effects, probe captures, the trail map), and a level-of-detail scale. Every one is a switch. |
+| 2026-11-25 | The game's own translated pixel shaders drawn live across five shader families (facades, trim, signs), at about 30 frames per second with them on. |
+| 2026-11-25 | Vehicles: a car's low-detail stand-in is no longer drawn on top of the car. |
+| 2026-11-25 | The shader translator reaches 25,674 of 25,889 programs, all valid. |
+| 2026-11-25 | The texture table holds 4,096 stable entries, with no re-uploads. |
+| 2026-11-25 | The first shot after entering the world is fixed (a camera-mounted card). |
+| 2026-11-25 | Strand hair and the game's user interface are wired into the renderer as switches, off by default. They are not shown live yet. |
 | 2026-11-25 | `cargo x burst` replays a burst of the game's draw-list steps outside the game, for timing and checks. |
+| 2026-11-25 | Vehicle doors and panels are posed per part (one-bone parts, a switch): an open door no longer shows the closed panel in its place. |
+| 2026-11-25 | The intro credits drawn by the game's own interface shaders, in replay and on the real GPU (the live interface is not shown yet). |
+| 2026-11-25 | Cube, array and 3D textures carry their real texels in replay, through views of their own dimension. |
 | 2026-11-25 | Zero-copy geometry: buffers are used where they sit instead of being copied (a switch, off by default; run on the software adapter only). |
 
 ### Performance so far
 
 | What | Measured |
 |---|---|
-| World on screen, our renderer, real GPU | about **26 frames per second** with characters and vehicles (3,990 frames in a 150 s run, 8 of them slow, no device errors); the game paces itself at 30 |
+| World on screen, our renderer, real GPU | about **43 frames per second** with characters and vehicles and the speed switches on (4,626 world frames in the best run; 25 fps with none of them, 2,733 frames); without the switches, 3,990 frames in 150 s earlier the same day |
 | Renderer cost inside each frame | 6-15 ms for our pass, plus 9-17 ms to read the game's draw lists; the draw-list hook costs 3.2-3.4 us a draw; GPU instance culling (a switch, `gpucull=on`, run on the card) 0.6 ms |
-| Texture slots filled with the game's textures | 23,562 of 25,653 at the end of a run (92 %) |
+| Texture slots filled with the game's textures | 23,562 of 25,653 at the end of an earlier run (92 %); the live table now holds 4,096 stable entries with no re-uploads |
 | Captured frame replayed in the frame lab | **4-7 ms per frame**; a shader edit shows on screen in about half a second |
-| Console GPU programs translated to DXIL | **25,530 of 25,889** (98.6 %) in the test game, all of them valid DXIL; 786 of the 788 that a typical frame uses. Programs that read barycentrics need hardware support for it and are run on the software adapter |
+| Console GPU programs translated to DXIL | **25,674 of 25,889** (99.2 %) in the test game, all of them valid DXIL; 786 of the 788 that a typical frame uses. Programs that read barycentrics need hardware support for it and are run on the software adapter |
 | Translating the whole program set | about 2.5 minutes on a 6-core machine with 6 threads, validation included; translated programs are cached per translator generation, and a change is checked against the previous output in seconds |
 | The game's own GPU work on real hardware | 1.3-4 s per frame, and not stable yet |
 
@@ -75,7 +86,7 @@ around and interact with the world. The picture is still incomplete, so it is no
 
 ### Pending
 
-- Lighting, sky, water, decals and the game's user interface. The picture is still dark and unlit.
+- Showing the lighting pass, strand hair and the game's user interface in the live picture: they are wired but off by default, not yet shown live. Water and decals are not started. Without the lighting switch the picture is flat and unlit.
 - Running the game's own GPU work on real hardware at a usable speed.
 - The frame lab (a window that replays captured frames with a free camera) is not in this tree yet.
 
@@ -113,6 +124,7 @@ cargo test --locked
 ```
 
 Tests that need the game's files, the format tables or a GPU are marked `#[ignore]` or skip themselves.
+At the last stage: 961 tests pass, 33 are ignored, none fail.
 
 ## Running
 

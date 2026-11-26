@@ -1143,6 +1143,9 @@ pub fn run(host: &xnw_gpu::host::Host, shader: &HostShader, wave: u32, b: &Bindi
         queue.Signal(&fence, 1).map_err(e)?;
         while fence.GetCompletedValue() < 1 {
             dev.GetDeviceRemovedReason().map_err(|x| format!("device removed: {}", e(x)))?;
+            if xnw_gpu::gpuwatch::overdue("preskin", sent) {
+                return Err("preskin: the submission was given up".into());
+            }
             std::thread::yield_now();
         }
         xnw_gpu::gpuwatch::end("preskin", sent, None);
@@ -1634,7 +1637,7 @@ pub(crate) mod tests {
     /// 4 and 5 are tables, 8 dwords, stride table and heap bounds read).
     fn shader_like_0() -> HostShader {
         let ud = |index, slot| emit::UserData { index, slot, root: xnw_shader::RootType::Table, dword: 0 };
-        HostShader { stage: xnw_shader::HwStage::Cs, dxil: Vec::new(), user_data: vec![ud(4, 0), ud(5, 1)], samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: Vec::new(), root_srvs: Vec::new(), root_uavs: Vec::new(), address_map: false, descriptor_words: false }
+        HostShader { stage: xnw_shader::HwStage::Cs, dxil: Vec::new(), user_data: vec![ud(4, 0), ud(5, 1)], samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: Vec::new(), root_srvs: Vec::new(), root_uavs: Vec::new(), half_views: Vec::new(), address_map: false, descriptor_words: false }
     }
 
     #[test]

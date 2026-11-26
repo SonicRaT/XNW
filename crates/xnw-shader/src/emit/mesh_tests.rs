@@ -283,6 +283,15 @@ fn run(h: &Host, container: &[u8], inp: &Inputs, repeats: u32) -> Result<Output,
             let lens = vec![32u32 << 20; cs.root_srvs.len().next_multiple_of(4)];
             list.SetComputeRoot32BitConstants(rp + 3, lens.len() as u32, lens.as_ptr().cast(), 0);
         }
+        // The heap bounds, where the program indexes the heap: every slot
+        // made above is in range (unset they read 0 and every index names
+        // slot 0, which these inputs never write: WARP 1.0.22 lost the
+        // device there).
+        let record_views = [(true, mesh::RECORD_REGISTER), (true, mesh::INDEX_REGISTER), (false, mesh::RECORD_REGISTER)];
+        if let Some(p) = Host::heap_bounds_parameter(&[(&cs, D3D12_SHADER_VISIBILITY_ALL)], &record_views) {
+            let bounds = [count, 0, 0, 0, 0, 0, 0, 0];
+            list.SetComputeRoot32BitConstants(p, 8, bounds.as_ptr().cast(), 0);
+        }
         for r in 0..repeats {
             list.EndQuery(&qh, D3D12_QUERY_TYPE_TIMESTAMP, 2 * r);
             list.Dispatch(groups, 1, 1);
@@ -691,7 +700,7 @@ fn root_srv_reads_past_their_length_stay_inside() {
         s.op(b, "rawBufferStore.i32", Attr::NoUnwind, s.t.void, 140, &[out, o, u, x, u, u, u, m1, al]);
     }
     s.m.terminate(b, Term::Ret);
-    let cs = super::HostShader { stage: HwStage::Ms, dxil: s.finish(), user_data: Vec::new(), samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: Vec::new(), root_srvs: vec![0], root_uavs: Vec::new(), address_map: false, descriptor_words: false };
+    let cs = super::HostShader { stage: HwStage::Ms, dxil: s.finish(), user_data: Vec::new(), samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: Vec::new(), root_srvs: vec![0], root_uavs: Vec::new(), half_views: Vec::new(), address_map: false, descriptor_words: false };
     let root = h.root_signature_records(&[(&cs, D3D12_SHADER_VISIBILITY_ALL)], &[(true, mesh::RECORD_REGISTER)]).unwrap();
     let pso = h.compute_pipeline_with(&root, &cs.dxil).unwrap();
     let dev = &h.device;

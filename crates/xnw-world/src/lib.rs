@@ -59,6 +59,10 @@ pub mod hair;
 pub mod gpucull;
 /// `gbuf=on`: the title's G-buffer layout beside our picture (LIT2).
 pub mod gbuf;
+/// `ourlight=on`: our own lighting over our G-buffer, one full-screen pass (LITE1).
+pub mod ourlight;
+/// UI1: the title's UI draws through its own programs into a layer over our picture (`ui=on`).
+pub mod ui;
 
 pub type Mat = [f32; 16];
 
@@ -259,9 +263,30 @@ pub fn skin_window(list: &FrameList, r: &DrawRecord) -> SkinWindow {
     if w.chunks_exact(12).all(rigid) { SkinWindow::Rigid } else { SkinWindow::Other }
 }
 
+/// A vertex buffer of at most four vertices (the 0x80-byte header, then up
+/// to 64 bytes each), and how near the camera its row sits, in metres.
+const CARD_VB: std::ops::RangeInclusive<u64> = 0x81..=0x80 + 4 * 64;
+const CARD_NEAR: f32 = 2.0;
+
+/// A skinned row that is one quad riding on the camera: no `skin_rules`
+/// bit lifts it. The intro has one (geometry 0x4dd838846336d800: 4
+/// vertices, 3 identity bones, effect `standard`, stage 67 and four shadow
+/// passes; origin (0, 0.15, -1.5) m from the camera, 3 m wide, its normal
+/// pointing away from the camera). The title culls its back face; this pass
+/// draws both faces (cull is not applied), so once lifted it covered the
+/// whole first shot after world entry (a uniform picture for 6 s in the
+/// card runs with `skinrules` bit 1 or 3).
+pub fn camera_card(r: &DrawRecord) -> bool {
+    let t = &r.world[12..15];
+    CARD_VB.contains(&r.geom.vb_len) && t[0] * t[0] + t[1] * t[1] + t[2] * t[2] < CARD_NEAR * CARD_NEAR
+}
+
 /// Whether `skin_rules` lets a skinned non-ped draw out of the
 /// `skinned` skip (identity or rigid window, or draw-time bones).
 pub fn skin_lifted(list: &FrameList, r: &DrawRecord, rules: u32) -> bool {
+    if camera_card(r) {
+        return false;
+    }
     if rules & SKIN_DRAW_TIME != 0 && r.palette != NO_PALETTE && list.palette_at_draw.get(r.palette as usize).copied().unwrap_or(false) {
         return true;
     }
@@ -399,9 +424,9 @@ float4 ps(VsOut i) : SV_Target { return shade(i); }
 
 /// A draw's render state from the title's records, in D3D12 enum
 /// values: depth-stencil (24 B: enable, write, func), raster (16 B: i8 bias
-/// +3, f32 clamp +4, f32 slope +8; cull and fill are recorded by the probe but
-/// not applied: our winding is not the title's [U]) and blend RT0 (68 B:
-/// +4 {enable, src, dst, op, srcA, dstA, opA, mask}).
+/// +3, f32 clamp +4, f32 slope +8; cull +1 and front-counter-clockwise +2
+/// are applied only under `cull=` ([`FaceCull`]), fill is not) and blend RT0
+/// (68 B: +4 {enable, src, dst, op, srcA, dstA, opA, mask}).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct RenderState {
     pub depth_enable: bool,
@@ -412,6 +437,76 @@ pub struct RenderState {
     pub bias_clamp: u32,
     pub slope_bias: u32,
     pub blend: [u8; 8],
+    /// The raster record's cull mode (D3D12: 1 none, 2 front, 3 back; 0:
+    /// not recorded) and FrontCounterClockwise. The pass draws both faces
+    /// unless `cull=` is set ([`effective_state`]).
+    pub cull: u8,
+    pub front_ccw: bool,
+}
+
+/// `XNW_WORLD_RENDER=screen,...,cull=title|back|front[,ccw=on]` (default
+/// off: both faces of every row, as before). `title`: each row with its
+/// state's cull mode and winding. `back` / `front`: every stated row culled
+/// that way with front = clockwise, or counter-clockwise with `ccw=on` (the
+/// lab's proof of the winding; not for runs).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FaceCull {
+    #[default]
+    Off,
+    Title,
+    /// (D3D12 cull mode 2 or 3, front counter-clockwise).
+    Forced(u8, bool),
+}
+
+pub fn parse_face_cull(v: &str) -> FaceCull {
+    let has = |k: &str| v.split(',').any(|p| p.trim() == k);
+    let ccw = has("ccw=on");
+    if has("cull=title") {
+        FaceCull::Title
+    } else if has("cull=back") {
+        FaceCull::Forced(3, ccw)
+    } else if has("cull=front") {
+        FaceCull::Forced(2, ccw)
+    } else {
+        FaceCull::Off
+    }
+}
+
+/// Whether a row's placement mirrors (negative determinant: its triangles
+/// wind the other way on screen). An instanced row: its instances' worlds
+/// (`None` when they disagree, or are not in the list: tested on the device).
+pub fn mirrored(list: &FrameList, r: &DrawRecord, on_device: bool) -> Option<bool> {
+    let det = |m: &[f32], a: usize, b: usize, c: usize| m[a] * (m[b + 1] * m[c + 2] - m[b + 2] * m[c + 1]) - m[a + 1] * (m[b] * m[c + 2] - m[b + 2] * m[c]) + m[a + 2] * (m[b] * m[c + 1] - m[b + 1] * m[c]);
+    if on_device {
+        return None;
+    }
+    if r.inst_count == 0 {
+        return Some(det(&r.world, 0, 4, 8) < 0.0);
+    }
+    let all = list.instances.get(12 * r.inst_first as usize..12 * (r.inst_first + r.inst_count) as usize)?;
+    let mut flips = all.chunks_exact(12).map(|w| det(w, 0, 3, 6) < 0.0);
+    let first = flips.next()?;
+    flips.all(|f| f == first).then_some(first)
+}
+
+/// The state a row is drawn with: the title's, with its cull mode only
+/// under `cull=` (zero otherwise: both faces, the pipelines as before). A
+/// mirrored row culls the other face; instances that disagree, or are
+/// tested on the device, keep both faces.
+pub fn effective_state(mode: FaceCull, list: &FrameList, r: &DrawRecord, on_device: bool) -> Option<RenderState> {
+    let mut s = r.state?;
+    let (cull, ccw) = match mode {
+        FaceCull::Off => (0, false),
+        FaceCull::Title => (s.cull, s.front_ccw),
+        FaceCull::Forced(c, ccw) => (c, ccw),
+    };
+    s.cull = match (cull, mirrored(list, r, on_device)) {
+        (2 | 3, Some(false)) => cull,
+        (2 | 3, Some(true)) => 5 - cull,
+        _ => 0,
+    };
+    s.front_ccw = s.cull != 0 && ccw;
+    Some(s)
 }
 
 /// Stages that draw other views (cube/probe capture 36, local-light
@@ -509,6 +604,12 @@ pub struct FrameList {
     pub imposters: Option<std::sync::Arc<imposter::Imposters>>,
     /// Rows drawn again by the title's own pixel programs (`bridgeps`; None: off).
     pub bridged: Option<std::sync::Arc<bridged::Frame>>,
+    /// HAIR6 (`hair=on`, default off): the strand pixels of the title's own
+    /// strand chain and draws, drawn over our picture under the depth test.
+    pub hair: Option<std::sync::Arc<hair::Pixels>>,
+    /// UI1 (`ui=on`, default off): the title's UI layer (RGBA8 premultiplied,
+    /// width x height), drawn over our picture with the plane blend.
+    pub ui: Option<std::sync::Arc<(u32, u32, Vec<u8>)>>,
     /// Instanced rows culled on the device (`gpucull=on`; empty: none): their
     /// `inst_first`/`inst_count` index the cull's output, not `instances`.
     pub cull: gpucull::CullFrame,
@@ -716,12 +817,12 @@ float4 ps(VsOut i) : SV_Target {
 // ---- the device side ----
 
 use std::mem::ManuallyDrop;
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_TIMEOUT};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::{D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::core::{Interface, PCSTR, Result};
 
 /// A geometry for the pass: [`pack_vertices`] floats and u32 triangle
@@ -748,7 +849,7 @@ pub struct HostGeometry {
 /// views sized to the buffers, so the hardware bound holds too. Bone
 /// indices are checked against the palette's bone count.
 pub const RAW_SHADER: &str = r#"
-#define RS "RootConstants(num32BitConstants=58, b0), DescriptorTable(SRV(t0), visibility=SHADER_VISIBILITY_VERTEX), DescriptorTable(SRV(t1), visibility=SHADER_VISIBILITY_VERTEX), DescriptorTable(SRV(t2), visibility=SHADER_VISIBILITY_VERTEX), DescriptorTable(SRV(t3, numDescriptors=1024), visibility=SHADER_VISIBILITY_PIXEL), CBV(b1, visibility=SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter=FILTER_ANISOTROPIC, maxAnisotropy=8, visibility=SHADER_VISIBILITY_PIXEL)"
+#define RS "RootConstants(num32BitConstants=58, b0), DescriptorTable(SRV(t0), visibility=SHADER_VISIBILITY_VERTEX), DescriptorTable(SRV(t1), visibility=SHADER_VISIBILITY_VERTEX), DescriptorTable(SRV(t2), visibility=SHADER_VISIBILITY_VERTEX), DescriptorTable(SRV(t3, numDescriptors=4096), visibility=SHADER_VISIBILITY_PIXEL), CBV(b1, visibility=SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter=FILTER_ANISOTROPIC, maxAnisotropy=8, visibility=SHADER_VISIBILITY_PIXEL)"
 cbuffer Draw : register(b0) {
     row_major float4x4 mvp;
     float4 world3[3];
@@ -793,7 +894,7 @@ float3 titleLit(float3 base, float3 n) {
 ByteAddressBuffer vb : register(t0);
 ByteAddressBuffer pal : register(t1);
 ByteAddressBuffer inst : register(t2);
-Texture2D albedoTex[1024] : register(t3); // TEX_SLOTS (test `albedo_table_matches_tex_slots`)
+Texture2D albedoTex[4096] : register(t3); // TEX_SLOTS (test `albedo_table_matches_tex_slots`)
 SamplerState wrapAniso : register(s0);
 // `?:` runs both sides: the condition picks the address (0 is inside every
 // view), then the value; a load past a view is never issued (GBV id 1005, HANG1).
@@ -911,6 +1012,14 @@ VsOut vs_rec(uint id : SV_VertexID) {
 // its albedo (linear) and unit normal here.
 static float3 gbBase = 0;
 static float3 gbN = float3(0, 0, 1);
+// `ourlight=on` (ourlight.rs): the fog visibility of the pixel, kept in RT1.r
+// as 1 + 254 x it (0, the clear: no row of ours there).
+static float gbFog = 1;
+#ifdef OURLIGHT
+float gbFlag() { return 1 + 254 * saturate(gbFog); }
+#else
+float gbFlag() { return 0; }
+#endif
 // The title's RT1 (PS_DeferredTextured ff2c46ab 0x1d0..0x2ec): octahedral normal,
 // 12 + 12 bits, word = y' << 12 | x', as (0, byte 0, byte 1, byte 2) / 255.
 float4 gbufNormal(float3 n) {
@@ -920,7 +1029,7 @@ float4 gbufNormal(float3 n) {
     p += float2(p.x >= 0 ? f : -f, p.y >= 0 ? f : -f);
     uint2 q = min(uint2(p * 2047.5 + 2047.5), 4095);
     uint w = (q.y << 12) | q.x;
-    return float4(0, w & 255, (w >> 8) & 255, (w >> 16) & 255) / 255.0;
+    return float4(gbFlag(), w & 255, (w >> 8) & 255, (w >> 16) & 255) / 255.0;
 }
 #endif
 float4 shade(VsOut i) {
@@ -937,7 +1046,7 @@ float4 shade(VsOut i) {
     bool chain = titleChain();
     if (texIndex != 0) {
         // Our own table only; the index is checked on the CPU and here.
-        float4 t = albedoTex[min(texIndex, 1023)].Sample(wrapAniso, i.uv);
+        float4 t = albedoTex[min(texIndex, 4095)].Sample(wrapAniso, i.uv);
         // a = Diffuse.a * matCB[0]; matCB[0] is not read at the hook (no
         // single cheap read: the alpha-scale variable is unnamed), so 1.0.
         a = t.a;
@@ -968,6 +1077,11 @@ float4 shade(VsOut i) {
     // Linear albedo: the old path re-encoded an sRGB view's value (undone here).
     gbBase = (!chain && texIndex != 0 && (matFlags & 2) != 0) ? pow(saturate(base), 2.2) : base;
     gbN = n;
+    gbFog = fog.w > 0 ? exp(-i.pos.w * fog.w) : 1;
+#endif
+#ifdef OURLIGHT
+    // `ourlight=on`: a row before the lighting pass leaves its albedo (the pass lights it).
+    if ((flags & 8) != 0) return float4(pow(saturate(base), 1.0 / 2.2), a);
 #endif
 #ifdef LAB_VIEW
     // The lab's view modes (xnw-lab prepends the define). Geometry first:
@@ -1181,6 +1295,10 @@ fn filtered_count(main: usize, kept: usize) -> usize {
 /// What a [`Pass::draw`] did.
 #[derive(Debug, Default, Clone)]
 pub struct PassStats {
+    /// HAIR6: strand pixels drawn over the picture (`hair=on`).
+    pub hair: usize,
+    /// UI1: the UI layer was drawn over the picture.
+    pub ui: bool,
     /// Geometry copies skipped (outside the page or the staging).
     pub copies_refused: usize,
     /// `XNW_ZEROCOPY` (ZC2): geometries read in place, and those dropped
@@ -1206,6 +1324,8 @@ pub struct PassStats {
     pub instanced: usize,
     /// Draws with a pipeline from the title's state.
     pub stated: usize,
+    /// Of those, rows drawn one-sided (`cull=`).
+    pub culled_faces: usize,
     pub instances: u64,
     /// Re-uploads of a key already on the device (content changed).
     pub replaced: usize,
@@ -1325,6 +1445,10 @@ pub struct Pass {
     dsv: ID3D12DescriptorHeap,
     readback: ID3D12Resource,
     alloc: ID3D12CommandAllocator,
+    /// [`split_on`]: the allocator of the frame's second list (the
+    /// bridged rows), and the fence value of the first part sent before it.
+    alloc_split: ID3D12CommandAllocator,
+    split_sent: u64,
     list: ID3D12GraphicsCommandList,
     fence: ID3D12Fence,
     fence_value: u64,
@@ -1358,6 +1482,8 @@ pub struct Pass {
     /// CPU side only: [`SKIN_IDENTITY_STATIC`], [`SKIN_RIGID_BONES`], [`SKIN_DRAW_TIME`].
     /// Live: `XNW_WORLD_RENDER=screen,skinrules=<hex>` ([`parse_skin_rules`]).
     pub skin_rules: u32,
+    /// `cull=` ([`FaceCull`]; default off).
+    pub face_cull: FaceCull,
     /// `decalhold=off` turns the two-list decal union off.
     pub decal_hold: bool,
     held_decals: Vec<(DrawRecord, [f32; 3])>,
@@ -1421,8 +1547,14 @@ pub struct Pass {
     pub bridge_gpu: bridged::Gpu,
     bridge_keep: Vec<windows::core::IUnknown>,
     bridge_grey: Option<ID3D12Resource>,
+    /// The stand-ins of the other shapes: six slices, 3D, 1D.
+    bridge_grey_shapes: Vec<ID3D12Resource>,
     /// The words buffer (upload memory, mapped): the frame table's slot 86 for the bridged rows.
     bridge_words: Option<(ID3D12Resource, *mut u8, u64)>,
+    /// HAIR6: the strand pixel pipeline (made at the first frame with strand pixels).
+    pub hair: Option<hair::HairPass>,
+    /// UI1: the UI layer pipeline (made at the first frame with a layer).
+    pub ui: Option<ui::UiPass>,
     /// The picture shown (a copy of `colour` from the last frame that was
     /// complete enough) and the cut watch (`hold=off`: `colour` is shown).
     shown: ID3D12Resource,
@@ -1438,6 +1570,8 @@ pub struct Pass {
     raw_source: String,
     /// `gbuf=on`: the title's G-buffer targets beside the colour target.
     gbuf: Option<gbuf::Targets>,
+    /// `ourlight=on`: the lighting pass after the opaque rows.
+    ourlight: Option<ourlight::Lit>,
     rec_pso: Option<ID3D12PipelineState>,
     rec_slot: Option<u32>,
     /// The instance cull on the device (made at its first batch).
@@ -1566,7 +1700,12 @@ fn pipeline_state_with(device: &ID3D12Device, root: &ID3D12RootSignature, vs: &I
         SampleMask: u32::MAX,
         RasterizerState: D3D12_RASTERIZER_DESC {
             FillMode: D3D12_FILL_MODE_SOLID,
-            CullMode: D3D12_CULL_MODE_NONE,
+            CullMode: match s.cull {
+                2 => D3D12_CULL_MODE_FRONT,
+                3 => D3D12_CULL_MODE_BACK,
+                _ => D3D12_CULL_MODE_NONE,
+            },
+            FrontCounterClockwise: s.front_ccw.into(),
             DepthClipEnable: true.into(),
             DepthBias: s.depth_bias,
             DepthBiasClamp: f32::from_bits(s.bias_clamp),
@@ -1632,7 +1771,7 @@ impl Pass {
     /// waits for its own work).
     pub fn set_raw_shader(&mut self, source: &str) -> std::result::Result<(), String> {
         let e = |e: windows::core::Error| e.to_string();
-        let plain = if gbuf::on() { Some(compile_source(source, c"ps", c"ps_5_1")?) } else { None };
+        let plain = if gbuf::on() { Some(compile_source(&gbuf::plain_source(source), c"ps", c"ps_5_1")?) } else { None };
         let source = &gbuf::source(source);
         let (vs, ps) = (compile_source(source, c"vs", c"vs_5_1")?, compile_source(source, c"ps", c"ps_5_1")?);
         // SAFETY: object creation from blobs that outlive each call.
@@ -1657,11 +1796,14 @@ impl Pass {
     pub fn new(host: &xnw_gpu::host::Host, width: u32, height: u32) -> std::result::Result<Pass, String> {
         let e = |e: windows::core::Error| e.to_string();
         // `gbuf=on`: before any pipeline is made (they read it).
-        gbuf::set(gbuf::parse_switch(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default()));
+        // `ourlight=on` turns the G-buffer on (it reads the normals).
+        let switches = std::env::var("XNW_WORLD_RENDER").unwrap_or_default();
+        ourlight::set(ourlight::parse_switch(&switches));
+        gbuf::set(gbuf::parse_switch(&switches) || ourlight::on());
         let raw_source = gbuf::source(RAW_SHADER);
         let (vs, ps) = (compile(c"vs", c"vs_5_1")?, compile(c"ps", c"ps_5_1")?);
         let (rvs, rps) = (compile_source(&raw_source, c"vs", c"vs_5_1")?, compile_source(&raw_source, c"ps", c"ps_5_1")?);
-        let raw_plain_ps = if gbuf::on() { Some(compile_source(RAW_SHADER, c"ps", c"ps_5_1")?) } else { None };
+        let raw_plain_ps = if gbuf::on() { Some(compile_source(&gbuf::plain_source(RAW_SHADER), c"ps", c"ps_5_1")?) } else { None };
         let device = host.device.clone();
         // SAFETY: object creation with descriptions that outlive each call.
         unsafe {
@@ -1687,6 +1829,11 @@ impl Pass {
             let water_pso = pipeline_state_with(&device, &water_root, &wvs, &wps, &water_state, &[D3D12_INPUT_ELEMENT_DESC { SemanticName: PCSTR(c"POSITION".as_ptr().cast()), SemanticIndex: 0, Format: DXGI_FORMAT_R32G32B32_FLOAT, InputSlot: 0, AlignedByteOffset: 0, InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, InstanceDataStepRate: 0 }]).map_err(e)?;
             let heap: ID3D12DescriptorHeap = device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, NumDescriptors: HEAP_SLOTS, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, NodeMask: 0 }).map_err(e)?;
             let heap_step = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            // The texture table (`albedoTex[TEX_SLOTS]`, the heap's top) starts as nulls: it is bound whole.
+            {
+                let base = heap.GetCPUDescriptorHandleForHeapStart().ptr;
+                textures::null_table(&device, &|slot: u32| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: base + (slot * heap_step) as usize }, HEAP_SLOTS - TEX_SLOTS, TEX_SLOTS);
+            }
             let texture = |format, flags, state, clear: D3D12_CLEAR_VALUE| -> Result<ID3D12Resource> {
                 let d = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: u64::from(width), Height: height, DepthOrArraySize: 1, MipLevels: 1, Format: format, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Flags: flags, ..Default::default() };
                 let props = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
@@ -1717,8 +1864,18 @@ impl Pass {
                 None
             };
             device.CreateDepthStencilView(&depth, None, dsv.GetCPUDescriptorHandleForHeapStart());
+            // `ourlight=on`: its two views at heap slots 4 and 5 (the frame's buffers hold 0-3).
+            let lit = match (&gbuf_targets, ourlight::on()) {
+                (Some(t), true) => {
+                    let base = heap.GetCPUDescriptorHandleForHeapStart().ptr;
+                    let cpu = |slot: u32| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: base + (slot * heap_step) as usize };
+                    Some(ourlight::Lit::new(&device, &t.normal, COLOUR, width, height, 4, &cpu)?)
+                }
+                _ => None,
+            };
             let readback = host.buffer(u64::from(width) * 4 * u64::from(height), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST).map_err(e)?;
             let alloc: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
+            let alloc_split: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
             let list: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(e)?;
             list.Close().map_err(e)?;
             let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
@@ -1734,7 +1891,7 @@ impl Pass {
                 wire_pso,
                 heap,
                 heap_step,
-                next_slot: 4,
+                next_slot: if lit.is_some() { 6 } else { 4 },
                 free_slots: Vec::new(),
                 zc_geoms: Default::default(),
                 palettes: [None, None],
@@ -1752,6 +1909,8 @@ impl Pass {
                 dsv,
                 readback,
                 alloc,
+                alloc_split,
+                split_sent: 0,
                 list,
                 fence,
                 fence_value: 0,
@@ -1769,6 +1928,7 @@ impl Pass {
                 peds: true,
                 skinned: true,
                 skin_rules: 0,
+                face_cull: FaceCull::Off,
                 decal_hold: true,
                 held_decals: Vec::new(),
                 tex: textures::TexTable::new(TexOptions::default(), HEAP_SLOTS - TEX_SLOTS),
@@ -1803,7 +1963,10 @@ impl Pass {
                 bridge_gpu: bridged::Gpu::default(),
                 bridge_keep: Vec::new(),
                 bridge_grey: None,
+                bridge_grey_shapes: Vec::new(),
                 bridge_words: None,
+                hair: None,
+                ui: None,
                 shown,
                 cuts: cuts::CutWatch::new(false),
                 preskin: preskin_gpu::GpuPreskin::default(),
@@ -1811,6 +1974,7 @@ impl Pass {
                 raw_source,
                 rec_pso: None,
                 gbuf: gbuf_targets,
+                ourlight: lit,
                 rec_slot: None,
                 cull: gpucull::GpuCull::default(),
             })
@@ -1934,8 +2098,9 @@ impl Pass {
                 st.new_psos += 1;
             }
         }
-        for r in &list.draws {
-            if let Some(s) = r.state
+        let device_rows: std::collections::HashSet<u32> = list.cull.rows.iter().map(|c| c.0).collect();
+        for (i, r) in list.draws.iter().enumerate() {
+            if let Some(s) = effective_state(self.face_cull, list, r, device_rows.contains(&(i as u32)))
                 && self.pso_asked.len() < MAX_STATE_PSOS
                 && self.pso_asked.insert(s)
             {
@@ -2345,6 +2510,18 @@ impl Pass {
         let inst_total = (list.instances.len() / 12) as u32;
         // SAFETY: recording on our own list and objects; every pointer passed outlives its call.
         unsafe {
+            // An earlier frame that failed after sending its first part
+            // (`split_on`): that part done before its allocator is reset.
+            if self.split_sent > self.fence.GetCompletedValue() {
+                let event: HANDLE = CreateEventW(None, false, false, None).map_err(at("CreateEvent".into()))?;
+                self.fence.SetEventOnCompletion(self.split_sent, event).map_err(at("SetEventOnCompletion".into()))?;
+                // At most 10 s (the trunk's rule: every fence wait has a limit).
+                let waited = WaitForSingleObject(event, 10_000);
+                let _ = CloseHandle(event);
+                if waited == WAIT_TIMEOUT {
+                    return Err(format!("frame {frame}: the last frame's first part never ended"));
+                }
+            }
             self.alloc.Reset().map_err(at("allocator Reset".into()))?;
             self.list.Reset(&self.alloc, &self.pso).map_err(at("list Reset".into()))?;
             let list_com = self.list.clone();
@@ -2406,18 +2583,20 @@ impl Pass {
             }
             // The device cull of the instanced rows (`gpucull=on`): per list draw its argument slot.
             let culled = self.cull_record(list, l);
+            // Rows whose instances the device tests: their worlds are not in the list.
+            let device_rows: std::collections::HashSet<u32> = list.cull.rows.iter().map(|c| c.0).collect();
             // This frame's albedo table (uploads recorded on this list first).
             let (heap_cpu, step) = (self.heap.GetCPUDescriptorHandleForHeapStart().ptr, self.heap_step as usize);
             let cpu = |slot: u32| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: heap_cpu + slot as usize * step };
             // The layers' textures share the table.
-            // Layer slots take the first entries (k[50] packs them in 8 bits each; at most 192 per frame in the captures).
+            // Layer slots take entries below TEX_LOW (k[50] packs them in 8 bits each; at most 192 per frame in the captures).
             // Timed (CUT1); a fast camera cut caps its new reads (cuts::CUT_TEX_MS).
             let tt = std::time::Instant::now();
             let tex_base = self.tex.opts.frame_ms;
             self.tex.opts.frame_ms = self.cuts.tex_ms(tex_base);
             // The bridged rows' textures last (our rows' come first in the table).
             let bridged = list.bridged.as_deref().filter(|_| self.bridge_on || self.bridge_warm);
-            self.tex.prepare(&self.device, l, &mut draws.iter().flat_map(|r| r.material.layers).chain(draws.iter().map(|r| r.material.albedo_desc)).chain(bridged.into_iter().flat_map(|f| f.rows.iter().flat_map(|r| r.1.handles()))), &cpu);
+            self.tex.prepare(&self.device, l, &mut draws.iter().flat_map(|r| r.material.layers), &mut draws.iter().map(|r| r.material.albedo_desc).chain(bridged.into_iter().flat_map(|f| f.rows.iter().flat_map(|r| r.1.handles()))), &cpu);
             self.tex.opts.frame_ms = tex_base;
             st.tex_ms = tt.elapsed().as_secs_f64() * 1e3;
             let tex_table = self.gpu_slot(self.tex.base());
@@ -2448,6 +2627,8 @@ impl Pass {
             let passes: &[bool] = if self.wire { &[false, true] } else { &[false] };
             // `gbuf=on`: targets bound (3; 1 for transparent rows and dual-source states).
             let (mut rts, mut gbuf_done) = (if self.gbuf.is_some() { 3u32 } else { 1 }, false);
+            // `ourlight=on`: the rows before its pass leave their albedo (flags bit 3).
+            let mut lit_done = self.ourlight.is_none() || self.id_mode;
             for &wire in passes {
                 let mut raw_bound: Option<bool> = None;
                 // Table 3 holds the cull's output (a device-culled row) rather than the frame's instances.
@@ -2480,6 +2661,11 @@ impl Pass {
                     // Water after opaque and decals, before transparent (14).
                     if !water_done && TRANSPARENT_STAGES.contains(&r.stage) {
                         water_done = true;
+                        // `ourlight=on`: the opaque rows lit, before the water and the transparent rows.
+                        if !lit_done {
+                            self.record_ourlight(l, light_va, rts);
+                            lit_done = true;
+                        }
                         st.water = self.record_water(list, &cam).map_err(at("water grid upload".into()))?;
                         raw_bound = None;
                         // `gbuf=on`: transparent rows come after the title's G-buffer.
@@ -2507,7 +2693,7 @@ impl Pass {
                             self.tex.count_draw(r.material.albedo_desc);
                             let jc = j.constants(&pr.p.layout);
                             (k[32], k[33], k[36], k[37], k[39], k[56]) = (ring_bytes.min(u64::from(u32::MAX)) as u32, b.record_at(it) as u32, pr.p.layout.record_bytes(), jc[0], jc[1], jc[2]);
-                            k[35] = u32::from(r.ped) << 1 | u32::from(self.id_mode) << 2;
+                            k[35] = u32::from(r.ped) << 1 | u32::from(self.id_mode) << 2 | if lit_done { 0 } else { ourlight::DEFERRED };
                             k[57] = idx + 1;
                             if let Some(s) = list.sun {
                                 for (j, v) in s.iter().enumerate() {
@@ -2560,7 +2746,8 @@ impl Pass {
                         Bound::Wire
                     } else if self.id_mode {
                         Bound::Raw
-                    } else if let Some(s) = r.state.filter(|_| self.states && raw.is_some()) {
+                    } else if let Some(s) = effective_state(self.face_cull, list, r, device_rows.contains(&(((*r as *const DrawRecord as usize).wrapping_sub(list.draws.as_ptr() as usize) / std::mem::size_of::<DrawRecord>()) as u32))).filter(|_| self.states && raw.is_some()) {
+                        st.culled_faces += usize::from(s.cull != 0);
                         // New pipelines within the frame's budget; the rest draw with
                         // our defaults until a later frame makes them.
                         if !self.pso_async && !self.state_psos.contains_key(&s) && self.state_psos.len() < MAX_STATE_PSOS && new_psos < self.pso_budget {
@@ -2660,7 +2847,7 @@ impl Pass {
                             k[32] = vb_bytes;
                             k[33] = pf;
                             k[34] = pb;
-                            k[35] = u32::from(wire) | u32::from(r.ped) << 1 | u32::from(self.id_mode) << 2 | (self.skin_rules & 0xFF) << 8;
+                            k[35] = u32::from(wire) | u32::from(r.ped) << 1 | u32::from(self.id_mode) << 2 | (self.skin_rules & 0xFF) << 8 | if lit_done || wire { 0 } else { ourlight::DEFERRED };
                             // The draw's index in the list + 1 (ID mode).
                             k[57] = ((*r as *const DrawRecord as usize).wrapping_sub(list.draws.as_ptr() as usize) / std::mem::size_of::<DrawRecord>()) as u32 + 1;
                             // The remap's dword index in t1 (relative to the draw's palette floats).
@@ -2734,6 +2921,10 @@ impl Pass {
                         st.triangles += u64::from(indices / 3);
                     }
                 }
+                if !wire && !lit_done {
+                    self.record_ourlight(l, light_va, rts);
+                    lit_done = true;
+                }
                 if !water_done {
                     st.water = self.record_water(list, &cam).map_err(at("water grid upload".into()))?;
                 }
@@ -2745,7 +2936,82 @@ impl Pass {
             if self.bridge_on
                 && let Some(f) = list.bridged.as_deref()
             {
-                self.bridge_stats = self.record_bridged(l, f).map_err(|x| format!("frame {frame}: bridgeps: {x}"))?;
+                if self.chunk > 0 && !f.rows.is_empty() {
+                    // `chunk`: our draws so far sent first, then the title's
+                    // rows N to a submission, each waited for before the next is
+                    // recorded (each record is a frame of the bridge's own: its
+                    // heap and records are rewritten only after the last one ran).
+                    let mut all = bridged::Stats::default();
+                    for (n, part) in f.rows.chunks(self.chunk as usize).enumerate() {
+                        self.stamp_close(l, sub_k);
+                        l.Close().map_err(at(format!("bridgeps chunk list Close before {} rows", n * self.chunk as usize)))?;
+                        let (w, g) = self.send_wait(l, sub_k, if n == 0 { "pass chunk" } else { "bridgeps chunk" }, frame)?;
+                        (chunk_wait, st.submits, sub_k) = (chunk_wait + w, st.submits + 1, sub_k + 1);
+                        (st.submit_wait_ms, st.submit_gpu_ms) = (st.submit_wait_ms.max(w), st.submit_gpu_ms.max(g.unwrap_or(0.0)));
+                        self.alloc.Reset().map_err(at("bridgeps chunk allocator Reset".into()))?;
+                        self.list.Reset(&self.alloc, &self.pso).map_err(at("bridgeps chunk list Reset".into()))?;
+                        self.stamp_open(l, sub_k);
+                        let (rtv, dsv) = (self.rtv.GetCPUDescriptorHandleForHeapStart(), self.dsv.GetCPUDescriptorHandleForHeapStart());
+                        l.OMSetRenderTargets(1, Some(&rtv), true, Some(&dsv));
+                        l.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: self.width as f32, Height: self.height as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
+                        l.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: self.width as i32, bottom: self.height as i32 }]);
+                        let sub = bridged::Frame::new(part.to_vec());
+                        all.add(&self.record_bridged(l, &sub).map_err(|x| format!("frame {frame}: bridgeps rows {}..: {x}", n * self.chunk as usize))?);
+                    }
+                    self.bridge_stats = all;
+                } else {
+                    if split_on() && !f.rows.is_empty() {
+                        // Our draws go to the card before the title's rows
+                        // are recorded (not waited for: the card draws them while
+                        // the CPU records the rows; the frame's last fence covers both).
+                        self.stamp_close(l, sub_k);
+                        l.Close().map_err(at("list Close before the bridged rows".into()))?;
+                        self.send(l, frame)?;
+                        (st.submits, sub_k) = (st.submits + 1, sub_k + 1);
+                        self.alloc_split.Reset().map_err(at("bridgeps allocator Reset".into()))?;
+                        self.list.Reset(&self.alloc_split, &self.pso).map_err(at("bridgeps list Reset".into()))?;
+                        self.stamp_open(l, sub_k);
+                        let (rtv, dsv) = (self.rtv.GetCPUDescriptorHandleForHeapStart(), self.dsv.GetCPUDescriptorHandleForHeapStart());
+                        l.OMSetRenderTargets(1, Some(&rtv), true, Some(&dsv));
+                        l.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: self.width as f32, Height: self.height as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
+                        l.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: self.width as i32, bottom: self.height as i32 }]);
+                    }
+                    self.bridge_stats = self.record_bridged(l, f).map_err(|x| format!("frame {frame}: bridgeps: {x}"))?;
+                }
+            }
+            // HAIR6: the title's strand pixels over ours, under our depth.
+            if let Some(px) = list.hair.as_deref().filter(|p| !p.is_empty()) {
+                if self.hair.is_none() {
+                    match hair::HairPass::new(&self.device) {
+                        Ok(h) => self.hair = Some(h),
+                        Err(x) => xnw_core::warn!("world render: hair pass: {x}"),
+                    }
+                }
+                if let Some(h) = self.hair.as_mut() {
+                    let (rtv, dsv) = (self.rtv.GetCPUDescriptorHandleForHeapStart(), self.dsv.GetCPUDescriptorHandleForHeapStart());
+                    l.OMSetRenderTargets(1, Some(&rtv), true, Some(&dsv));
+                    l.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: self.width as f32, Height: self.height as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
+                    l.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: self.width as i32, bottom: self.height as i32 }]);
+                    h.record(&self.device, l, px, (self.width, self.height)).map_err(|x| format!("frame {frame}: hair: {x}"))?;
+                    st.hair = h.drawn;
+                }
+            }
+            // UI1: the title's UI layer over everything, with the plane blend.
+            if let Some(layer) = list.ui.as_deref().filter(|u| (u.0, u.1) == (self.width, self.height)) {
+                if self.ui.is_none() {
+                    match ui::UiPass::new(&self.device) {
+                        Ok(u) => self.ui = Some(u),
+                        Err(x) => xnw_core::warn!("world render: ui pass: {x}"),
+                    }
+                }
+                if let Some(u) = self.ui.as_mut() {
+                    let (rtv, dsv) = (self.rtv.GetCPUDescriptorHandleForHeapStart(), self.dsv.GetCPUDescriptorHandleForHeapStart());
+                    l.OMSetRenderTargets(1, Some(&rtv), true, Some(&dsv));
+                    l.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: self.width as f32, Height: self.height as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
+                    l.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: self.width as i32, bottom: self.height as i32 }]);
+                    u.record(&self.device, l, &layer.2, (self.width, self.height)).map_err(|x| format!("frame {frame}: ui: {x}"))?;
+                    st.ui = true;
+                }
             }
             // A frame complete enough becomes the shown picture.
             if self.cuts.hold && !st.held {
@@ -2797,6 +3063,18 @@ impl Pass {
         Ok(st)
     }
 
+    /// `ourlight=on`: its pass on the open list, then the frame's `rts`
+    /// targets and the depth bound again (the caller binds its root again).
+    fn record_ourlight(&self, l: &ID3D12GraphicsCommandList, light_va: u64, rts: u32) {
+        if let (Some(lit), Some(g)) = (&self.ourlight, &self.gbuf) {
+            // SAFETY: our heaps; an open list.
+            let (rtv, dsv) = unsafe { (self.rtv.GetCPUDescriptorHandleForHeapStart(), self.dsv.GetCPUDescriptorHandleForHeapStart()) };
+            lit.record(l, &self.colour, &g.normal, rtv, light_va, self.gpu_slot(lit.slot));
+            // SAFETY: as above.
+            unsafe { l.OMSetRenderTargets(rts, Some(&rtv), true, Some(&dsv)) };
+        }
+    }
+
     /// The pass's timestamp heap and readback, made once.
     fn stamps_ready(&mut self) -> std::result::Result<(), String> {
         if self.stamps.is_none() {
@@ -2831,6 +3109,21 @@ impl Pass {
     /// Sends the closed list `l` and waits for its fence under the GPU
     /// watchdog (`xnw_gpu::gpuwatch`: the card's time of this submission
     /// alone, not the CPU's recording); its fence wait and timestamped GPU ms.
+    /// Sends the closed list `l` without waiting (the frame's later
+    /// [`Pass::send_wait`] on the same queue covers it). The split
+    /// allocator is reset only once this part's fence was reached.
+    fn send(&mut self, l: &ID3D12GraphicsCommandList, frame: u64) -> std::result::Result<(), String> {
+        let at = |what: &'static str| move |e: windows::core::Error| format!("frame {frame}: pass part: {what}: {e}");
+        // SAFETY: our queue, fence and a closed list of ours.
+        unsafe {
+            self.queue.ExecuteCommandLists(&[Some(l.cast().map_err(at("list cast"))?)]);
+            self.fence_value += 1;
+            self.queue.Signal(&self.fence, self.fence_value).map_err(at("queue Signal"))?;
+        }
+        self.split_sent = self.fence_value;
+        Ok(())
+    }
+
     fn send_wait(&mut self, l: &ID3D12GraphicsCommandList, k: u32, label: &'static str, frame: u64) -> std::result::Result<(f64, Option<f64>), String> {
         let at = |what: &'static str| move |e: windows::core::Error| format!("frame {frame}: {label}: {what}: {e}");
         // SAFETY: our queue, fence and a closed list of ours; the event is closed here.
@@ -2841,7 +3134,13 @@ impl Pass {
             self.queue.Signal(&self.fence, self.fence_value).map_err(at("queue Signal"))?;
             let event: HANDLE = CreateEventW(None, false, false, None).map_err(at("CreateEvent"))?;
             self.fence.SetEventOnCompletion(self.fence_value, event).map_err(at("SetEventOnCompletion"))?;
-            WaitForSingleObject(event, INFINITE);
+            // In turns of a second, so a submission that never ends is given up.
+            while WaitForSingleObject(event, 1000) == WAIT_TIMEOUT {
+                if xnw_gpu::gpuwatch::overdue(label, sent) {
+                    let _ = CloseHandle(event);
+                    return Err(format!("frame {frame}: {label}: the submission was given up"));
+                }
+            }
             let _ = CloseHandle(event);
             if let Some(r) = xnw_gpu::d3d12x::host::removal_report(&self.device) {
                 xnw_gpu::gpuwatch::end(label, sent, None);
@@ -2877,28 +3176,18 @@ impl Pass {
         let e = |x: windows::core::Error| x.message().to_string();
         // SAFETY: our device and open list; the upload goes to the fence with `bridge_keep`.
         unsafe {
+            // The grey stand-ins, once: one 2D texel, and the other shapes
+            // a title view can have (six slices for cube views, 3D, 1D).
             if self.bridge_grey.is_none() {
-                let desc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 1, Height: 1, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8G8B8A8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() };
-                let mut t: Option<ID3D12Resource> = None;
-                self.device.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut t).map_err(e)?;
-                let t = t.ok_or("no grey texture")?;
-                let bdesc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: 256, Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default() };
-                let mut up: Option<ID3D12Resource> = None;
-                self.device.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &bdesc, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut up).map_err(e)?;
-                let up = up.ok_or("no grey upload")?;
-                let mut at = std::ptr::null_mut();
-                up.Map(0, None, Some(&mut at)).map_err(e)?;
-                std::ptr::copy_nonoverlapping([128u8, 128, 128, 255].as_ptr(), at.cast::<u8>(), 4);
-                up.Unmap(0, None);
-                let fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: 0, Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: DXGI_FORMAT_R8G8B8A8_UNORM, Width: 1, Height: 1, Depth: 1, RowPitch: 256 } };
-                let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: ManuallyDrop::new(Some(t.clone())), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
-                let src = D3D12_TEXTURE_COPY_LOCATION { pResource: ManuallyDrop::new(Some(up.clone())), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
-                l.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
-                drop(ManuallyDrop::into_inner(dst.pResource));
-                drop(ManuallyDrop::into_inner(src.pResource));
-                transition(l, &t, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                self.bridge_keep.push(windows::core::Interface::cast(&up).map_err(e)?);
-                self.bridge_grey = Some(t);
+                let mut made = Vec::new();
+                for dim in [bridged::DIM_2D, 9, 8, 2] {
+                    let (t, up) = bridged::grey_texture(&self.device, l, dim)?;
+                    self.bridge_keep.push(windows::core::Interface::cast(&up).map_err(e)?);
+                    made.push(t);
+                }
+                let mut made = made.into_iter();
+                self.bridge_grey = made.next();
+                self.bridge_grey_shapes = made.collect();
             }
             // The words buffer: grown to the frame's largest offset (at most
             // 256 MiB), kept; each frame writes only its rows' words.
@@ -2918,10 +3207,12 @@ impl Pass {
             }
             let (words, wp, wlen) = self.bridge_words.clone().ok_or("no words buffer")?;
             let grey = self.bridge_grey.clone().ok_or("no grey texture")?;
+            let shapes = self.bridge_grey_shapes.clone();
+            let [cube, volume, line] = &shapes[..] else { return Err("no grey stand-ins of the other shapes".into()) };
             let tex = &self.tex;
             let texture = |h: u64| tex.host_view(h);
             let flat = |h: u64| tex.flat_reason(h) as usize;
-            let t = bridged::Target { rtv: self.rtv.GetCPUDescriptorHandleForHeapStart(), dsv: self.dsv.GetCPUDescriptorHandleForHeapStart(), width: self.width, height: self.height, texture: &texture, flat: &flat, grey: &grey, words: (&words, wlen, wp) };
+            let t = bridged::Target { rtv: self.rtv.GetCPUDescriptorHandleForHeapStart(), dsv: self.dsv.GetCPUDescriptorHandleForHeapStart(), width: self.width, height: self.height, texture: &texture, flat: &flat, grey: &grey, grey_shapes: [cube, volume, line], words: (&words, wlen, wp) };
             self.bridge_gpu.record(&self.device, l, f, &t, &mut self.bridge_keep)
         }
     }
@@ -3277,11 +3568,19 @@ pub fn screen_pass(host: &xnw_gpu::host::Host) -> std::result::Result<Pass, Stri
     // Parsed again, not `screen_mode()`: `xnw burst` sets the variable after main read it.
     let opts = parse_screen(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default()).ok_or("XNW_WORLD_RENDER does not ask for the screen")?;
     let mut p = Pass::new(host, 1920, 1080)?;
+    if p.ourlight.is_some() {
+        xnw_core::info!("world render: ourlight on: our lighting pass (our HLSL) after the opaque rows over the G-buffer's normals (gbuf on); light from the timecycle (Lighting::ours)");
+    }
     (p.wire, p.only_stage, p.skin, p.states, p.sky, p.water, p.peds, p.decal_hold) = (opts.wire, opts.stage, opts.skin, opts.states, opts.sky, opts.water, opts.peds, opts.decal_hold);
     // Skinned non-ped draws only with `skinned=on`.
     p.skinned = std::env::var("XNW_WORLD_RENDER").is_ok_and(|v| v.split(',').any(|s| s.trim() == "skinned=on"));
     // `skinrules=<hex>` (default 0: the default maths and skips).
     p.skin_rules = parse_skin_rules(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default());
+    // `cull=title` (default off: both faces of every row).
+    p.face_cull = parse_face_cull(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default());
+    if p.face_cull != FaceCull::Off {
+        xnw_core::info!("world render: face cull {:?}: stated rows with their cull mode; mirrored rows the other face; instances that disagree or are tested on the device both faces", p.face_cull);
+    }
     p.pso_budget = SCREEN_PSO_BUDGET;
     p.pso_async = true;
     p.upload_ms_budget = Some(SCREEN_UPLOAD_MS);
@@ -3298,6 +3597,13 @@ pub fn screen_pass(host: &xnw_gpu::host::Host) -> std::result::Result<Pass, Stri
     if !bridgeps.is_empty() {
         let hw = std::env::var("XNW_BRIDGE_HW").ok().as_deref() == Some("1");
         p.bridge_on = host.caps.software || hw;
+        // On the card the per-submission GPU watchdog exits the title before the
+        // driver's 2 s timeout (`XNW_GPU_WATCH_MS`, default 500), its line every 60 frames.
+        if p.bridge_on && !host.caps.software {
+            let ms = std::env::var("XNW_GPU_WATCH_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(500u64);
+            xnw_gpu::gpuwatch::start(std::time::Duration::from_millis(ms));
+            xnw_core::info!("world render: bridgeps on {}: GPU watchdog {ms} ms per submission", host.caps.adapter);
+        }
         xnw_core::info!(
             "world render: bridgeps: {} pixel programs ({bridgeps:08x?}) {} on {}",
             bridgeps.len(),
@@ -3348,6 +3654,14 @@ pub fn screen_pass(host: &xnw_gpu::host::Host) -> std::result::Result<Pass, Stri
     // `stipple=off` draws cross-fading LODs solid (bisecting).
     p.stipple = !std::env::var("XNW_WORLD_RENDER").is_ok_and(|v| v.split(',').any(|s| s.trim() == "stipple=off"));
     Ok(p)
+}
+
+/// With bridged rows, our draws are sent before the rows are recorded
+/// and the card draws them meanwhile (`XNW_BRIDGE_SPLIT=off`: one list, the
+/// rule before). The pass waited 9-10 ms of GPU after recording.
+pub fn split_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("XNW_BRIDGE_SPLIT").as_deref().map(str::trim), Ok("off" | "0")))
 }
 
 /// One finished list into the screen pass, as the live path draws it: its new
@@ -3423,6 +3737,9 @@ pub fn screen_draw(pass: &mut Pass, mut list: FrameList, readback: bool) -> std:
     if list.frame % 60 == 0 && pass.bridge_on {
         let none = bridged::Frame::default();
         xnw_core::info!("{}", bridged::line(list.frame, list.bridged.as_deref().unwrap_or(&none), &pass.bridge_stats));
+        if xnw_gpu::gpuwatch::budget().is_some() {
+            xnw_core::info!("world render: frame {}: {}", list.frame, xnw_gpu::gpuwatch::summary("the last 60 frames", &xnw_gpu::gpuwatch::take()));
+        }
     }
     if list.frame % 60 == 0 && pass.imposters.opts.on {
         xnw_core::info!("{}", pass.imposters.frame_line(list.frame, list.imposters.as_deref()));
@@ -3432,9 +3749,18 @@ pub fn screen_draw(pass: &mut Pass, mut list: FrameList, readback: bool) -> std:
             xnw_core::info!("{l}");
         }
     }
+    // The pass's parts summed per frame between these lines: [frames, record, textures, bridged, GPU, total].
+    let means = {
+        static SUMS: std::sync::Mutex<[f64; 6]> = std::sync::Mutex::new([0.0; 6]);
+        let mut s = SUMS.lock().unwrap_or_else(|e| e.into_inner());
+        for (a, b) in s.iter_mut().zip([1.0, st.record_ms, st.tex_ms, pass.bridge_stats.ms, st.gpu_ms, t.elapsed().as_secs_f64() * 1e3]) {
+            *a += b;
+        }
+        if list.frame % 60 == 0 { std::mem::take(&mut *s) } else { [0.0; 6] }
+    };
     if list.frame % 60 == 0 {
         xnw_core::info!(
-            "world render: frame {}: {} draws (skinned {} of {} hooked, {} with the ped remap, {} peds skipped, {} skinned skipped, {} decals held, {} without geometry, {} filtered, {} with the title's state, {} state pipelines), {} triangles; {} geometries uploaded ({} replaced, {} indices clamped) ({} KiB), palettes {} B; record {:.1} ms, GPU {:.1} ms, total {:.1} ms",
+            "world render: frame {}: {} draws (skinned {} of {} hooked, {} with the ped remap, {} peds skipped, {} skinned skipped, {} decals held, {} without geometry, {} filtered, {} with the title's state ({} one-sided), {} state pipelines), {} triangles; {} geometries uploaded ({} replaced, {} indices clamped) ({} KiB), palettes {} B; record {:.1} ms (textures {:.1} ms), GPU {:.1} ms, total {:.1} ms; means of the last {} frames: record {:.1} ms (textures {:.1}, bridged {:.1}), GPU {:.1} ms, total {:.1} ms",
             list.frame,
             st.draws,
             st.skinned,
@@ -3446,6 +3772,7 @@ pub fn screen_draw(pass: &mut Pass, mut list: FrameList, readback: bool) -> std:
             st.skipped,
             st.filtered,
             st.stated,
+            st.culled_faces,
             pass.state_psos.len(),
             st.triangles,
             st.uploaded_geometries,
@@ -3454,8 +3781,15 @@ pub fn screen_draw(pass: &mut Pass, mut list: FrameList, readback: bool) -> std:
             st.uploaded_bytes >> 10,
             st.palette_bytes,
             st.record_ms,
+            st.tex_ms,
             st.gpu_ms,
-            t.elapsed().as_secs_f64() * 1e3
+            t.elapsed().as_secs_f64() * 1e3,
+            means[0],
+            means[1] / means[0].max(1.0),
+            means[2] / means[0].max(1.0),
+            means[3] / means[0].max(1.0),
+            means[4] / means[0].max(1.0),
+            means[5] / means[0].max(1.0)
         );
     }
     Ok(st)
@@ -3492,7 +3826,7 @@ mod tests {
     /// WARP removes the device on a pixel shader that returns inside a branch.
     #[test]
     fn pixel_entries_return_once() {
-        let shaders = [("SHADER", SHADER), ("RAW_SHADER", RAW_SHADER), ("WATER_SHADER", WATER_SHADER), ("SKY_SHADER", SKY_SHADER), ("IMPOSTER_SHADER", imposter::IMPOSTER_SHADER), ("TERRAIN_SHADER", terrain::TERRAIN_SHADER)];
+        let shaders = [("SHADER", SHADER), ("RAW_SHADER", RAW_SHADER), ("WATER_SHADER", WATER_SHADER), ("SKY_SHADER", SKY_SHADER), ("IMPOSTER_SHADER", imposter::IMPOSTER_SHADER), ("TERRAIN_SHADER", terrain::TERRAIN_SHADER), ("ourlight", ourlight::SHADER)];
         for (name, src) in shaders {
             let entries = pixel_entries(src);
             assert_eq!(entries.len(), 1, "{name}: one pixel entry");
@@ -3511,7 +3845,7 @@ mod tests {
     /// past its buffer on the card). Every guarded load picks its address.
     #[test]
     fn no_load_in_a_conditional_arm() {
-        let shaders = [("SHADER", SHADER), ("RAW_SHADER", RAW_SHADER), ("WATER_SHADER", WATER_SHADER), ("SKY_SHADER", SKY_SHADER), ("IMPOSTER_SHADER", imposter::IMPOSTER_SHADER), ("TERRAIN_SHADER", terrain::TERRAIN_SHADER), ("gpucull", gpucull::SHADER), ("preskin_gpu", preskin_gpu::SHADER)];
+        let shaders = [("SHADER", SHADER), ("RAW_SHADER", RAW_SHADER), ("WATER_SHADER", WATER_SHADER), ("SKY_SHADER", SKY_SHADER), ("IMPOSTER_SHADER", imposter::IMPOSTER_SHADER), ("TERRAIN_SHADER", terrain::TERRAIN_SHADER), ("gpucull", gpucull::SHADER), ("preskin_gpu", preskin_gpu::SHADER), ("ourlight", ourlight::SHADER)];
         // Both arms of each `?`: the text after it up to the end of its
         // expression (a `;`, a `,` or `)` closing what encloses it).
         let arm = |src: &str| {
@@ -4270,7 +4604,7 @@ mod tests {
         let geom = GeomKey { mesh_at: 9, ..Default::default() };
         let rec = |rgb: [f32; 3], stage: u32, state: Option<RenderState>| DrawRecord { geom, world: id, viewport: 1, effect: 0, albedo: Albedo::Flat(rgb), palette: NO_PALETTE, stage, inst_first: 0, inst_count: 0, bone_first: 0, bone_count: 0, material: Material::default(), state, remap: NO_REMAP, ped: false };
         // Additive blend (ONE, ONE, ADD), depth test GE without write: the decal's red adds to the opaque blue.
-        let add = RenderState { depth_enable: true, depth_write: false, depth_func: 7, depth_bias: 0, bias_clamp: 0, slope_bias: 0, blend: [1, 2, 2, 1, 2, 2, 1, 0xF] };
+        let add = RenderState { depth_enable: true, depth_write: false, depth_func: 7, depth_bias: 0, bias_clamp: 0, slope_bias: 0, blend: [1, 2, 2, 1, 2, 2, 1, 0xF], cull: 0, front_ccw: false };
         let g = HostGeometry { vertices: Vec::new(), indices: vec![0, 1, 2], raw_vb: Some(vb), vb_place: 0 };
         let draws = vec![rec([1.0, 0.0, 0.0], 74, Some(add)), rec([0.0, 1.0, 0.0], 36, None), rec([0.0, 0.0, 1.0], 67, None)];
         let list = FrameList { frame: 1, draws, cameras: vec![Camera { viewport: 1, view: id, proj: PROJ }], main: Some(1), new_geoms: vec![(geom, g)], ..Default::default() };
@@ -4338,7 +4672,7 @@ mod tests {
         let g = HostGeometry { vertices: Vec::new(), indices: vec![0, 1, 2], raw_vb: Some(vb), vb_place: 0 };
         let curve = [0.22, 0.3, 0.1, 0.2, 0.01, 0.3, 4.0];
         let pi = std::f32::consts::PI;
-        let light = lighting::Lighting { dir: [0.0, 0.0, 1.0], radiance: [pi; 3], mult: pi, amb_sky: [0.0; 3], amb_ground: [0.0; 3], exposure: 1.0, ev: 0.0, bias: 0.0, strength: 1.0, moon: false, sky_scale: 1.0, curve };
+        let light = lighting::Lighting { dir: [0.0, 0.0, 1.0], radiance: [pi; 3], mult: pi, amb_sky: [0.0; 3], amb_ground: [0.0; 3], exposure: 1.0, ev: 0.0, bias: 0.0, strength: 1.0, moon: false, sky_scale: 1.0, curve, fog: [0.0; 3] };
         let mut list = FrameList { frame: 1, draws: vec![rec], cameras: vec![Camera { viewport: 1, view: id, proj: PROJ }], main: Some(1), new_geoms: vec![(geom, g)], light: Some(light), ..Default::default() };
         let grey = |pass: &mut Pass, list: &mut FrameList| -> i32 {
             pass.draw(list, &mut |_| None, true).unwrap();
@@ -4475,5 +4809,34 @@ mod tests {
         l2.palette_at_draw.clear();
         assert!(!skin_lifted(&l2, &at(1), SKIN_DRAW_TIME));
         assert!(skin_lifted(&list, &r(0, 2), SKIN_IDENTITY_STATIC));
+        // The cull switch: off zeroes the title's mode, title keeps it, a
+        // mirrored row culls the other face, instances that disagree keep both.
+        let back = RenderState { cull: 3, front_ccw: true, ..Default::default() };
+        let row = |w: Mat, first: u32, count: u32| DrawRecord { state: Some(back), world: w, inst_first: first, inst_count: count, ..r(0, 2) };
+        let mut mirror = translation([0.0; 3]);
+        mirror[0] = -1.0;
+        let plain = translation([1.0, 2.0, 3.0]);
+        let inst = |x: f32| [x, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0];
+        let l3 = FrameList { instances: [inst(1.0), inst(1.0), inst(-1.0), inst(-1.0)].concat(), ..Default::default() };
+        let eff = |m, r: &DrawRecord, dev| effective_state(m, &l3, r, dev).map(|s| (s.cull, s.front_ccw));
+        assert_eq!(eff(FaceCull::Off, &row(plain, 0, 0), false), Some((0, false)));
+        assert_eq!(eff(FaceCull::Title, &row(plain, 0, 0), false), Some((3, true)));
+        assert_eq!(eff(FaceCull::Title, &row(mirror, 0, 0), false), Some((2, true)));
+        assert_eq!(eff(FaceCull::Forced(3, false), &row(plain, 0, 0), false), Some((3, false)));
+        assert_eq!(eff(FaceCull::Title, &row(plain, 0, 2), false), Some((3, true)));
+        assert_eq!(eff(FaceCull::Title, &row(plain, 2, 2), false), Some((2, true)));
+        assert_eq!(eff(FaceCull::Title, &row(plain, 1, 2), false), Some((0, false)), "instances disagree");
+        assert_eq!(eff(FaceCull::Title, &row(plain, 0, 2), true), Some((0, false)), "tested on the device");
+        assert_eq!(eff(FaceCull::Title, &DrawRecord { state: None, ..row(plain, 0, 0) }, false), None);
+        assert_eq!(effective_state(FaceCull::Title, &l3, &DrawRecord { state: Some(RenderState { cull: 1, ..back }), ..row(plain, 0, 0) }, false).map(|s| s.cull), Some(0), "cull none");
+        assert_eq!((parse_face_cull("screen,cull=title"), parse_face_cull("screen,cull=back,ccw=on"), parse_face_cull("screen,cull=front"), parse_face_cull("screen")), (FaceCull::Title, FaceCull::Forced(3, true), FaceCull::Forced(2, false), FaceCull::Off));
+        // A quad on the camera stays skipped under every bit; the same quad
+        // 3 m off, or a larger buffer there, is lifted.
+        let quad = |at: [f32; 3], vb_len: u64| DrawRecord { geom: GeomKey { vb_len, ..GeomKey::default() }, world: translation(at), ..r(0, 2) };
+        let card = quad([0.0, 0.15, -1.5], 240);
+        assert!(camera_card(&card));
+        assert!(!skin_lifted(&list, &card, SKIN_IDENTITY_STATIC | SKIN_RIGID_BONES | SKIN_DRAW_TIME));
+        assert!(skin_lifted(&list, &quad([0.0, 3.0, -1.5], 240), SKIN_IDENTITY_STATIC));
+        assert!(skin_lifted(&list, &quad([0.0, 0.15, -1.5], 15780), SKIN_IDENTITY_STATIC));
     }
 }

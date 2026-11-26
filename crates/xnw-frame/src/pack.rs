@@ -17,6 +17,9 @@ pub struct Pack {
     pub data: FramePack,
     /// v1 draw -> its sink draws.
     sinks_of: HashMap<u32, Vec<u32>>,
+    /// HAIR6: a pack the live path made this frame: its blobs in memory
+    /// (none on disk; `dir` only names where `shader-names.tsv` is looked for).
+    mem: Option<std::sync::Arc<HashMap<u128, Vec<u8>>>>,
 }
 
 /// The v1 frame and its pack (None for a v1 capture).
@@ -33,12 +36,29 @@ impl Pack {
                 sinks_of.entry(d).or_default().push(s.index);
             }
         }
-        Ok(Some(Pack { dir: dir.to_path_buf(), data, sinks_of }))
+        Ok(Some(Pack { dir: dir.to_path_buf(), data, sinks_of, mem: None }))
+    }
+
+    /// HAIR6: a pack made in memory (the live path's frame), its blobs by hash.
+    pub fn in_memory(dir: &Path, data: FramePack, blobs: std::sync::Arc<HashMap<u128, Vec<u8>>>) -> Pack {
+        let mut sinks_of: HashMap<u32, Vec<u32>> = HashMap::new();
+        for s in &data.sinks {
+            if let Some(d) = s.hook_draw {
+                sinks_of.entry(d).or_default().push(s.index);
+            }
+        }
+        Pack { dir: dir.to_path_buf(), data, sinks_of, mem: Some(blobs) }
     }
 
     /// A blob's bytes (None: not stored or not found).
     pub fn blob(&self, hash: u128) -> Option<Vec<u8>> {
-        (hash != 0).then(|| FramePack::blob(&self.dir, hash)).flatten()
+        if hash == 0 {
+            return None;
+        }
+        match &self.mem {
+            Some(m) => m.get(&hash).cloned(),
+            None => FramePack::blob(&self.dir, hash),
+        }
     }
 
     pub(crate) fn bytes_of(&self, r: &Ref) -> Option<Vec<u8>> {
@@ -407,8 +427,91 @@ fn game_file(name: &str) -> Option<PathBuf> {
     files.get(&name.to_ascii_lowercase()).cloned()
 }
 
-/// A texture's finest mip (capped) from its pack origin `<file>#<index>`.
-fn from_origin(origin: &str) -> Option<xnw_world::textures::Provided> {
+/// How a texture view's texels are provided: `Provided::dim`, and the
+/// resource's slices the view takes (first, count; 0: all).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ViewShape {
+    pub dim: u8,
+    pub first: u32,
+    pub count: u32,
+}
+
+/// A view's shape from its captured words (`bridged::title_dim`: the view
+/// description's dimension at words[15], its fields from words[18]): a 2D
+/// array with the view's slices, a cube (six faces; a cube array view
+/// gives the cube at its first face, as the translator reads one cube),
+/// a 3D texture, else 2D (1D views are 2D of one row, as before BUG3).
+pub fn view_shape(v: &SlotView) -> ViewShape {
+    use xnw_world::textures::{TEX_2D, TEX_2D_ARRAY, TEX_3D, TEX_CUBE};
+    // An array view's FirstArraySlice and ArraySize; a cube array's First2DArrayFace.
+    let (first, count) = if v.words[15] == 0 { (0, 0) } else { (v.words[20], v.words[21]) };
+    match xnw_world::bridged::title_dim(v.kind, &v.words) {
+        5 => ViewShape { dim: TEX_2D_ARRAY, first, count: if count == u32::MAX { 0 } else { count } },
+        9 => ViewShape { dim: TEX_CUBE, first: 0, count: 6 },
+        10 => ViewShape { dim: TEX_CUBE, first, count: 6 },
+        8 => ViewShape { dim: TEX_3D, first: 0, count: 0 },
+        _ => ViewShape { dim: TEX_2D, first: 0, count: 1 },
+    }
+}
+
+/// A cube's, an array's or a 3D texture's subresources as packed linear
+/// rows in D3D12 order ([`Provided::mips`]): the mips from the finest not
+/// over [`PROVIDE_MAX`] down, of each of `shape`'s slices (3D: of the
+/// whole depth, `slices` = its depth at mip 0). `detile(mip, slice, out,
+/// row bytes, depth pitch)` fills one subresource. A block-compressed
+/// top mip must be whole blocks (D3D12's rule for the texture we make).
+fn shaped_rows(shape: ViewShape, format: u32, width: u32, height: u32, slices: u32, mips: u32, detile: &dyn Fn(u32, u32, &mut [u8], usize, usize) -> bool) -> Option<xnw_world::textures::Provided> {
+    use xnw_world::textures::{TEX_3D, TEX_CUBE};
+    let f = xnw_formats::texture::format(format)?;
+    let mips = mips.max(1);
+    let m0 = (0..mips).find(|m| (width >> m).max(1) <= PROVIDE_MAX && (height >> m).max(1) <= PROVIDE_MAX).unwrap_or(mips - 1);
+    let size = |m: u32| ((width >> m).max(1), (height >> m).max(1));
+    let (w0, h0) = size(m0);
+    if f.block > 1 && (w0 % f.block != 0 || h0 % f.block != 0) {
+        return None;
+    }
+    let volume = shape.dim == TEX_3D;
+    let (first, count) = if volume {
+        (0, 1)
+    } else {
+        let first = shape.first.min(slices.checked_sub(1)?);
+        (first, if shape.count == 0 { slices - first } else { shape.count.min(slices - first) })
+    };
+    if shape.dim == TEX_CUBE && count < 6 {
+        return None;
+    }
+    let mut rows = Vec::new();
+    let mut mip = |m: u32, s: u32, depth: u32| -> bool {
+        let (w, h) = size(m);
+        let (rb, n) = ((w.div_ceil(f.block) * f.bytes) as usize, h.div_ceil(f.block) as usize);
+        let at = rows.len();
+        rows.resize(at + rb * n * depth as usize, 0);
+        detile(m, s, &mut rows[at..], rb, rb * n)
+    };
+    if volume {
+        for m in m0..mips {
+            if !mip(m, 0, (slices >> m).max(1)) {
+                return None;
+            }
+        }
+    } else {
+        for s in first..first + count {
+            for m in m0..mips {
+                if !mip(m, s, 1) {
+                    return None;
+                }
+            }
+        }
+    }
+    let depth = if volume { (slices >> m0).max(1) } else { count };
+    let row_bytes = w0.div_ceil(f.block) * f.bytes;
+    Some(xnw_world::textures::Provided { width: w0, height: h0, format, rows, row_bytes, row_count: h0.div_ceil(f.block) * depth, dim: shape.dim, depth, mips: mips - m0 })
+}
+
+/// A texture's finest mip (capped) from its pack origin `<file>#<index>`;
+/// a cube's, an array's or a 3D texture's subresources ([`shaped_rows`])
+/// for a view of that `shape`.
+fn from_origin(origin: &str, shape: ViewShape) -> Option<xnw_world::textures::Provided> {
     use xnw_formats::ttpf;
     let (name, idx) = origin.rsplit_once('#')?;
     let path = game_file(name)?;
@@ -416,18 +519,35 @@ fn from_origin(origin: &str) -> Option<xnw_world::textures::Provided> {
     let len = f.metadata().ok()?.len();
     let t = ttpf::Ttpf::read(&mut f, len).ok()?;
     let tex = *t.textures.get(idx.parse::<usize>().ok()?)?;
+    let tables = xnw_formats::bcpack::Tables::builtin().ok();
+    if shape.dim != xnw_world::textures::TEX_2D {
+        // The file's layout by kind (array units interleaved, a cube's
+        // copies, a volume's one chain): one plain chain a slice.
+        let volume = tex.kind == ttpf::KIND_VOLUME;
+        if volume != (shape.dim == xnw_world::textures::TEX_3D) {
+            return None;
+        }
+        let span = t.read_span(&mut f, tex.addr, tex.span, tables.as_ref()).ok()?;
+        let (chain, slices) = xnw_formats::texpack::source_chains(&tex, &span).ok()?;
+        let n = if volume { tex.layers.max(1) } else { slices.len() as u32 };
+        return shaped_rows(shape, tex.format, tex.width, tex.height, n, chain.mips.len() as u32, &|m, s, out, rb, dp| {
+            slices.get(if volume { 0 } else { s as usize }).is_some_and(|tiled| chain.detile(tiled, m, 0, out, rb, dp).is_ok())
+        });
+    }
     if tex.kind != ttpf::KIND_2D {
         return None;
     }
-    let tables = xnw_formats::bcpack::Tables::builtin().ok();
     let span = t.read_span(&mut f, tex.addr, tex.span, tables.as_ref()).ok()?;
     let chain = ttpf::chain(&tex, tex.mips).ok()?;
     let (width, height, rows, row_bytes, row_count) = linear_mip(&chain, &span, tex.width, tex.height, tex.format)?;
-    Some(xnw_world::textures::Provided { width, height, format: tex.format, rows, row_bytes, row_count, dim: xnw_world::textures::TEX_2D, depth: 1 })
+    Some(xnw_world::textures::Provided { width, height, format: tex.format, rows, row_bytes, row_count, dim: xnw_world::textures::TEX_2D, depth: 1, mips: 1 })
 }
 
-/// A texture's finest mip (capped) from its stored resident bytes.
-fn from_texels(v: &SlotView, tiled: &[u8]) -> Option<xnw_world::textures::Provided> {
+/// A texture's finest mip (capped) from its stored resident bytes; a
+/// cube's, an array's or a 3D texture's subresources ([`shaped_rows`])
+/// for a view of that `shape`, in the console's memory layout (the one
+/// the layer's uploads detile: `Layout::detile(mip, slice)`).
+fn from_texels(v: &SlotView, tiled: &[u8], shape: ViewShape) -> Option<xnw_world::textures::Provided> {
     use xnw_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
     let swizzle = match v.layout {
         1 => Swizzle::LINEAR,
@@ -435,7 +555,8 @@ fn from_texels(v: &SlotView, tiled: &[u8]) -> Option<xnw_world::textures::Provid
         _ => Swizzle::SW_4KB_S,
     };
     let height = v.height.max(1);
-    let t = Texture::new(&TextureDesc { dimension: Dimension::Tex2d, width: u32::try_from(v.width).ok()?, height, depth_or_array: u32::from(v.depth.max(1)), mips: u32::from(v.mips), format: v.format, samples: 1, swizzle }).ok()?;
+    let volume = shape.dim == xnw_world::textures::TEX_3D;
+    let t = Texture::new(&TextureDesc { dimension: if volume { Dimension::Tex3d } else { Dimension::Tex2d }, width: u32::try_from(v.width).ok()?, height, depth_or_array: u32::from(v.depth.max(1)), mips: u32::from(v.mips), format: v.format, samples: 1, swizzle }).ok()?;
     let layout = &t.planes.first()?.layout;
     // Short of the layout's size (a cut copy): the rest reads as zeros.
     let mut padded;
@@ -446,20 +567,59 @@ fn from_texels(v: &SlotView, tiled: &[u8]) -> Option<xnw_world::textures::Provid
     } else {
         tiled
     };
+    if shape.dim != xnw_world::textures::TEX_2D {
+        return shaped_rows(shape, v.format, v.width as u32, height, u32::from(v.depth.max(1)), layout.mips.len() as u32, &|m, s, out, rb, dp| {
+            layout.detile(tiled, m, s, out, rb, dp).is_ok()
+        });
+    }
     let (width, height, rows, row_bytes, row_count) = linear_mip(layout, tiled, v.width as u32, height, v.format)?;
-    Some(xnw_world::textures::Provided { width, height, format: v.format, rows, row_bytes, row_count, dim: xnw_world::textures::TEX_2D, depth: 1 })
+    Some(xnw_world::textures::Provided { width, height, format: v.format, rows, row_bytes, row_count, dim: xnw_world::textures::TEX_2D, depth: 1, mips: 1 })
 }
 
 impl Pack {
-    /// The texels of one texture view (a draw word's view): its pack
-    /// origin, else its stored texels; Err says which is missing.
+    /// The texels of one texture view (a draw word's view) as a 2D
+    /// texture: its pack origin, else its stored texels; Err says which is
+    /// missing.
     pub fn view_texels(&self, v: &SlotView) -> Result<xnw_world::textures::Provided, &'static str> {
+        self.view_texels_as(v, ViewShape { dim: xnw_world::textures::TEX_2D, first: 0, count: 1 })
+    }
+
+    /// [`Self::view_texels`] in the view's own shape ([`view_shape`]): a
+    /// cube, a 2D array or a 3D texture with its slices and mips.
+    pub fn view_texels_shaped(&self, v: &SlotView) -> Result<xnw_world::textures::Provided, &'static str> {
+        self.view_texels_as(v, view_shape(v))
+    }
+
+    fn view_texels_as(&self, v: &SlotView, shape: ViewShape) -> Result<xnw_world::textures::Provided, &'static str> {
         let t = self.texture(v).ok_or("no texture row")?;
-        if let Some(p) = t.origin.as_deref().and_then(from_origin) {
+        if let Some(p) = t.origin.as_deref().and_then(|o| from_origin(o, shape)) {
             return Ok(p);
         }
-        let tiled = (t.texels != 0).then(|| FramePack::blob(&self.dir, t.texels)).flatten().ok_or("no texels")?;
-        from_texels(v, &tiled).ok_or("texels not decoded")
+        let tiled = self.blob(t.texels).ok_or("no texels")?;
+        from_texels(v, &tiled, shape).ok_or("texels not decoded")
+    }
+
+    /// The content keys of [`Self::texel_provider`]'s texels: a
+    /// slot's texture origin, else its stored texels' hash with the view's
+    /// shape, which is all `from_origin` / `from_texels` read, and the
+    /// view's shape ([`view_shape`]: one texture viewed as a cube and as
+    /// an array is two). No texels are read here.
+    pub fn texel_keys(&self) -> xnw_world::textures::Keys {
+        use std::hash::{Hash, Hasher};
+        let views = self.views_by_handle();
+        let rows: HashMap<(u64, u64), (Option<String>, u128)> = self.data.textures.iter().map(|t| ((t.at, t.len), (t.origin.clone(), t.texels))).collect();
+        Box::new(move |slot| {
+            let v = views.get(&slot)?;
+            let (origin, texels) = rows.get(&(v.addr, v.bytes))?;
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            view_shape(v).hash(&mut h);
+            match origin {
+                Some(o) => (0u8, o).hash(&mut h),
+                None if *texels != 0 => (1u8, *texels, v.layout, v.width, v.height, v.depth, v.mips, v.format).hash(&mut h),
+                None => return None,
+            }
+            Some(h.finish())
+        })
     }
 
     /// The replay's texel source ([`TexMode::Provided`]): a slot handle ->
@@ -468,18 +628,19 @@ impl Pack {
     pub fn texel_provider(&self, counts: std::sync::Arc<[std::sync::atomic::AtomicU64; 3]>) -> xnw_world::textures::Provider {
         let views = self.views_by_handle();
         let rows: HashMap<(u64, u64), fp::Texture> = self.data.textures.iter().map(|t| ((t.at, t.len), t.clone())).collect();
-        let dir = self.dir.clone();
+        let (dir, mem) = (self.dir.clone(), self.mem.clone());
         Box::new(move |slot| {
             use std::sync::atomic::Ordering::Relaxed;
             counts[0].fetch_add(1, Relaxed);
             let v = views.get(&slot)?;
             let t = rows.get(&(v.addr, v.bytes))?;
-            if let Some(p) = t.origin.as_deref().and_then(from_origin) {
+            let shape = view_shape(v);
+            if let Some(p) = t.origin.as_deref().and_then(|o| from_origin(o, shape)) {
                 counts[1].fetch_add(1, Relaxed);
                 return Some(p);
             }
-            let tiled = (t.texels != 0).then(|| FramePack::blob(&dir, t.texels)).flatten()?;
-            let p = from_texels(v, &tiled)?;
+            let tiled = (t.texels != 0).then(|| match &mem { Some(m) => m.get(&t.texels).cloned(), None => FramePack::blob(&dir, t.texels) }).flatten()?;
+            let p = from_texels(v, &tiled, shape)?;
             counts[2].fetch_add(1, Relaxed);
             Some(p)
         })
@@ -528,10 +689,75 @@ mod tests {
         // A linear 8x8 RGBA8 texture's texels come back as its rows.
         let texels: Vec<u8> = (0..256u32).map(|i| i as u8).collect();
         let v = SlotView { kind: view::PLACED, width: 8, height: 8, depth: 1, mips: 1, format: 28, layout: 1, ..SlotView::default() };
-        let p = from_texels(&v, &texels).unwrap();
+        let p = from_texels(&v, &texels, view_shape(&v)).unwrap();
         assert_eq!((p.width, p.height, p.row_bytes, p.row_count), (8, 8, 32, 8));
         assert_eq!(&p.rows[..32], &texels[..32]);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A view's shape comes from its words, and a cube, an array and a 3D
+    /// texture come back with every slice and mip in D3D12 order: tiled
+    /// by the console layout (`Layout::tile`, slice and mip marked in
+    /// each texel), then read through `from_texels`.
+    #[test]
+    fn cubes_arrays_and_volumes_keep_their_slices_and_mips() {
+        use xnw_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
+        use xnw_world::textures::{TEX_2D, TEX_2D_ARRAY, TEX_3D, TEX_CUBE};
+        let view = |kind: u32, res: u32, dim: u32, depth: u16, mips: u16| {
+            let mut v = SlotView { kind, width: 8, height: 8, depth, mips, format: 28, layout: 0x105, ..SlotView::default() };
+            (v.words[0], v.words[7], v.words[15]) = (res, u32::from(depth) | u32::from(mips) << 16, dim);
+            v
+        };
+        // The shapes: a placed cube, a cube array at face 6, an array's slices 1-2, a resource view's default.
+        let cube = view(view::PLACED, 3, 9, 6, 4);
+        assert_eq!(view_shape(&cube), ViewShape { dim: TEX_CUBE, first: 0, count: 6 });
+        let mut second = view(view::PLACED, 3, 10, 12, 1);
+        second.words[20] = 6;
+        assert_eq!(view_shape(&second), ViewShape { dim: TEX_CUBE, first: 6, count: 6 });
+        let mut part = view(view::TEXTURE, 3, 5, 4, 1);
+        (part.words[20], part.words[21]) = (1, 2);
+        assert_eq!(view_shape(&part), ViewShape { dim: TEX_2D_ARRAY, first: 1, count: 2 });
+        assert_eq!(view_shape(&view(view::TEXTURE, 3, 0, 4, 1)), ViewShape { dim: TEX_2D_ARRAY, first: 0, count: 0 });
+        assert_eq!(view_shape(&view(view::TEXTURE, 4, 0, 4, 1)).dim, TEX_3D);
+        // No words (a capture before BUG3), a 2D view, a 1D view: 2D.
+        assert_eq!(view_shape(&SlotView { kind: view::TEXTURE, depth: 6, ..SlotView::default() }).dim, TEX_2D);
+        assert_eq!((view_shape(&view(view::PLACED, 3, 4, 1, 1)).dim, view_shape(&view(view::PLACED, 2, 2, 1, 1)).dim), (TEX_2D, TEX_2D));
+        // Texels: byte 0 = slice (3D: depth slice), byte 1 = mip, bytes 2-3 = x, y.
+        let tiled = |dimension: Dimension, depth: u32, mips: u32| {
+            let t = Texture::new(&TextureDesc { dimension, width: 8, height: 8, depth_or_array: depth, mips, format: 28, samples: 1, swizzle: Swizzle::SW_4KB_S }).unwrap();
+            let l = t.planes[0].layout.clone();
+            let mut mem = vec![0u8; l.size as usize];
+            let volume = dimension == Dimension::Tex3d;
+            for m in 0..mips {
+                let (w, d) = ((8u32 >> m).max(1) as usize, if volume { (depth >> m).max(1) } else { 1 });
+                for s in 0..if volume { 1 } else { depth } {
+                    let rows: Vec<u8> = (0..d).flat_map(|z| (0..w * w).flat_map(move |i| [if volume { z } else { s } as u8, m as u8, (i % w) as u8, (i / w) as u8])).collect();
+                    l.tile(&mut mem, m, s, &rows, w * 4, w * w * 4).unwrap();
+                }
+            }
+            mem
+        };
+        let mem = tiled(Dimension::Tex2d, 6, 4);
+        let p = from_texels(&cube, &mem, view_shape(&cube)).unwrap();
+        assert_eq!((p.dim, p.depth, p.mips, p.width, p.row_bytes, p.row_count), (TEX_CUBE, 6, 4, 8, 32, 48));
+        // One face's chain: 64 + 16 + 4 + 1 texels; face 3's mip 2 starts after three chains and two mips.
+        assert_eq!(p.rows.len(), 6 * 85 * 4);
+        let at = (3 * 85 + 64 + 16) * 4;
+        assert_eq!(&p.rows[at..at + 8], &[3, 2, 0, 0, 3, 2, 1, 0]);
+        assert_eq!(&p.rows[5 * 85 * 4..5 * 85 * 4 + 4], &[5, 0, 0, 0]);
+        // The array's slices 1-2 alone; a cube view of fewer than six slices is none.
+        let mem = tiled(Dimension::Tex2d, 4, 1);
+        let p = from_texels(&part, &mem, view_shape(&part)).unwrap();
+        assert_eq!((p.dim, p.depth, p.mips, p.rows.len(), p.rows[0], p.rows[256]), (TEX_2D_ARRAY, 2, 1, 512, 1, 2));
+        assert!(from_texels(&part, &mem, ViewShape { dim: TEX_CUBE, first: 0, count: 6 }).is_none());
+        // As a 2D texture (the pass, `view_texels`): slice 0, as before.
+        let flat = from_texels(&part, &mem, ViewShape { dim: TEX_2D, first: 0, count: 1 }).unwrap();
+        assert_eq!((flat.dim, flat.depth, flat.mips, flat.rows.len(), flat.rows[0]), (TEX_2D, 1, 1, 256, 0));
+        // A volume: mip after mip, each with its depth slices.
+        let vol = view(view::PLACED, 4, 8, 4, 2);
+        let p = from_texels(&vol, &tiled(Dimension::Tex3d, 4, 2), view_shape(&vol)).unwrap();
+        assert_eq!((p.dim, p.depth, p.mips, p.rows.len()), (TEX_3D, 4, 2, (4 * 64 + 2 * 16) * 4));
+        assert_eq!((&p.rows[3 * 256..3 * 256 + 4], &p.rows[4 * 256 + 64..4 * 256 + 68]), (&[3u8, 0, 0, 0][..], &[1u8, 1, 0, 0][..]));
     }
 
     /// A dispatch and the draws that read its range are joined by the
@@ -754,7 +980,7 @@ mod tests {
         let t = xnw_formats::ttpf::Ttpf::read(&mut f, len).unwrap();
         let i = t.textures.iter().position(|t| t.kind == xnw_formats::ttpf::KIND_2D).expect("a 2D texture");
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        let p = from_origin(&format!("{name}#{i}")).expect("decoded");
+        let p = from_origin(&format!("{name}#{i}"), ViewShape { dim: xnw_world::textures::TEX_2D, first: 0, count: 1 }).expect("decoded");
         eprintln!("{name}#{i}: {}x{} format {} {} rows of {} B", p.width, p.height, p.format, p.row_count, p.row_bytes);
         assert!(p.rows.iter().any(|b| *b != 0));
     }

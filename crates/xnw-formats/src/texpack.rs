@@ -417,7 +417,7 @@ pub fn block_align(bytes: u64) -> u64 {
 /// The console layout's slices of `t` as one plain mip chain each, from its
 /// decoded span (2D: the span; array: units gathered; cube: the last, full
 /// copy, faces one after the other; volume: the span).
-fn source_chains(t: &Texture, span: &[u8]) -> Result<(crate::texture::Layout, Vec<Vec<u8>>), String> {
+pub fn source_chains(t: &Texture, span: &[u8]) -> Result<(crate::texture::Layout, Vec<Vec<u8>>), String> {
     let p = ttpf::place(t)?;
     if p.size > t.span {
         return Err(format!("layout {:#x} longer than span {:#x}", p.size, t.span));

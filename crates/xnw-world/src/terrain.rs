@@ -373,6 +373,11 @@ impl TerrainPass {
             let pso = super::pipeline_state_with(device, &root, &vs, &ps, &state, &[]).map_err(e)?;
             let heap: ID3D12DescriptorHeap = device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, NumDescriptors: SLOTS, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, NodeMask: 0 }).map_err(e)?;
             let step = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            // Its table (the heap, bound whole) starts as nulls.
+            {
+                let base = heap.GetCPUDescriptorHandleForHeapStart().ptr;
+                super::textures::null_table(device, &|slot: u32| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: base + (slot * step) as usize }, 0, SLOTS);
+            }
             let opts = TexOptions { mode: TexMode::Off, slots: SLOTS, uploads: 16, upload_bytes: 16 << 20, async_reads: false, frame_ms: 0.0 };
             Ok(TerrainPass { opts: TerrainOptions::default(), root, pso, heap, step, table: TexTable::new(opts, 0), kinds: HashMap::new(), last: TerrainStats::default(), last_kinds: KindCounts::default() })
         }
@@ -444,7 +449,7 @@ impl TerrainPass {
         };
         let step = self.step as usize;
         let cpu = |i: u32| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: base + i as usize * step };
-        self.table.prepare(device, l, &mut slots.into_iter(), &cpu);
+        self.table.prepare(device, l, &mut std::iter::empty(), &mut slots.into_iter(), &cpu);
         let mut k = [0u32; 56];
         k[..16].iter_mut().zip(&vp).for_each(|(d, s)| *d = s.to_bits());
         if let Some(s) = list.sun {

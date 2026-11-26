@@ -15,16 +15,19 @@
 //!   xnw texture-info <ttpf|dir|rpf> [--census] [--list N] [--dump N] [--sample K]  texture page files
 //!   xnw texture-pack <ttpf|dir|rpf> [--out DIR] [--drop-mips N] [--only-trace LOG] [--threads K]  host texture packs
 
+mod ab;
 mod bcpack;
 mod gpucheck;
 mod movie;
 mod packinfo;
 mod detours;
+mod fencewait;
 mod dirtyfilter;
 mod patches;
 mod prebuild;
 mod run;
 mod dwatch;
+mod levers;
 mod watch;
 mod worldahead;
 mod worldprobe;
@@ -33,10 +36,12 @@ mod worldwater;
 mod worldtex;
 mod shaderinfo;
 mod smoke;
+mod stagemeter;
 mod shadermatch;
 mod textureinfo;
 mod texturepack;
 mod texturetrace;
+mod titlemeter;
 mod translate;
 
 use std::collections::BTreeMap;

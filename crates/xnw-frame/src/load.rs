@@ -346,7 +346,9 @@ pub fn sun_of(tc: &[u8]) -> Option<[f32; 8]> {
 /// read is logged once.
 pub fn light_of(tc: &[u8], sky: Option<&xnw_world::Sky>, log: bool) -> xnw_world::lighting::Lighting {
     let floats: Vec<f32> = tc.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
-    let (l, table) = xnw_world::lighting::Lighting::from_timecycle(&floats, sky.map(|s| ([s.zenith[0], s.zenith[1], s.zenith[2]], [s.horizon[0], s.horizon[1], s.horizon[2]])));
+    let sky = sky.map(|s| ([s.zenith[0], s.zenith[1], s.zenith[2]], [s.horizon[0], s.horizon[1], s.horizon[2]]));
+    // `ourlight=on` (LITE1): our own pass's light from the same values.
+    let (l, table) = if xnw_world::ourlight::asked() { xnw_world::lighting::Lighting::ours(&floats, sky) } else { xnw_world::lighting::Lighting::from_timecycle(&floats, sky) };
     static ONCE: std::sync::Once = std::sync::Once::new();
     if log {
         ONCE.call_once(|| {
@@ -462,17 +464,18 @@ pub fn water_tint(sun: Option<[f32; 8]>) -> [f32; 4] {
 /// A live list dumped by [`dump_list`], read back for the pass.
 /// The decoded render state of a draw as one list.tsv field (the replay
 /// draws with the state the live pass used; "-" = our defaults):
-/// depth_enable,depth_write,func,bias,clamp_bits,slope_bits,blend0..7.
+/// depth_enable,depth_write,func,bias,clamp_bits,slope_bits,blend0..7,cull,front_ccw
+/// (the last two since the cull switch: 14 fields read as cull not recorded).
 pub fn rstate_text(s: Option<xnw_world::RenderState>) -> String {
     match s {
         None => "-".into(),
-        Some(s) => format!("{},{},{},{},{:#x},{:#x},{}", u8::from(s.depth_enable), u8::from(s.depth_write), s.depth_func, s.depth_bias, s.bias_clamp, s.slope_bias, s.blend.iter().map(u8::to_string).collect::<Vec<_>>().join(",")),
+        Some(s) => format!("{},{},{},{},{:#x},{:#x},{},{},{}", u8::from(s.depth_enable), u8::from(s.depth_write), s.depth_func, s.depth_bias, s.bias_clamp, s.slope_bias, s.blend.iter().map(u8::to_string).collect::<Vec<_>>().join(","), s.cull, u8::from(s.front_ccw)),
     }
 }
 
 pub fn rstate_parse(v: &str) -> Option<xnw_world::RenderState> {
     let f: Vec<&str> = v.split(',').collect();
-    if f.len() != 14 {
+    if f.len() != 14 && f.len() != 16 {
         return None;
     }
     let n = |i: usize| f[i].trim().parse::<i64>().ok();
@@ -481,7 +484,7 @@ pub fn rstate_parse(v: &str) -> Option<xnw_world::RenderState> {
     for (k, b) in blend.iter_mut().enumerate() {
         *b = n(6 + k)? as u8;
     }
-    Some(xnw_world::RenderState { depth_enable: n(0)? != 0, depth_write: n(1)? != 0, depth_func: n(2)? as u8, depth_bias: n(3)? as i32, bias_clamp: h(4)?, slope_bias: h(5)?, blend })
+    Some(xnw_world::RenderState { depth_enable: n(0)? != 0, depth_write: n(1)? != 0, depth_func: n(2)? as u8, depth_bias: n(3)? as i32, bias_clamp: h(4)?, slope_bias: h(5)?, blend, cull: if f.len() == 16 { n(14)? as u8 } else { 0 }, front_ccw: f.len() == 16 && n(15)? != 0 })
 }
 
 pub fn load_list(fdir: &std::path::Path) -> Result<(FrameList, HashMap<GeomKey, (Vec<u8>, Vec<u32>)>), String> {
@@ -532,7 +535,10 @@ pub fn load_list_with(fdir: &std::path::Path, have: &dyn Fn(&GeomKey) -> bool) -
         let Ok(b) = std::fs::read(fdir.join(format!("pal-{i}.bin"))) else { break };
         list.palettes.push(b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect());
     }
-    if let Ok(b) = std::fs::read(fdir.join("timecycle.bin")) {
+    // `XNW_REPLAY_TIMECYCLE=<file>` (offline, LITE1): another frame's timecycle over
+    // this frame's draws (a sun-on light on a night capture's street).
+    let tc_file = std::env::var_os("XNW_REPLAY_TIMECYCLE").map_or_else(|| fdir.join("timecycle.bin"), std::path::PathBuf::from);
+    if let Ok(b) = std::fs::read(tc_file) {
         list.sun = sun_of(&b);
         list.sky = sky_of(&b);
         list.light = Some(light_of(&b, list.sky.as_ref(), false));
@@ -594,4 +600,21 @@ pub fn load_terrain(fdir: &std::path::Path) -> Option<Terrain> {
     let field = |k: &str| txt.lines().find_map(|l| l.strip_prefix(k)).map(str::trim).and_then(|v| if let Some(h) = v.strip_prefix("0x") { u64::from_str_radix(h, 16).ok() } else { v.parse().ok() });
     let n = (raw.len() / TILE_BYTES) as u32;
     Some(parse(field("cap ").unwrap_or(u64::from(n)) as u32, field("count ").unwrap_or(u64::from(n)) as u32, raw, field("heap_base ").unwrap_or(0)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The state text keeps the cull mode and winding; a 14-field text
+    /// (captures before the cull switch) reads as cull not recorded.
+    #[test]
+    fn rstate_text_keeps_cull() {
+        let s = xnw_world::RenderState { depth_enable: true, depth_write: true, depth_func: 7, depth_bias: -8, bias_clamp: 0, slope_bias: 1.5f32.to_bits(), blend: [0, 2, 1, 1, 2, 1, 1, 15], cull: 3, front_ccw: true };
+        let text = rstate_text(Some(s));
+        assert_eq!(text, "1,1,7,-8,0x0,0x3fc00000,0,2,1,1,2,1,1,15,3,1");
+        assert_eq!(rstate_parse(&text), Some(s));
+        assert_eq!(rstate_parse("1,1,7,0,0x0,0x0,0,2,1,1,2,1,1,15").map(|s| (s.cull, s.front_ccw, s.depth_func)), Some((0, false, 7)));
+        assert_eq!(rstate_parse("-"), None);
+    }
 }

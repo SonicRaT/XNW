@@ -39,8 +39,8 @@ pub const MAX_BATCH: u32 = 65_536;
 pub const OUT_CAP: u32 = 1 << 20;
 /// Batches per frame at most (one thread group each).
 pub const MAX_BATCHES: usize = 65_535;
-/// A batch's descriptor in the frame buffer: 48 dwords.
-const DESC_WORDS: usize = 48;
+/// A batch's descriptor in the frame buffer: 52 dwords (208 B, the shader's `b * 208`).
+const DESC_WORDS: usize = 52;
 /// Bytes of one indirect draw (D3D12_DRAW_INDEXED_ARGUMENTS).
 pub const ARG_BYTES: u32 = 20;
 const NONE: u32 = u32::MAX;
@@ -57,6 +57,10 @@ pub struct Batch {
     pub lod: Option<([f32; 35], u32)>,
     /// The title's hide bitset (instance i hidden when bit i&31 of word i>>5 is set).
     pub hide: Vec<u32>,
+    /// The batch's near fade-in bitset (VEH3;: IcRec+0x20 -> h+0x2F0, the
+    /// culling shader's R+0x34): instance i fades in past its own distance
+    /// ([`near_fade`]) when bit i&31 of word i>>5 is set. Empty: none (R+0x34 = -1).
+    pub near: Vec<u32>,
     /// The draw's camera position; its planes (None: the batch sphere is inside every plane).
     pub origin: [f32; 3],
     pub planes: Option<[[f32; 4]; 5]>,
@@ -102,15 +106,46 @@ pub fn plausible_record(r: &[f32; 16]) -> bool {
 /// is dropped (scale fields, far fade). Draw it iff the slot equals this
 /// call's lod - firstLod.
 pub fn lod_slot(t: &[f32; 35], r: &[f32; 16], d: f32) -> Option<usize> {
+    lod_slot_near(t, r, d, false)
+}
+
+/// The near fade-in of an instance whose bit is set in the batch's near
+/// bitset (CS_Prop_BatchNoCull 0x1ac-0x284, V): a = h * T+0x64 with h
+/// the fp16 in the low half of record dword 15 (+0x3C), b = max(a + T+0x60,
+/// a + 1e-7). Inside the band (d <= b) the fade is clamp((d - a) / (b - a))
+/// and the far fade is not evaluated: Some(kept, i.e. fade > 0). Past it,
+/// None: the far fade decides as for any instance. A car's own far proxy
+/// in a `prop_batch_slod*` batch carries h = 280 (a = 117 m): drawn only past
+/// that distance, never on top of the car (VEH3, pk8a f1030 instance 5).
+pub fn near_fade(t: &[f32; 35], r: &[f32; 16], d: f32) -> Option<bool> {
+    let h = crate::hair::f16(r[15].to_bits() as u16);
+    let a = h * t[25];
+    let b = (a + t[24]).max(a + 1e-7);
+    if d > b {
+        return None;
+    }
+    // NaN (h or T) gives no fade: dropped, as the program's clamp makes it 0.
+    Some((d - a) / (b - a) > 0.0)
+}
+
+/// [`lod_slot`] for an instance flagged (`near`) or not in its batch's near bitset.
+pub fn lod_slot_near(t: &[f32; 35], r: &[f32; 16], d: f32, near: bool) -> Option<usize> {
     // 2. rec_i+0x30 / +0x38.
     if r[12].min(r[14]) <= 0.0 {
         return None;
     }
-    // 3. Far fade T+0x58 {s0, s1}: gone at d >= s1.
-    let (s0, s1) = (t[22], t[23]);
-    let e = s0.min(s1 - 1e-7);
-    if d >= e && (s1 <= e || 1.0 - (d - e) / (s1 - e) <= 0.0) {
-        return None;
+    // 3. Near fade-in (flagged instances inside their band), else the far
+    // fade T+0x58 {s0, s1}: gone at d >= s1.
+    match if near { near_fade(t, r, d) } else { None } {
+        Some(false) => return None,
+        Some(true) => {}
+        None => {
+            let (s0, s1) = (t[22], t[23]);
+            let e = s0.min(s1 - 1e-7);
+            if d >= e && (s1 <= e || 1.0 - (d - e) / (s1 - e) <= 0.0) {
+                return None;
+            }
+        }
     }
     // 4. Slot from the distances T+0x48 (< 0: absent); the last has no upper bound.
     let dd = [t[18], t[19], t[20], t[21]];
@@ -186,7 +221,8 @@ pub fn keeps(b: &Batch, i: usize, r: &[f32; 16]) -> bool {
     }
     let v = [r[3] - b.origin[0], r[7] - b.origin[1], r[11] - b.origin[2]];
     let d = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-    lod_slot(t, r, d) == Some(*slot as usize)
+    let near = b.near.get(i >> 5).is_some_and(|w| w & (1 << (i & 31)) != 0);
+    lod_slot_near(t, r, d, near) == Some(*slot as usize)
 }
 
 /// The CPU reference: a batch's surviving instances as 12-float worlds, in record order.
@@ -220,18 +256,25 @@ bool finite1(float x) { return (asuint(x) & 0x7F800000) != 0x7F800000; }
 // its address points. So the condition picks the address, every load stays
 // inside its buffer (offset 0 is), then the value (HANG1).
 float4 rec4(bool fromFrame, uint a) { float4 f = asfloat(frame.Load4(fromFrame ? a : 0)), k = asfloat(kept.Load4(fromFrame ? 0 : a)); return fromFrame ? f : k; }
-uint dw(uint b, uint k) { return frame.Load(b * 192 + 4 * k); }
+uint dw(uint b, uint k) { return frame.Load(b * 208 + 4 * k); }
 float df(uint b, uint k) { return asfloat(dw(b, k)); }
-float4 d4(uint b, uint k) { return asfloat(frame.Load4(b * 192 + 4 * k)); }
-// lod_slot (gpucull.rs): -1 dropped.
-int lodSlot(uint b, float s, float d) {
+float4 d4(uint b, uint k) { return asfloat(frame.Load4(b * 208 + 4 * k)); }
+// lod_slot_near (gpucull.rs): -1 dropped; flagged: the instance's near fade-in bit, h its fp16.
+int lodSlot(uint b, float s, float d, bool flagged, float h) {
     if (s <= 0) return -1;
-    precise float s0 = df(b, 44), s1 = df(b, 45);
-    precise float e = min(s0, s1 - 1e-7);
-    if (d >= e) {
-        if (s1 <= e) return -1;
-        precise float f = 1.0 - (d - e) / (s1 - e);
-        if (f <= 0) return -1;
+    precise float na = h * df(b, 49);
+    precise float nb = max(na + df(b, 48), na + 1e-7);
+    if (flagged && !(d > nb)) {
+        precise float nf = (d - na) / (nb - na);
+        if (!(nf > 0)) return -1;
+    } else {
+        precise float s0 = df(b, 44), s1 = df(b, 45);
+        precise float e = min(s0, s1 - 1e-7);
+        if (d >= e) {
+            if (s1 <= e) return -1;
+            precise float f = 1.0 - (d - e) / (s1 - e);
+            if (f <= 0) return -1;
+        }
     }
     float4 dd = d4(b, 40);
     int last = dd.w >= 0 ? 3 : dd.z >= 0 ? 2 : dd.y >= 0 ? 1 : 0;
@@ -278,7 +321,11 @@ bool keeps(uint b, uint i, float4 r0, float4 r1, float4 r2, float4 r3, uint flag
     }
     precise float3 v = float3(r0.w - o.x, r1.w - o.y, r2.w - o.z);
     precise float d = sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
-    return lodSlot(b, s, d) == (int)dw(b, 4);
+    // The near words follow the batch's hide words.
+    uint nearWords = dw(b, 47), nearAt = hideAt + 4 * hideWords;
+    uint nearW = frame.Load(nearAt + 4 * (hw < nearWords ? hw : 0));
+    bool flagged = hw < nearWords && ((nearW >> (i & 31)) & 1) != 0;
+    return lodSlot(b, s, d, flagged, f16tof32(asuint(r3.w) & 0xFFFF)) == (int)dw(b, 4);
 }
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
@@ -364,6 +411,10 @@ fn descriptor(b: &Batch, rec_at: u32, from_frame: bool, hide_at: u32, rows: (u32
     d[44] = t[22].to_bits();
     d[45] = t[23].to_bits();
     d[46] = t[17].to_bits();
+    // The near fade-in: its words after the hide words, T+0x60 / T+0x64.
+    d[47] = b.near.len() as u32;
+    d[48] = t[24].to_bits();
+    d[49] = t[25].to_bits();
     d
 }
 
@@ -537,10 +588,10 @@ impl GpuCull {
                 v.push((slot as u32, index_counts.get(slot).copied().unwrap_or(0)));
             }
         }
-        // The frame buffer: descriptors | rows | hide words | per-frame records | newly kept records.
+        // The frame buffer: descriptors | rows | hide and near words | per-frame records | newly kept records.
         let rows_at = (batches.len() * DESC_WORDS * 4).next_multiple_of(64);
         let hide_at = (rows_at + 8 * frame.rows.len()).next_multiple_of(64);
-        let hide_words: usize = batches.iter().map(|b| b.hide.len()).sum();
+        let hide_words: usize = batches.iter().map(|b| b.hide.len() + b.near.len()).sum();
         let recs_at = (hide_at + 4 * hide_words).next_multiple_of(64);
         let frame_recs: u64 = place.at.iter().zip(batches).filter(|(a, _)| a.1).map(|(a, b)| a.0 + (b.records.len() as u64).next_multiple_of(64)).max().unwrap_or(0);
         let new_at = (recs_at as u64 + frame_recs).next_multiple_of(256);
@@ -585,9 +636,12 @@ impl GpuCull {
                 let rows = &by_batch[i];
                 let d = descriptor(b, rec_at as u32, from_frame, hide_next as u32, (row_first, rows.len() as u32));
                 put(i * DESC_WORDS * 4, std::slice::from_raw_parts(d.as_ptr().cast::<u8>(), DESC_WORDS * 4));
-                if !b.hide.is_empty() {
-                    put(hide_next, std::slice::from_raw_parts(b.hide.as_ptr().cast::<u8>(), 4 * b.hide.len()));
-                    hide_next += 4 * b.hide.len();
+                // Hide words, then near words (the shader finds them at hideAt + 4 hideWords).
+                for w in [&b.hide, &b.near] {
+                    if !w.is_empty() {
+                        put(hide_next, std::slice::from_raw_parts(w.as_ptr().cast::<u8>(), 4 * w.len()));
+                        hide_next += 4 * w.len();
+                    }
                 }
                 for &(slot, n) in rows {
                     rows_bytes.extend_from_slice(&slot.to_le_bytes());
@@ -719,6 +773,9 @@ pub fn run(dev: &ID3D12Device, frame: &CullFrame, index_counts: &[u32]) -> Resul
             queue.Signal(&fence, pass_no).map_err(e)?;
             while fence.GetCompletedValue() < pass_no {
                 dev.GetDeviceRemovedReason().map_err(|x| format!("device removed: {}", e(x)))?;
+                if xnw_gpu::gpuwatch::overdue("cull check", sent) {
+                    return Err("cull check: the submission was given up".into());
+                }
                 std::thread::yield_now();
             }
             xnw_gpu::gpuwatch::end("cull check", sent, None);
@@ -823,6 +880,15 @@ mod tests {
         [1.0, 0.0, 0.0, x, 0.0, 1.0, 0.0, y, 0.0, 0.0, 1.0, z, s, 0.0, s, 0.0]
     }
 
+    /// An integer 0..2048 as an IEEE half.
+    fn half(v: f32) -> u16 {
+        if v < 1.0 {
+            return 0;
+        }
+        let e = v.log2().floor() as u32;
+        ((e + 15) << 10 | ((v / (1u32 << e) as f32 - 1.0) * 1024.0) as u32) as u16
+    }
+
     fn block(recs: &[[f32; 16]]) -> Arc<Vec<u8>> {
         Arc::new(recs.iter().flatten().flat_map(|v| v.to_le_bytes()).collect())
     }
@@ -857,6 +923,30 @@ mod tests {
         assert_eq!(cull_cpu(&b1)[10], 30.0);
         let none = Batch { lod: None, hide: Vec::new(), ..b };
         assert_eq!(cull_cpu(&none).len(), 12 * 5, "without a LOD record every sane record draws");
+    }
+
+    /// The near fade-in (VEH3): a flagged instance with h = 280 under
+    /// T+0x60 = 20, T+0x64 = 0.4172 (pk8a f1030's car proxy) is gone at 6.4 m
+    /// and back past a = 116.8 m; unflagged, or h = 0, it draws.
+    #[test]
+    fn near_fade_in() {
+        let mut t = lodrec();
+        (t[19], t[22], t[23], t[24], t[25]) = (-1.0, 1987.0, 2007.0, 20.0, 0.4172);
+        let mut r = rec(0.0, 6.4, 0.0, 1.0);
+        r[15] = f32::from_bits(0x4c00_5c60);
+        assert_eq!(near_fade(&t, &r, 6.4), Some(false));
+        assert_eq!(lod_slot_near(&t, &r, 6.4, true), None, "the proxy on top of its car");
+        assert_eq!(lod_slot_near(&t, &r, 6.4, false), Some(0), "unflagged: the far fade only");
+        assert_eq!(lod_slot_near(&t, &r, 120.0, true), Some(0), "inside the band, fading in");
+        assert_eq!(near_fade(&t, &r, 200.0), None, "past the band: the far fade decides");
+        assert_eq!(lod_slot_near(&t, &r, 2010.0, true), None);
+        let mut z = r;
+        z[15] = f32::from_bits(0x4c00_0000);
+        assert_eq!(lod_slot_near(&t, &z, 6.4, true), Some(0), "h = 0: nothing to fade");
+        let recs = [r, z];
+        let b = Batch { records: block(&recs), len: 2, lod: Some((t, 0)), near: vec![0b11], ..Default::default() };
+        assert_eq!(cull_cpu(&b).len(), 12, "the flagged proxy goes, the h = 0 record stays");
+        assert_eq!(cull_cpu(&Batch { near: Vec::new(), ..b }).len(), 24, "without the bitset both draw (the bug)");
     }
 
     #[test]
@@ -930,6 +1020,76 @@ mod tests {
         assert_eq!(got, 7);
     }
 
+    /// A submission that never ends, given up by its submitter, ends the
+    /// process with code 3 after the grace although the thread that sent it
+    /// then hangs releasing its queue (the software adapter waits there for
+    /// ever: measured on WARP 1.0.22, as were a later submission on the same
+    /// queue never reaching its fence and one on a new queue running at
+    /// once). The child is this test with `XNW_STUCK_CHILD` set.
+    #[test]
+    fn a_stuck_submission_ends_the_process() {
+        if !xnw_gpu::host::device_allowed() {
+            return;
+        }
+        if std::env::var_os("XNW_STUCK_CHILD").is_none() {
+            let t0 = std::time::Instant::now();
+            let mut child = std::process::Command::new(std::env::current_exe().expect("exe"))
+                .args(["gpucull::tests::a_stuck_submission_ends_the_process", "--exact", "--nocapture", "--test-threads=1"])
+                .env("XNW_STUCK_CHILD", "1")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("child");
+            let code = loop {
+                if let Some(st) = child.try_wait().expect("wait") {
+                    break st.code();
+                }
+                if t0.elapsed().as_secs() > 60 {
+                    let _ = child.kill();
+                    panic!("the child was still running after 60 s");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            };
+            assert_eq!(code, Some(3), "after {:.1} s", t0.elapsed().as_secs_f64());
+            return;
+        }
+        let (_gpu, host) = super::super::tests::warp_host();
+        let dev = &host.device;
+        let e = |e: windows::core::Error| e.to_string();
+        // Spins while word 0 of the buffer is 0: for ever.
+        let src = "#define RS \"UAV(u0)\"\nRWByteAddressBuffer o : register(u0);\n[RootSignature(RS)][numthreads(1, 1, 1)] void cs() { uint i = 0; while (o.Load(0) == 0) { i++; } o.Store(4, i); }\n";
+        let cs = super::super::compile_source(src, c"cs", c"cs_5_1").expect("compile");
+        // SAFETY: as in `run`; the child's own objects.
+        unsafe {
+            let bytes = std::slice::from_raw_parts(cs.GetBufferPointer().cast::<u8>(), cs.GetBufferSize());
+            let root: ID3D12RootSignature = dev.CreateRootSignature(0, bytes).map_err(e).expect("root");
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC { pRootSignature: std::mem::transmute_copy(&root), CS: D3D12_SHADER_BYTECODE { pShaderBytecode: cs.GetBufferPointer(), BytecodeLength: cs.GetBufferSize() }, ..Default::default() };
+            let pso: ID3D12PipelineState = dev.CreateComputePipelineState(&desc).map_err(e).expect("pso");
+            let out = buffer(dev, 256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS).expect("out");
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).map_err(e).expect("queue");
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e).expect("fence");
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e).expect("alloc");
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(e).expect("list");
+            list.SetComputeRootSignature(&root);
+            list.SetPipelineState(&pso);
+            list.SetComputeRootUnorderedAccessView(0, out.GetGPUVirtualAddress());
+            list.Dispatch(1, 1, 1);
+            list.Close().map_err(e).expect("close");
+            queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).map_err(e).expect("cast"))]);
+            let sent = xnw_gpu::gpuwatch::begin("test");
+            queue.Signal(&fence, 1).map_err(e).expect("signal");
+            while fence.GetCompletedValue() < 1 && sent.elapsed().as_secs_f64() < 0.5 {
+                std::thread::yield_now();
+            }
+            assert!(fence.GetCompletedValue() < 1, "the dispatch spins");
+            xnw_gpu::gpuwatch::abandon("test", 0.5, std::time::Duration::from_secs(1));
+            // Hangs on WARP 1.0.22: the adapter waits for the queue's work.
+            drop(queue);
+            // An adapter that lets go still has to be ended by the grace.
+            std::thread::sleep(std::time::Duration::from_secs(40));
+        }
+    }
+
     /// The device output equals the reference, instance for instance, on a
     /// made-up frame of mixed batches (WARP unless XNW_ADAPTER says otherwise).
     #[test]
@@ -950,8 +1110,20 @@ mod tests {
             let recs: Vec<[f32; 16]> = (0..n).map(|_| rec(rnd() * 200.0 - 100.0, rnd() * 200.0 - 20.0, rnd() * 10.0, if rnd() < 0.05 { 0.0 } else { 0.5 + rnd() })).collect();
             let hide = if k % 5 == 0 { vec![0xF0F0_F0F0; 4] } else { Vec::new() };
             let planes = (k % 3 != 0).then_some([[0.0, 1.0, 0.0, 0.0], [0.6, 0.8, 0.0, 0.0], far, far, far]);
-            let lod = (k % 7 != 0).then(|| (lodrec(), (k % 3) as u32));
-            let i = f.push(Batch { records: block(&recs), len: n as u32, keep: k % 2 == 0, lod, hide, origin: [rnd(), rnd(), 0.5], planes, out_first: 0 }).unwrap();
+            // Every fourth batch: near fade-in bits, fp16 distances 0-150 in the records, T+0x60/+0x64.
+            let near = if k % 4 == 1 { vec![0xAAAA_AAAA; 40] } else { Vec::new() };
+            let recs: Vec<[f32; 16]> = recs.into_iter().map(|mut r| {
+                if k % 4 == 1 {
+                    r[15] = f32::from_bits(0x4c00_0000 | u32::from(half((rnd() * 150.0).floor())));
+                }
+                r
+            }).collect();
+            let lod = (k % 7 != 0).then(|| {
+                let mut t = lodrec();
+                (t[24], t[25]) = (20.0, 0.5);
+                (t, (k % 3) as u32)
+            });
+            let i = f.push(Batch { records: block(&recs), len: n as u32, keep: k % 2 == 0, lod, hide, near, origin: [rnd(), rnd(), 0.5], planes, out_first: 0 }).unwrap();
             f.rows.push((k as u32, i));
         }
         let counts: Vec<u32> = (0..f.rows.len() as u32).map(|r| 36 + r).collect();

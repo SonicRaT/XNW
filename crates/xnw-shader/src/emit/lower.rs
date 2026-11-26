@@ -10,6 +10,9 @@
 // With DexNom-VIctory (ddb7332), GPL-3.0-or-later: a uniform branch choosing between two immediate samplers.
 // With victory-fork (578d459, GPL-3.0-or-later): computed barycentrics (SV_Barycentrics, attributeAtVertex).
 // With victory-fork (a26859f, and 3bff182 which it gates; GPL-3.0-or-later): first halves of interpolations read as data.
+// With victory-fork (open pull request at 5a55384; GPL-3.0-or-later): 16-bit halves through views of a table move as unsigned integers (`half_views`).
+// With VIctory (open pull request at 39ba8d3, GPL-3.0-or-later): opaque wave64 masks carry both dwords.
+// With VIctory-7900XTX (389db9e, GPL-3.0-or-later): ordered sections (POPS) as rasterizer ordered views (`ordered_section`).
 //! IR to DXIL, one machine instruction at a time (decision 0003).
 //!
 //! Every register dword is an `i32` (SCC an `i1`); float operations bitcast
@@ -58,6 +61,8 @@ pub(crate) struct Lowered {
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
+    /// See [`super::HostShader::half_views`].
+    pub half_views: Vec<(u8, u32)>,
     /// Reads title memory through the address map.
     pub address_map: bool,
     /// Reads descriptor words.
@@ -142,6 +147,64 @@ mod mesh_lower;
 const TWO_PI: f32 = std::f32::consts::TAU;
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
 const GS_ALLOC_REQ: u16 = 9;
+/// `s_sendmsg` id that ends a pixel wave's ordered section.
+const ORDERED_PS_DONE: u16 = 7;
+/// Hardware register (of `s_setreg_b32`) a pixel wave names its packer in
+/// before it waits for the waves it overlaps.
+const POPS_PACKER: u16 = 25;
+/// The operand `src_pops_exiting_wave_id`.
+pub(super) const POPS_EXITING: u8 = 239;
+
+/// VIctory-7900XTX 389db9e: the instructions inside a pixel program's
+/// ordered section (primitive-ordered pixel shading, which the console
+/// compiler makes of rasterizer ordered views): from the write of
+/// `POPS_PACKER`, along every path, to the message that ends the section or
+/// the program's end. The console waits there until the waves holding
+/// earlier primitives' samples of the same pixels have left their sections;
+/// a host's rasterizer ordered views wait by themselves, at their first
+/// access. Empty for a program without such a section.
+fn ordered_section(p: &Program) -> HashSet<Site> {
+    let starts = |i: &Inst| {
+        i.name() == "s_setreg_b32"
+            && matches!(i.fields, Fields::Sop { imm: Some(imm), .. } if imm & 0x3F == POPS_PACKER)
+    };
+    let ends = |i: &Inst| {
+        i.name() == "s_sendmsg"
+            && matches!(i.fields, Fields::Sopp { imm } if imm & 0xF == ORDERED_PS_DONE)
+    };
+    let mut section = HashSet::new();
+    let mut entered = vec![false; p.blocks.len()];
+    let mut work: Vec<Site> = p
+        .blocks
+        .iter()
+        .enumerate()
+        .flat_map(|(b, block)| {
+            (0..block.insts.len())
+                .filter(|&i| starts(&block.insts[i]))
+                .map(move |i| (b, i))
+        })
+        .collect();
+    while let Some((b, from)) = work.pop() {
+        let block = &p.blocks[b];
+        let mut done = false;
+        for i in from..block.insts.len() {
+            if ends(&block.insts[i]) {
+                done = true;
+                break;
+            }
+            section.insert((b, i));
+        }
+        if done {
+            continue;
+        }
+        for (t, next) in p.blocks.iter().enumerate() {
+            if next.preds.contains(&b) && !std::mem::replace(&mut entered[t], true) {
+                work.push((t, 0));
+            }
+        }
+    }
+    section
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Numeric {
@@ -218,6 +281,8 @@ struct Lower<'a> {
     lane_bits: HashMap<Value, V>,
     /// IR phi location by value.
     phi_at: HashMap<Value, (usize, usize)>,
+    /// See [`ordered_section`] (pixel programs).
+    ordered: HashSet<Site>,
     mask_phis: HashMap<Value, V>,
     pending_masks: Vec<(V, usize, usize)>,
     data_phis: Vec<(V, usize, usize)>,
@@ -237,6 +302,11 @@ struct Lower<'a> {
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
+    /// Table descriptors read or written sixteen bits a channel
+    /// ([`super::HostShader::half_views`]): root parameter, dword offset.
+    half_views: std::collections::BTreeSet<(u8, u32)>,
+    /// [`Self::places_read_as_halves`], found before the code is lowered.
+    halves_only: std::collections::BTreeSet<(u8, u32)>,
     /// GPU-side descriptors: per table or heap parameter, the user-data
     /// index of its window view and byte offset (XNW).
     windows: HashMap<usize, u32>,
@@ -516,6 +586,8 @@ mod valu16;
 mod integer;
 mod image;
 mod buffer;
+// Format loads that move 16-bit halves without the d16 form (victory-fork, head 5a55384).
+mod halves;
 mod exit;
 
 #[cfg(test)]
@@ -578,6 +650,43 @@ mod tests {
             pagetable: false,
             barycentrics: false,
         })
+    }
+
+    /// VIctory (39ba8d3's `lower_wave`): a compute program over `layout`
+    /// and `used`, the layout's user SGPRs (at least two), 512 bytes of LDS.
+    fn lower_wave(
+        words: &[u32],
+        layout: Vec<crate::RootParam>,
+        used: Vec<crate::UsedResource>,
+        wave64: bool,
+    ) -> Result<Lowered, crate::ShaderError> {
+        let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
+        let io = StageIo::Cs(ComputeIo { rsrc2: 1 << 15 | sgprs.max(2) << 1, threads: [1, 1, 1] });
+        lower_with(words, HwStage::Cs, wave64, io, layout, used)
+    }
+
+    /// VIctory (open pull request, 39ba8d3, GPL-3.0-or-later).
+    #[test]
+    fn a_wave64_select_on_a_mask_set_by_halves_reads_its_high_dword() {
+        // The mask's dwords come from separate writes: lanes 32-63 test
+        // s11's bits, so programs differing only in s11 differ.
+        let lower_hi = |hi: u32| {
+            let words = [
+                0xBE8A_0380, // s_mov_b32 s10, 0
+                hi,          // s_mov_b32 s11, ...
+                0xD765_0002,
+                0x0001_00C1, // v_mbcnt_lo_u32_b32 v2, -1, 0
+                0xD501_0001,
+                0x0029_8280, // v_cndmask_b32 v1, 0, -1, s[10:11]
+                0xD834_0000,
+                0x0000_0102, // ds_write_b32 v2, v1
+                S_ENDPGM,
+            ];
+            lower_wave(&words, vec![], vec![], true).unwrap().dxil
+        };
+        // s_mov_b32 s11, -1 and s_mov_b32 s11, 0
+        let same = lower_hi(0xBE8B_03C1) == lower_hi(0xBE8B_0380);
+        assert!(!same, "lanes 32-63 tested s10's bits");
     }
 
     /// Whether a synthetic compute program translates with these input registers.

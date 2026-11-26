@@ -58,14 +58,31 @@ impl<'a> Lower<'a> {
                         .copied()
                         .chain(whens)
                         .collect();
-                all.sort_unstable();
-                all.dedup();
-                all.into_iter().any(|g| {
-                    x.st.bools
-                        .support(g)
-                        .iter()
-                        .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
-                }) || insts().any(|i| {
+                // victory-fork (578d459, `lane_constant_masks`): through
+                // lane-mask joins too: an edge that brings a number or a
+                // constant lane set needs the lane's own bit of it.
+                let (mut seen, mut joins) = (HashSet::new(), HashSet::new());
+                let mut constant = false;
+                while let Some(g) = all.pop() {
+                    if !seen.insert(g) {
+                        continue;
+                    }
+                    for a in x.st.bools.support(g) {
+                        match a {
+                            Atom::Opaque(..) | Atom::Constant(_) => constant = true,
+                            Atom::Phi(id) if joins.insert(id) => {
+                                if let Some(edges) = x.st.phi_masks.get(&id) {
+                                    all.extend(edges.iter().copied());
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if constant {
+                        break;
+                    }
+                }
+                constant || insts().any(|i| {
                     matches!(
                         i.name(),
                         "v_cndmask_b32"
@@ -161,6 +178,11 @@ impl<'a> Lower<'a> {
             bools: HashMap::new(),
             lane_bits: HashMap::new(),
             phi_at,
+            ordered: if x.native.stage == HwStage::Ps {
+                super::ordered_section(p)
+            } else {
+                HashSet::new()
+            },
             mask_phis: HashMap::new(),
             pending_masks: Vec::new(),
             data_phis: Vec::new(),
@@ -200,6 +222,8 @@ impl<'a> Lower<'a> {
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
+            half_views: Default::default(),
+            halves_only: Default::default(),
             windows: HashMap::new(),
             buffer_site: None,
             samplers: Vec::new(),
@@ -508,6 +532,9 @@ impl<'a> Lower<'a> {
             Shape::K(k) => return Ok(self.s.m.i32(k)),
             Shape::Value(v) => return self.i32_of(v),
             Shape::Active(op, src, mask, ident) => (op, src, mask, ident, None),
+            Shape::ActiveF64(lo, hi, mask, high) => {
+                return self.active_f64_sum(lo, hi, mask, high);
+            }
             Shape::Masked(src, mask, ident) => {
                 let c = self.cur;
                 let &m = self
@@ -652,9 +679,44 @@ impl<'a> Lower<'a> {
         Ok(if float { self.as_int(r) } else { r })
     }
 
+    /// `WaveActiveSum` of 64-bit floats (`f64(lo, hi)` in active lanes, `+0.0` elsewhere),
+    /// returning the low (`!high`) or high (`high`) 32-bit word. (victory-fork 3bff182,
+    /// VIctory-7900XTX b17b69f and 61e5f79, GPL-3.0-or-later; changed: no wave64-on-32-lane
+    /// exchange step, ours runs the console's wave size.)
+    fn active_f64_sum(&mut self, lo: Value, hi: Value, mask: Value, high: bool) -> Result<V, Why> {
+        if self.mask_data == MaskData::None {
+            return Err("a wave reduction in a mesh shader");
+        }
+        let c = self.cur;
+        let &m = self
+            .x
+            .st
+            .masks
+            .get(&mask)
+            .ok_or("a wave reduction's untracked mask")?;
+        let on = self.boolean(m, c)?;
+        let lo = self.i32_of(lo)?;
+        let hi = self.i32_of(hi)?;
+        let z = self.s.m.i32(0);
+        let lo = self.s.m.select(c, on, lo, z);
+        let hi = self.s.m.select(c, on, hi, z);
+        self.s.flags |= flags::WAVE_OPS | flags::DOUBLES;
+        let f64t = self.s.m.double();
+        let i32t = self.s.t.i32;
+        let split_ty = self.s.m.named_struct("dx.types.splitdouble", vec![i32t, i32t]);
+        let arg = self.s.op(c, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[lo, hi]);
+        let (k0, k0b) = (self.s.m.i8(0), self.s.m.i8(0));
+        let sum = self.s.op(c, "waveActiveOp.f64", Attr::NoUnwind, f64t, 119, &[arg, k0, k0b]);
+        let split = self.s.op(c, "splitDouble.f64", Attr::ReadNone, split_ty, 102, &[sum]);
+        let r_lo = self.s.m.extract(c, split, 0);
+        let r_hi = self.s.m.extract(c, split, 1);
+        Ok(if high { r_hi } else { r_lo })
+    }
+
     pub(super) fn run(mut self) -> Result<Lowered, Stop> {
         let t = std::time::Instant::now();
         let p = self.x.p;
+        self.halves_only = self.places_read_as_halves();
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
             self.rpo[b] = n;
@@ -747,6 +809,7 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
+        let half_views = std::mem::take(&mut self.half_views).into_iter().collect();
         let address_map = self.s.address_map.is_some();
         let descriptor_words = self.s.descriptor_words.is_some();
         let cmp_samplers = self.s.cmp_samplers;
@@ -759,6 +822,7 @@ impl<'a> Lower<'a> {
             root_cbvs,
             root_srvs,
             root_uavs,
+            half_views,
             address_map,
             descriptor_words,
             dxil: {
@@ -801,6 +865,9 @@ impl<'a> Lower<'a> {
                     None if n <= 105 && self.x.io.initialized_sgprs.is_some_and(|k| n >= k) => {
                         Val::I32(self.s.m.i32(0))
                     }
+                    // VIctory-7900XTX 389db9e: no wave overlaps this one
+                    // (see `ordered_section`).
+                    None if self.pops_collision(v) => Val::I32(self.s.m.i32(0)),
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
@@ -814,6 +881,37 @@ impl<'a> Lower<'a> {
             self.vals.insert(v, val);
         }
         Ok(())
+    }
+
+    /// VIctory-7900XTX 389db9e: whether the input SGPR `v` is the POPS
+    /// collision wave id: a program with an ordered section only takes its
+    /// fields apart (bit 31 says that the wave overlaps another, the others
+    /// which packer and waves).
+    pub(super) fn pops_collision(&self, v: Value) -> bool {
+        if self.ordered.is_empty() {
+            return false;
+        }
+        let mut packer = false;
+        for block in &self.x.p.blocks {
+            if block.phis.iter().any(|p| p.args.contains(&v)) {
+                return false;
+            }
+            for i in &block.insts {
+                if !i.reads.iter().any(|r| r.1 == v) {
+                    continue;
+                }
+                let Fields::Sop { src, .. } = &i.fields else {
+                    return false;
+                };
+                match (i.name(), src.get(1)) {
+                    // bits 28 and 29: the packer
+                    ("s_bfe_u32", Some(Operand::Literal(0x0002_001C))) => packer = true,
+                    ("s_bfe_u32" | "s_lshr_b32", _) => {}
+                    _ => return false,
+                }
+            }
+        }
+        packer
     }
 
     pub(super) fn input(&mut self, input: Input) -> Val {

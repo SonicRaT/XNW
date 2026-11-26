@@ -79,7 +79,7 @@ pub fn texels(px: &[[f32; 4]], w: u32, h: u32, format: u32) -> Provided {
     } else {
         (8, px.iter().flat_map(|p| p.map(half).into_iter().flat_map(u16::to_le_bytes)).collect())
     };
-    Provided { width: w, height: h, format, rows, row_bytes: w * bpp, row_count: h, dim: xnw_world::textures::TEX_2D, depth: 1 }
+    Provided { width: w, height: h, format, rows, row_bytes: w * bpp, row_count: h, dim: xnw_world::textures::TEX_2D, depth: 1, mips: 1 }
 }
 
 /// Sink `sink` (a plain draw of `vertices`) through its own vertex and

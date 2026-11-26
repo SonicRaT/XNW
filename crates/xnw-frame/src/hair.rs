@@ -147,18 +147,48 @@ pub fn bridge_cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, size:
     } else {
         None
     };
-    let (draws, c) = strands(&p, chain.as_ref().map(|c| (c.pool_at, &c.pool[..])));
-    println!("{}: {}", dir.display(), c.line());
+    let mut vertex = Vertex::new();
+    let (union, lines, n) = draw_strands(&p, host, size, chain.as_ref(), probe, &mut vertex)?;
+    for l in &lines {
+        println!("{l}");
+    }
+    if let Some(out) = args.iter().position(|a| a == "--out").and_then(|i| args.get(i + 1)) {
+        let rgba: Vec<u8> = union.depth.iter().flat_map(|&z| if z != union.far { [255, 140, 20, 255] } else { [0, 0, 0, 255] }).collect();
+        crate::replay::write_png(Path::new(out), size.0, size.1, &rgba).map_err(|e| e.to_string())?;
+    }
+    println!("hair bridge: {n} strand draws run, {} pixels covered in all", union.covered());
+    Ok(union)
+}
+
+/// Translated strand vertex programs by container hash, with the slots
+/// they name (HAIR6: the live path keeps them across frames).
+pub type Vertex = HashMap<u128, Result<(xnw_world::bridge::Programs, HashMap<(u16, u32), u32>), String>>;
+
+/// Every main-view strand draw of `p` through the title's vertex program on
+/// the bridge's plain-draw mode (one instance per strand of its group, a
+/// triangle strip [I]), depth only, reverse depth, into one union of the
+/// nearest strand per pixel at `size`. `chain`: its pool in place of the
+/// captured one; `probe`: made-up straight strands ([`probe_points`]).
+/// Returns the union, the lines (the census, then one per draw) and the
+/// strand draws. `world-render --hair-bridge` and the live path (HAIR6)
+/// both draw here.
+pub fn draw_strands(p: &Pack, host: &xnw_gpu::host::Host, size: (u32, u32), chain: Option<&crate::hair_chain::Chain>, probe: bool, vertex: &mut Vertex) -> Result<(Strands, Vec<String>, usize), String> {
+    let (draws, c) = strands(p, chain.map(|c| (c.pool_at, &c.pool[..])));
+    let mut lines = vec![format!("{}: {}", p.dir.display(), c.line())];
     let counts = std::sync::Arc::new([const { std::sync::atomic::AtomicU64::new(0) }; 3]);
     let mut texels = p.texel_provider(counts);
     let mut union = Strands { depth: vec![0.0; (size.0 * size.1) as usize], far: 0.0 };
     for s in &draws {
-        let (prog, used, vs) = crate::bridge::vertex_program(&p, s.sink, s.draw.vertices, s.group.strands, true)?;
-        let mut loaded = crate::bridge::load(&p, s.sink, &crate::bridge::Row::default(), None, &used, &mut texels);
+        let vs = crate::bridge::vertex_container(p, s.sink)?;
+        let (prog, used) = match vertex.entry(vs).or_insert_with(|| crate::bridge::vertex_program(p, s.sink, 0, 0, true).map(|(prog, used, _)| (prog, used))) {
+            Ok((prog, used)) => (xnw_world::bridge::Programs { vertex: Some((s.draw.vertices, s.group.strands, true)), ..prog.clone() }, used.clone()),
+            Err(e) => return Err(e.clone()),
+        };
+        let mut loaded = crate::bridge::load(p, s.sink, &crate::bridge::Row::default(), None, &used, &mut texels);
         if probe && let Some(pool) = loaded.slot_bytes_mut(0, hair::POINTS_SLOT) {
             probe_points(s, pool);
         }
-        if let Some(c) = &chain
+        if let Some(c) = chain
             && let Some(pool) = loaded.slot_bytes_mut(0, hair::POINTS_SLOT)
         {
             pool.clone_from(&c.pool);
@@ -167,7 +197,7 @@ pub fn bridge_cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, size:
         let d = loaded.draw();
         let b = xnw_world::bridge::bind(&prog.ms, &prog.ps, &d)?;
         if let Some(gap) = xnw_world::bridge::gap(&host.caps, &prog.needs()) {
-            println!("  sink {}: not run: {gap}", s.sink);
+            lines.push(format!("  sink {}: not run: {gap}", s.sink));
             continue;
         }
         // Reverse depth, as the pass: greater-equal, written.
@@ -185,7 +215,7 @@ pub fn bridge_cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, size:
                 union.depth[i] = if union.depth[i] == f.far { *z } else { union.depth[i].max(*z) };
             }
         }
-        println!(
+        lines.push(format!(
             "  sink {} vs {:032x}: lod {} group {} {} vertices x {} strands on {} in {:.3} s: {n} pixels; vertex constants {:x?}{}",
             s.sink,
             vs,
@@ -197,14 +227,9 @@ pub fn bridge_cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, size:
             f.seconds,
             b.mesh.constants,
             if lacks.is_empty() { String::new() } else { format!("; lacks: {}", lacks.iter().map(|l| l.as_str()).collect::<Vec<_>>().join("; ")) }
-        );
+        ));
     }
-    if let Some(out) = args.iter().position(|a| a == "--out").and_then(|i| args.get(i + 1)) {
-        let rgba: Vec<u8> = union.depth.iter().flat_map(|&z| if z != union.far { [255, 140, 20, 255] } else { [0, 0, 0, 255] }).collect();
-        crate::replay::write_png(Path::new(out), size.0, size.1, &rgba).map_err(|e| e.to_string())?;
-    }
-    println!("hair bridge: {} strand draws run, {} pixels covered in all", draws.len(), union.covered());
-    Ok(union)
+    Ok((union, lines, draws.len()))
 }
 
 /// The strand draws' pixels: per pixel the nearest strand's depth (reverse
@@ -228,6 +253,27 @@ impl Strands {
         let z = self.depth.get(i).copied().unwrap_or(self.far);
         z != self.far && scene.and_then(|s| s.get(i)).is_none_or(|s| z >= *s)
     }
+}
+
+impl Strands {
+    /// The strand pixels as our pass draws them ([`xnw_world::hair::Pixels`]):
+    /// (x, y, depth, 0) per covered pixel of a target `width` wide.
+    pub fn pixels(&self, width: u32) -> xnw_world::hair::Pixels {
+        self.depth.iter().enumerate().filter(|(_, z)| **z != self.far).map(|(i, z)| [(i as u32 % width) as f32, (i as u32 / width) as f32, *z, 0.0]).collect()
+    }
+}
+
+/// HAIR6 `XNW_HAIR_OVERLAY=pass` (replay; default off): the strand pixels
+/// go with the list and our pass draws them under its depth test
+/// (`xnw_world::hair::HairPass`, the live path's), not painted over the
+/// picture read back.
+pub fn overlay_in_pass() -> bool {
+    std::env::var("XNW_HAIR_OVERLAY").is_ok_and(|v| v == "pass")
+}
+
+/// Takes the pending strand pixels (for [`overlay_in_pass`]).
+pub fn take_overlay() -> Option<Strands> {
+    OVERLAY.lock().unwrap_or_else(|e| e.into_inner()).take()
 }
 
 /// The strand pixels `hair=on` paints over the pass's picture (set before the pass draws).

@@ -233,6 +233,9 @@ impl Batch {
                 queue.Signal(&fence, 1).map_err(e)?;
                 while fence.GetCompletedValue() < 1 {
                     dev.GetDeviceRemovedReason().map_err(|x| format!("bridgems uploads: {}", e(x)))?;
+                    if xnw_gpu::gpuwatch::overdue("bridgems uploads", sent) {
+                        return Err("bridgems uploads: the submission was given up".into());
+                    }
                     std::thread::yield_now();
                 }
                 xnw_gpu::gpuwatch::end("bridgems uploads", sent, None);
@@ -347,6 +350,9 @@ pub fn read_depth_on(dev: &ID3D12Device, queue: &ID3D12CommandQueue, depth: &ID3
         queue.Signal(&fence, 1).map_err(e)?;
         while fence.GetCompletedValue() < 1 {
             dev.GetDeviceRemovedReason().map_err(|x| format!("reading the depth target back: {}", e(x)))?;
+            if xnw_gpu::gpuwatch::overdue("bridgems readback", sent) {
+                return Err("reading the depth target back: the submission was given up".into());
+            }
             std::thread::yield_now();
         }
         xnw_gpu::gpuwatch::end("bridgems readback", sent, None);

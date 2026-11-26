@@ -1945,8 +1945,14 @@ impl State {
     /// compute roots.
     fn tap(&self, op: u8, count: u32, args: [u32; 4]) {
         let set = if op == xnw_formats::framepack::op::INDIRECT_DISPATCH { &self.compute } else { &self.graphics };
-        if let Some(f) = super::tap::get() {
+        if let Some(f) = super::tap::get()
+            && (op == xnw_formats::framepack::op::INDIRECT_DISPATCH || super::tap::tap_want().is_none_or(|want| want(self.pipeline)))
+        {
+            // UI1: a Draw or DrawIndexed sink carries its IA views.
+            let ia = matches!(op, xnw_formats::framepack::op::DRAW | xnw_formats::framepack::op::INDEXED).then(|| self.tap_ia());
+            super::tap::set_ia(ia);
             self.tap_roots(f, op, count, [0; 2], args, set);
+            super::tap::set_ia(None);
         }
         if let Some((want, f)) = super::tap::draw_tap()
             && want(self.pipeline)
@@ -1969,6 +1975,18 @@ impl State {
         {
             self.tap_roots(f, xnw_formats::framepack::op::DISPATCH, x, [y, z], [0; 4], &self.compute);
         }
+    }
+
+    /// The bound index view and the first vertex views, for the tap.
+    fn tap_ia(&self) -> super::tap::TapIa {
+        let mut ia = super::tap::TapIa { index: (self.index.address, self.index.size, self.index.format), topology: self.topology, ..Default::default() };
+        for (k, v) in self.vertex.iter().take(super::tap::IA_SLOTS).enumerate() {
+            ia.vertex[k] = (v.address, v.size, v.stride);
+            if v.address != 0 && v.size != 0 {
+                ia.slots |= 1 << k;
+            }
+        }
+        ia
     }
 
     fn tap_roots(&self, f: super::tap::Tap, op: u8, count: u32, yz: [u32; 2], args: [u32; 4], set: &[Root]) {
@@ -2373,7 +2391,11 @@ impl State {
             2 => xnw_formats::framepack::op::INDIRECT_DISPATCH,
             _ => xnw_formats::framepack::op::INDIRECT,
         };
-        self.tap(op, max, [0; 4]);
+        // An indirect dispatch's sink carries where its group counts sit
+        // (the argument record's address, lo and hi, and the stride: the
+        // pack's INDIRECT_ARGS); other indirect ops carry none.
+        let args = if kind == 2 { [arguments as u32, (arguments >> 32) as u32, stride, 0] } else { [0; 4] };
+        self.tap(op, max, args);
         const DRAW: u32 = 0;
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;

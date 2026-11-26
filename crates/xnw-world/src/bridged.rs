@@ -122,6 +122,152 @@ pub struct SrcView {
     pub format: u32,
     /// A buffer view's element size (0: none given).
     pub width: u64,
+    /// A texture view's dimension as the title described it (the D3D12
+    /// shader-resource dimension: 2 1D, 3 1D array, 4 2D, 5 2D array, 8 3D,
+    /// 9 cube, 10 cube array); 0: not given (a resource view's own).
+    pub dim: u32,
+}
+
+/// A 2D view, in [`view_dim`]'s numbers.
+pub const DIM_2D: u8 = 4;
+
+/// The dimension the bridge's view at a texture slot takes for a title
+/// view of dimension `title` ([`SrcView::dim`]): the title's own, among the
+/// kinds translated programs declare. A cube array is read as a cube
+/// (emit's `cube_direction`), multisampled images are refused by the
+/// translator, and a view that names no dimension is taken as 2D.
+/// Why: D3D12 leaves a read through a view of another dimension undefined
+/// and the software adapter does not mind it; pixel program 38110e02
+/// sampled two 256x256x6 cube views through the bridge's 1x1 2D stand-in.
+/// (That program still lost the RX 5700 XT with cube stand-ins bound,
+/// CARD5 c1: this is a rule kept, not that hang's cause.) VIctory 8c26061
+/// (`null_like`): a null view has the dimension of the title's description.
+pub fn view_dim(title: u32) -> u8 {
+    match title {
+        2 | 3 | 5 | 8 | 9 => title as u8,
+        10 => 9,
+        _ => DIM_2D,
+    }
+}
+
+/// The title's view dimension of a texture view ([`SrcView::dim`]) from
+/// its captured words (`TapView`/`SlotView`: the resource description's
+/// 14 words, then the view's): the view's own (`words[15]`); without a
+/// view description the resource's default view, a 2D array when a 2D
+/// resource has slices, 3D for a 3D one. 0: not given. Resource views
+/// carry their words since BUG3 (`tap::view`); an older capture's are
+/// zeros and such a view is taken as 2D.
+pub fn title_dim(kind: u32, words: &[u32; 30]) -> u32 {
+    if kind != view::PLACED && kind != view::TEXTURE {
+        return 0;
+    }
+    match (words[15], words[0]) {
+        (0, 4) => 8,
+        (0, 3) if words[7] & 0xffff > 1 => 5,
+        (d, _) => d,
+    }
+}
+
+/// Whether a texture's view from our table can stand at a slot the
+/// programs read in dimension `dim` ([`view_dim`]): a cube, a 2D array or
+/// a 3D view only where that is the dimension read, and a 2D view not
+/// where one of those is (D3D12 leaves a read through a view of another
+/// dimension undefined; the stand-in of `dim` goes there instead). A cube
+/// array view fits nothing: the translator declares a cube there.
+pub fn view_fits(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC, dim: u8) -> bool {
+    match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE2D => !matches!(dim, 5 | 8 | 9),
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => dim == 5,
+        D3D12_SRV_DIMENSION_TEXTURE3D => dim == 8,
+        D3D12_SRV_DIMENSION_TEXTURECUBE => dim == 9,
+        _ => false,
+    }
+}
+
+/// The texture our table holds for `h` this frame, if its view fits a slot
+/// read in dimension `dim` ([`view_fits`]).
+fn real(texs: &Texs, h: u64, dim: u8) -> Option<&(ID3D12Resource, D3D12_SHADER_RESOURCE_VIEW_DESC)> {
+    texs.get(&h)?.as_ref().filter(|t| view_fits(&t.1, dim))
+}
+
+/// [`view_dim`]'s number for an image instruction's dimension (GFX10 MIMG
+/// `dim`: 0 1D, 1 2D, 2 3D, 3 cube, 4 1D array, 5 2D array, 6 and 7
+/// multisampled), as emit's lowering declares the handle.
+pub fn read_dim(mimg: u8) -> u8 {
+    match mimg & 7 {
+        0 => 2,
+        2 => 8,
+        3 => 9,
+        4 => 3,
+        5 => 5,
+        _ => DIM_2D,
+    }
+}
+
+/// The names of [`view_dim`]'s dimensions, for the statistics.
+pub const DIMS: [(u8, &str); 6] = [(4, "2D"), (5, "2D array"), (9, "cube"), (8, "3D"), (2, "1D"), (3, "1D array")];
+
+/// The description of a one-texel RGBA8 view of dimension `dim`
+/// ([`view_dim`]): a stand-in over the texture of that shape, or a null.
+pub fn one_texel_view(dim: u8) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
+    let (d, a) = match dim {
+        2 => (D3D12_SRV_DIMENSION_TEXTURE1D, D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture1D: D3D12_TEX1D_SRV { MipLevels: 1, ..Default::default() } }),
+        3 => (D3D12_SRV_DIMENSION_TEXTURE1DARRAY, D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture1DArray: D3D12_TEX1D_ARRAY_SRV { MipLevels: 1, ArraySize: 1, ..Default::default() } }),
+        5 => (D3D12_SRV_DIMENSION_TEXTURE2DARRAY, D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2DArray: D3D12_TEX2D_ARRAY_SRV { MipLevels: 1, ArraySize: 1, ..Default::default() } }),
+        8 => (D3D12_SRV_DIMENSION_TEXTURE3D, D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture3D: D3D12_TEX3D_SRV { MipLevels: 1, ..Default::default() } }),
+        9 => (D3D12_SRV_DIMENSION_TEXTURECUBE, D3D12_SHADER_RESOURCE_VIEW_DESC_0 { TextureCube: D3D12_TEXCUBE_SRV { MipLevels: 1, ..Default::default() } }),
+        _ => (D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() } }),
+    };
+    D3D12_SHADER_RESOURCE_VIEW_DESC { Format: DXGI_FORMAT_R8G8B8A8_UNORM, ViewDimension: d, Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, Anonymous: a }
+}
+
+/// The table slots the pair's programs read as images at a fixed place,
+/// with the dimension each is declared in ([`read_dim`]): (root, slot,
+/// dimension). A slot read in two dimensions keeps the one that is not 2D.
+/// Reads through a computed heap index are not here: those views take the
+/// title's own dimension ([`Owned::dims`]).
+pub fn image_reads(containers: &[&[u8]]) -> Vec<(u16, u32, u8)> {
+    let mut out: Vec<(u16, u32, u8)> = Vec::new();
+    for c in containers {
+        for u in super::compute::uses(c).unwrap_or_default() {
+            let Some(i) = u.image else { continue };
+            let (root, dim) = (u16::from(u.root), read_dim(i.dim));
+            match out.iter_mut().find(|o| o.0 == root && o.1 == u.slot) {
+                Some(o) if o.2 == DIM_2D => o.2 = dim,
+                Some(_) => {}
+                None => out.push((root, u.slot, dim)),
+            }
+        }
+    }
+    out
+}
+
+/// The dimensions the containers' programs read images in anywhere, table
+/// slots and computed heap indices alike: bit [`read_dim`] of every image
+/// instruction (0: none decoded). A title view of a dimension none of the
+/// pair's programs reads is not read in that dimension, so its stand-in
+/// stays 2D ([`Lay::stand_in_dim`]): pk6 f1205 row 1401's word 1 is a 1D
+/// view of the title's (1024x1) that 38110e02 has no 1D instruction for.
+pub fn dims_read(containers: &[&[u8]]) -> u16 {
+    let mut mask = 0u16;
+    for c in containers {
+        let Ok(parsed) = xnw_shader::Container::parse(c) else { continue };
+        let Some(part) = parsed.part(xnw_shader::FourCC::DXIL) else { continue };
+        for p in xnw_shader::native_programs(part.data).unwrap_or_default() {
+            for inst in xnw_shader::gfx10::decode(&p.patched_code()).unwrap_or_default() {
+                if let xnw_shader::gfx10::Fields::Image { dim, .. } = inst.fields(p.wave64) {
+                    mask |= 1 << read_dim(dim);
+                }
+            }
+        }
+    }
+    mask
+}
+
+/// [`dims_read`]'s mask in words ("2D, 2D array, cube").
+pub fn dims_text(mask: u16) -> String {
+    let d: Vec<&str> = DIMS.iter().filter(|d| mask & 1 << d.0 != 0).map(|d| d.1).collect();
+    if d.is_empty() { "no images".into() } else { d.join(", ") }
 }
 
 /// A root argument as a source has it.
@@ -172,6 +318,17 @@ pub enum ORoot {
 /// The (mesh, pixel) container hashes of a pipeline.
 pub type Key = (u128, u128);
 
+/// The title's pixel output our colour target takes: 0 (its first
+/// target, the albedo of a G-buffer program); `XNW_BRIDGE_TARGET=<1-7>`
+/// shows another one instead (a lab view: the normal, material and
+/// emissive targets, where array and cube texels land, BUG3). The
+/// targets before it are bound null; a program without that target is
+/// refused.
+pub fn shown_target() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("XNW_BRIDGE_TARGET").ok().and_then(|v| v.trim().parse::<u32>().ok()).map_or(0, |n| n.min(7)))
+}
+
 /// One draw's binding inputs ([`take`]).
 #[derive(Clone, Debug, Default)]
 pub struct Owned {
@@ -179,6 +336,10 @@ pub struct Owned {
     pub roots: Vec<ORoot>,
     /// Textures the draw words name: (word k, handle).
     pub heap: Vec<(u32, u64)>,
+    /// Textures (table slots and draw words) whose title view is not 2D:
+    /// (handle, [`view_dim`]). The stand-in at such a slot has that
+    /// dimension.
+    pub dims: Vec<(u64, u8)>,
     /// The rewritten words and their byte offset in the title's slot 86.
     pub words: [u32; WORDS],
     pub words_at: u32,
@@ -193,10 +354,28 @@ pub struct Owned {
     /// Title address of each buffer input, by its bytes' address (the
     /// `Arc`'s data): `XNW_ZEROCOPY=on` binds it there in place (ZC1).
     pub addrs: Vec<(usize, u64)>,
+    /// The draw's identity across frames ([`ident`]; 0: none, the replay).
+    pub ident: u64,
+    /// The title's blend of target 0 for this draw (`RenderState::blend`;
+    /// zeros: none), applied as our own draws apply it.
+    pub blend: [u8; 8],
+}
+
+/// A draw's identity across frames from its list row's own record: its
+/// geometry (meshlet data, vertex buffer, the geometry's hash word) and
+/// its pass stage. [`Gpu::record`] adds the pipeline and the draw's
+/// occurrence among the frame's draws of one identity (instances of one
+/// geometry in one pass, in list order); never 0.
+pub fn ident(g: &super::GeomKey, stage: u32) -> u64 {
+    let mut h = Fx::default();
+    for w in [g.mesh_at, g.mesh_len, g.vb_at, g.vb_len, g.ib, g.hash, u64::from(stage)] {
+        std::hash::Hasher::write_u64(&mut h, w);
+    }
+    std::hash::Hasher::finish(&h) | 1
 }
 
 /// What [`Owned::lacks`] counts, by bit.
-pub const LACKS: [&str; 9] = ["no draw words", "a word below the heap bound naming no view", "a named constant buffer without bytes (zeros)", "a named view without bytes", "no samplers (defaults)", "a root view without bytes", "no group count", "a texture read as a buffer (dropped)", "a buffer read as an image (dropped)"];
+pub const LACKS: [&str; 10] = ["no draw words", "a word below the heap bound naming no view", "a named constant buffer without bytes (zeros)", "a named view without bytes", "no samplers (defaults)", "a root view without bytes", "no group count", "a texture read as a buffer (dropped)", "a buffer read as an image (dropped)", "a texture's slot read as a constant buffer"];
 
 impl Owned {
     /// The group count from the meshlet buffer at `mesh_at` (CPU or GPU address).
@@ -285,7 +464,18 @@ pub fn take(src: &dyn Source, key: Key, used: &Used) -> Owned {
                         // A texture read through a buffer descriptor gives the
                         // hardware a wild address (victory-fork 3c81420): the row is dropped.
                         view::TEXTURE | view::PLACED if stride != NAMED_IMAGE && stride != NAMED_CBV => out.lacks |= 1 << 7,
-                        view::TEXTURE | view::PLACED => slots.push((slot, OSlot::Texture(handle + 32 * u64::from(slot)))),
+                        // HANG2: a slot one program reads as a constant buffer
+                        // (`NAMED_CBV` wins the merge in `named`) holding a texture:
+                        // the CBV loads read the texture's descriptor (counted).
+                        view::TEXTURE | view::PLACED => {
+                            if stride == NAMED_CBV {
+                                out.lacks |= 1 << 9;
+                            }
+                            if view_dim(v.dim) != DIM_2D {
+                                out.dims.push((handle + 32 * u64::from(slot), view_dim(v.dim)));
+                            }
+                            slots.push((slot, OSlot::Texture(handle + 32 * u64::from(slot))));
+                        }
                         _ => {}
                     }
                 }
@@ -312,6 +502,9 @@ pub fn take(src: &dyn Source, key: Key, used: &Used) -> Owned {
                     Some((h, v)) if v.kind == view::TEXTURE || v.kind == view::PLACED => {
                         out.words[k] = k as u32;
                         out.heap.push((k as u32, h));
+                        if view_dim(v.dim) != DIM_2D {
+                            out.dims.push((h, view_dim(v.dim)));
+                        }
                     }
                     Some(_) => {}
                     // A value past every heap bound is the material's data, not
@@ -407,6 +600,10 @@ pub struct Built {
     gpso: ID3D12PipelineState,
     cp: Params,
     gp: Params,
+    /// The pixel pipeline per title blend ([`blend_ok`]), made at its first row.
+    blended: std::sync::Mutex<HashMap<[u8; 8], ID3D12PipelineState>>,
+    /// The pass-through vertex program (for those pipelines).
+    vs: Vec<u8>,
     /// The pair's table layout ([`Lay`]).
     pub lay: Lay,
     /// Milliseconds the translation and the pipelines took.
@@ -423,42 +620,85 @@ unsafe impl Sync for Built {}
 /// target (RGBA8; its other targets dropped) and depth (GREATER_EQUAL, no write).
 pub fn build(dev: &ID3D12Device, caps: &xnw_gpu::host::Caps, msc: &[u8], psc: &[u8]) -> Result<Built, String> {
     let t0 = std::time::Instant::now();
+    // Card safety first: a program that hung the card gets no pipeline there.
+    if let Some(why) = bridge::denied(xnw_core::hash128(&[psc]), caps.software) {
+        return Err(why);
+    }
     let (p, used) = translate(msc, psc)?;
     if let Some(gap) = bridge::gap(caps, &p.needs()) {
         return Err(gap);
     }
-    if bridge::targets(&p.ps.dxil).first().copied() != Some((0, DXGI_FORMAT_R32G32B32A32_FLOAT.0)) {
-        return Err("the pixel program's target 0 is not a float target".into());
+    let target = shown_target();
+    if !bridge::targets(&p.ps.dxil).contains(&(target, DXGI_FORMAT_R32G32B32A32_FLOAT.0)) {
+        return Err(format!("the pixel program's target {target} is not a float target"));
     }
     let eh = emit::host::Host::from_device(dev.clone());
     use emit::mesh::{INDEX_REGISTER, RECORD_REGISTER};
     let croot = eh.root_signature_records(&[(&p.ms, D3D12_SHADER_VISIBILITY_ALL)], &[(true, RECORD_REGISTER), (true, INDEX_REGISTER), (false, RECORD_REGISTER)])?;
     let cpso = eh.compute_pipeline_with(&croot, &p.ms.dxil).map_err(|x| format!("compute pipeline: {x}"))?;
-    let vs = HostShader { stage: HwStage::Vs, dxil: p.vs.clone(), user_data: Vec::new(), samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: Vec::new(), root_srvs: Vec::new(), root_uavs: Vec::new(), address_map: false, descriptor_words: false };
+    let vs = HostShader { stage: HwStage::Vs, dxil: p.vs.clone(), user_data: Vec::new(), samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: Vec::new(), root_srvs: Vec::new(), root_uavs: Vec::new(), half_views: Vec::new(), address_map: false, descriptor_words: false };
     let gstages = [(&vs, D3D12_SHADER_VISIBILITY_VERTEX), (&p.ps, D3D12_SHADER_VISIBILITY_PIXEL)];
     let groot = eh.root_signature_records(&gstages, &[(false, RECORD_REGISTER)])?;
     let (cp, gp) = (bridge::params(&[&p.ms], 3), bridge::params(&[&vs, &p.ps], 1));
+    let gpso = graphics(dev, &groot, &p.vs, &p.ps.dxil, [0; 8])?;
+    let lay = Lay::new(&p, &used, &image_reads(&[msc, psc]), dims_read(&[msc, psc]));
+    let vs = p.vs.clone();
+    Ok(Built { programs: p, used, croot, cpso, groot, gpso, cp, gp, blended: Default::default(), vs, lay, ms: t0.elapsed().as_secs_f64() * 1e3 })
+}
+
+/// A title blend of target 0 our pipelines take: enabled, factors and
+/// operations in D3D12's ranges (the rule of our own draws' state pipelines).
+pub fn blend_ok(b: [u8; 8]) -> bool {
+    b[0] != 0 && [b[1], b[2], b[4], b[5]].iter().all(|v| (1..=19).contains(v)) && [b[3], b[6]].iter().all(|v| (1..=5).contains(v))
+}
+
+impl Built {
+    /// The pixel pipeline for a row with title blend `b` (made once per blend).
+    fn pixel_pipeline(&self, dev: &ID3D12Device, b: [u8; 8]) -> Result<ID3D12PipelineState, String> {
+        if !blend_ok(b) {
+            return Ok(self.gpso.clone());
+        }
+        let mut m = self.blended.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(p) = m.get(&b) {
+            return Ok(p.clone());
+        }
+        let p = graphics(dev, &self.groot, &self.vs, &self.programs.ps.dxil, b)?;
+        m.insert(b, p.clone());
+        Ok(p)
+    }
+}
+
+/// The pass-through vertex program and pixel program `ps` into our colour
+/// target and depth (GREATER_EQUAL, no write); with a title blend
+/// ([`blend_ok`]) its factors, operations and write mask on target 0, as
+/// `pipeline_state_with` applies them to our own draws.
+fn graphics(dev: &ID3D12Device, groot: &ID3D12RootSignature, vs: &[u8], ps: &[u8], b: [u8; 8]) -> Result<ID3D12PipelineState, String> {
     // SAFETY: a description whose pointers outlive the call.
-    let gpso = unsafe {
+    unsafe {
         let mut g = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
-            pRootSignature: std::mem::transmute_copy(&groot),
-            VS: D3D12_SHADER_BYTECODE { pShaderBytecode: p.vs.as_ptr().cast(), BytecodeLength: p.vs.len() },
-            PS: D3D12_SHADER_BYTECODE { pShaderBytecode: p.ps.dxil.as_ptr().cast(), BytecodeLength: p.ps.dxil.len() },
+            pRootSignature: std::mem::transmute_copy(groot),
+            VS: D3D12_SHADER_BYTECODE { pShaderBytecode: vs.as_ptr().cast(), BytecodeLength: vs.len() },
+            PS: D3D12_SHADER_BYTECODE { pShaderBytecode: ps.as_ptr().cast(), BytecodeLength: ps.len() },
             SampleMask: u32::MAX,
             RasterizerState: D3D12_RASTERIZER_DESC { FillMode: D3D12_FILL_MODE_SOLID, CullMode: D3D12_CULL_MODE_NONE, DepthClipEnable: true.into(), ..Default::default() },
             DepthStencilState: D3D12_DEPTH_STENCIL_DESC { DepthEnable: true.into(), DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO, DepthFunc: D3D12_COMPARISON_FUNC_GREATER_EQUAL, ..Default::default() },
             PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
-            NumRenderTargets: 1,
+            NumRenderTargets: shown_target() + 1,
             DSVFormat: DXGI_FORMAT_D32_FLOAT,
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             ..Default::default()
         };
-        g.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
-        g.RTVFormats[0] = bridge::INTO_COLOUR;
-        dev.CreateGraphicsPipelineState::<ID3D12PipelineState>(&g).map_err(|x| format!("graphics pipeline: {}", x.message()))?
-    };
-    let lay = Lay::new(&p, &used);
-    Ok(Built { programs: p, used, croot, cpso, groot, gpso, cp, gp, lay, ms: t0.elapsed().as_secs_f64() * 1e3 })
+        let rt = &mut g.BlendState.RenderTarget[0];
+        rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+        if blend_ok(b) {
+            rt.RenderTargetWriteMask = b[7] & 0xF;
+            rt.BlendEnable = true.into();
+            (rt.SrcBlend, rt.DestBlend, rt.BlendOp) = (D3D12_BLEND(i32::from(b[1])), D3D12_BLEND(i32::from(b[2])), D3D12_BLEND_OP(i32::from(b[3])));
+            (rt.SrcBlendAlpha, rt.DestBlendAlpha, rt.BlendOpAlpha) = (D3D12_BLEND(i32::from(b[4])), D3D12_BLEND(i32::from(b[5])), D3D12_BLEND_OP(i32::from(b[6])));
+        }
+        g.RTVFormats[shown_target() as usize] = bridge::INTO_COLOUR;
+        dev.CreateGraphicsPipelineState::<ID3D12PipelineState>(&g).map_err(|x| format!("graphics pipeline: {}", x.message()))
+    }
 }
 
 enum Entry {
@@ -515,7 +755,7 @@ impl Cache {
             let d = d;
             let e = match build(&d.0, &d.1, &msc, &psc) {
                 Ok(b) => {
-                    xnw_core::info!("bridgeps: pipelines of pixel program {:08x} (mesh {:08x}) made in {:.0} ms", (key.1 >> 96) as u32, (key.0 >> 96) as u32, b.ms);
+                    xnw_core::info!("bridgeps: pipelines of pixel program {:08x} (mesh {:08x}) made in {:.0} ms; the pair reads images as {}", (key.1 >> 96) as u32, (key.0 >> 96) as u32, b.ms, dims_text(b.lay.dims_read));
                     Entry::Ready(Arc::new(b))
                 }
                 Err(e) => {
@@ -562,6 +802,10 @@ pub struct Stats {
     pub grey: u32,
     /// The grey ones by our texture table's reason ([`super::textures::FLAT_REASONS`]).
     pub grey_why: [u32; 7],
+    /// The grey ones by the dimension of their view ([`DIMS`]' order).
+    pub grey_dims: [u32; 6],
+    /// Of `textures`, those bound through a cube, a 2D array or a 3D view.
+    pub shaped: u32,
     /// Buffers uploaded this frame and their bytes (each distinct buffer once).
     pub buffers: u32,
     pub bytes: u64,
@@ -594,6 +838,75 @@ pub struct Stats {
     /// [`small_on`]: small inputs placed, made this frame, bytes made.
     pub small: [u32; 2],
     pub small_bytes: u64,
+    /// [`steady_on`]: inputs at their draw's own slot, of them rewritten, bytes written.
+    pub steady: [u32; 2],
+    pub steady_bytes: u64,
+    /// The small inputs' buffer: its end and size.
+    pub small_end: [u64; 2],
+    /// The bindings part: [`bridge::bind_at`], placing the inputs (milliseconds).
+    pub bind_ms: [f64; 2],
+    /// Rows drawn with their title blend ([`blend_ok`]).
+    pub blended: u32,
+    /// Rows whose title blend is on but not one our pipelines take (drawn
+    /// without it), and the frame's distinct title blends with their rows (8 at most).
+    pub blend_refused: u32,
+    pub blends: Vec<([u8; 8], u32)>,
+}
+
+impl Stats {
+    /// Adds a later [`Gpu::record`]'s counts of the same frame (the pass's
+    /// `chunk`: the rows in several records): counts and times sum;
+    /// the view heap slots and kept bytes are the largest; the first
+    /// refusal's reason stays.
+    pub fn add(&mut self, o: &Stats) {
+        if self.why.is_empty() {
+            self.why.clone_from(&o.why);
+        }
+        self.drawn += o.drawn;
+        self.blended += o.blended;
+        self.blend_refused += o.blend_refused;
+        for (b, k) in &o.blends {
+            match self.blends.iter().position(|x| x.0 == *b) {
+                Some(i) => self.blends[i].1 += k,
+                None if self.blends.len() < 8 => self.blends.push((*b, *k)),
+                None => {}
+            }
+        }
+        self.no_pipeline += o.no_pipeline;
+        self.refused += o.refused;
+        self.textures += o.textures;
+        self.grey += o.grey;
+        self.shaped += o.shaped;
+        for (a, b) in self.grey_dims.iter_mut().zip(o.grey_dims) {
+            *a += b;
+        }
+        self.buffers += o.buffers;
+        self.bytes += o.bytes;
+        self.kept = self.kept.max(o.kept);
+        self.kept_new += o.kept_new;
+        self.in_place += o.in_place;
+        self.in_place_bytes += o.in_place_bytes;
+        self.slots = self.slots.max(o.slots);
+        self.ms += o.ms;
+        self.flushes += o.flushes;
+        self.uncut += o.uncut;
+        self.small_bytes += o.small_bytes;
+        let sum = |a: &mut [u32], b: &[u32]| a.iter_mut().zip(b).for_each(|(x, y)| *x += y);
+        sum(&mut self.grey_why, &o.grey_why);
+        sum(&mut self.writes, &o.writes);
+        sum(&mut self.blocks, &o.blocks);
+        sum(&mut self.block_slots, &o.block_slots);
+        sum(&mut self.small, &o.small);
+        let sumf = |a: &mut [f64], b: &[f64]| a.iter_mut().zip(b).for_each(|(x, y)| *x += y);
+        sumf(&mut self.parts, &o.parts);
+        sumf(&mut self.view_ms, &o.view_ms);
+        for (r, c) in &o.by_root {
+            match self.by_root.iter_mut().find(|x| x.0 == *r) {
+                Some(x) => sum(&mut x.1, c),
+                None => self.by_root.push((*r, *c)),
+            }
+        }
+    }
 }
 
 /// [`Stats::writes`]: typed nulls copied (slots), guards, null images,
@@ -628,9 +941,54 @@ pub struct Target<'a> {
     pub flat: &'a dyn Fn(u64) -> usize,
     /// A 1x1 texture in a shader-resource state (the grey stand-in).
     pub grey: &'a ID3D12Resource,
+    /// The grey stand-ins of the other shapes, each one texel a slice, in a
+    /// shader-resource state: six slices (cube views), a 3D and a 1D
+    /// texture. A 2D array view is a view of `grey`.
+    pub grey_shapes: [&'a ID3D12Resource; 3],
     /// The words buffer (upload memory), its bytes and its mapping: each
     /// drawn row's words are written there at the row's offset.
     pub words: (&'a ID3D12Resource, u64, *mut u8),
+}
+
+/// A grey texture (128, 128, 128, 255) of one texel a slice in the shape a
+/// stand-in of dimension `dim` ([`view_dim`]) views: six slices for a cube
+/// (9), a 3D texture (8), a 1D texture (2, 3), else one 2D texel. Filled
+/// on the open list `l` and left in a shader-resource state; the second
+/// resource is its upload, which the caller keeps until the list has run.
+pub fn grey_texture(dev: &ID3D12Device, l: &ID3D12GraphicsCommandList, dim: u8) -> Result<(ID3D12Resource, ID3D12Resource), String> {
+    let e = |x: windows::core::Error| x.message().to_string();
+    let (dimension, slices) = match dim {
+        9 => (D3D12_RESOURCE_DIMENSION_TEXTURE2D, 6u16),
+        8 => (D3D12_RESOURCE_DIMENSION_TEXTURE3D, 1),
+        2 | 3 => (D3D12_RESOURCE_DIMENSION_TEXTURE1D, 1),
+        _ => (D3D12_RESOURCE_DIMENSION_TEXTURE2D, 1),
+    };
+    let desc = D3D12_RESOURCE_DESC { Dimension: dimension, Width: 1, Height: 1, DepthOrArraySize: slices, MipLevels: 1, Format: DXGI_FORMAT_R8G8B8A8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() };
+    let bdesc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: 256, Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default() };
+    // SAFETY: our device and open list; the descriptions outlive the calls,
+    // four bytes are written into the 256-byte upload's mapping.
+    unsafe {
+        let mut t: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut t).map_err(e)?;
+        let t = t.ok_or("no grey texture")?;
+        let mut up: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &bdesc, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut up).map_err(e)?;
+        let up = up.ok_or("no grey upload")?;
+        let mut at = std::ptr::null_mut();
+        up.Map(0, None, Some(&mut at)).map_err(e)?;
+        std::ptr::copy_nonoverlapping([128u8, 128, 128, 255].as_ptr(), at.cast::<u8>(), 4);
+        up.Unmap(0, None);
+        let fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: 0, Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: DXGI_FORMAT_R8G8B8A8_UNORM, Width: 1, Height: 1, Depth: 1, RowPitch: 256 } };
+        for slice in 0..u32::from(slices) {
+            let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::ManuallyDrop::new(Some(t.clone())), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: slice } };
+            let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::ManuallyDrop::new(Some(up.clone())), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
+            l.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+            drop(std::mem::ManuallyDrop::into_inner(dst.pResource));
+            drop(std::mem::ManuallyDrop::into_inner(src.pResource));
+        }
+        l.ResourceBarrier(&[transition(&t, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)]);
+        Ok((t, up))
+    }
 }
 
 fn transition(r: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_BARRIER {
@@ -792,6 +1150,66 @@ pub struct Small {
     pub placed: u32,
     pub made: u32,
     pub made_bytes: u64,
+    /// [`steady_on`]: inputs by draw identity ([`IdKey`]).
+    ids: HashMap<IdKey, IdEnt, std::hash::BuildHasherDefault<Fx>>,
+    /// This frame: inputs at their draw's slot, of them rewritten, bytes written there.
+    pub id_placed: u32,
+    pub id_written: u32,
+    pub id_bytes: u64,
+}
+
+/// One input of a draw known across frames: the draw's identity
+/// ([`Owned::ident`]), its pipeline, its occurrence in the frame (draws
+/// of one identity in list order), the input (a table view's slot in the
+/// row; root views `1 << 24 | parameter`, the pixel stage's `2 << 24 | ..`).
+pub type IdKey = (u64, Key, u32, u32);
+
+/// [`Small::place_steady`]'s entry: the bytes last placed (a CPU copy:
+/// the upload buffer is write-combined), their padded size and unit, the
+/// draw's own slot ([offset, capacity, alignment]), the last frame used.
+struct IdEnt {
+    shadow: Box<[u8]>,
+    size: u64,
+    unit: u64,
+    slot: [u64; 3],
+    last: u64,
+}
+
+/// Frames an input by draw identity stays unused before its slot is freed.
+const ID_FRAMES: u64 = 8;
+
+/// `XNW_BRIDGE_STEADY` (default on with [`small_on`]; `off`: by content
+/// only, as): the small inputs of a draw known across frames
+/// ([`Owned::ident`]) lie in slots of their own in [`Small`]'s buffer,
+/// kept while the draw lasts; each frame only the bytes that changed are
+/// written there and the descriptors stay the same, so the draw's table
+/// blocks are the same blocks on every frame (its per-draw constants
+/// change bytes and title address every frame: by content or address
+/// they made a new mesh-table block a frame). Rows handing over the same
+/// bytes (one frame table) share the first row's place.
+pub fn steady_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| small_on() && !matches!(std::env::var("XNW_BRIDGE_STEADY").as_deref(), Ok("off" | "0")))
+}
+
+/// `XNW_ZEROCOPY_CBV=on` (default off; with `XNW_ZEROCOPY=on`): constant
+/// buffers in title memory are bound in place too (ZC2 kept them as
+/// copies: hot data, every lane reads them).
+pub fn zc_cbv_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("XNW_ZEROCOPY_CBV").as_deref(), Ok("on" | "1")))
+}
+
+/// The first and one past the last 64-byte piece where `a` and `b` (one length) differ.
+fn changed(a: &[u8], b: &[u8]) -> Option<std::ops::Range<usize>> {
+    if a == b {
+        return None;
+    }
+    let n = a.len();
+    let piece = |i: usize| a[i..(i + 64).min(n)] != b[i..(i + 64).min(n)];
+    let first = (0..n).step_by(64).find(|&i| piece(i))?;
+    let last = (0..n).step_by(64).rev().find(|&i| piece(i))?;
+    Some(first..(last + 64).min(n))
 }
 
 impl Small {
@@ -809,7 +1227,15 @@ impl Small {
             });
             !v.is_empty()
         });
+        self.ids.retain(|_, e| {
+            let keep = e.last + ID_FRAMES >= f;
+            if !keep {
+                free.entry((e.slot[1], e.slot[2])).or_default().push(e.slot[0]);
+            }
+            keep
+        });
         (self.placed, self.made, self.made_bytes) = (0, 0, 0);
+        (self.id_placed, self.id_written, self.id_bytes) = (0, 0, 0);
     }
 
     /// Starts again empty with `size` bytes (the caller makes the new buffer).
@@ -817,34 +1243,84 @@ impl Small {
         (self.size, self.end) = (size, 0);
         self.at.clear();
         self.free.clear();
+        self.ids.clear();
+    }
+
+    /// A free place of `cap` bytes at alignment `al` (None: the buffer is full).
+    fn alloc(&mut self, cap: u64, al: u64) -> Option<u64> {
+        if let Some(o) = self.free.get_mut(&(cap, al)).and_then(|v| v.pop()) {
+            return Some(o);
+        }
+        let o = self.end.next_multiple_of(al);
+        if o + cap > self.size {
+            return None;
+        }
+        self.end = o + cap;
+        Some(o)
+    }
+
+    /// Input `id` of a draw known across frames ([`steady_on`]): where it
+    /// lies, the part of `bytes` the caller writes there now, and whether
+    /// the place is new (the caller zeros its capacity past the bytes);
+    /// None when the buffer has no room (the caller places it by content).
+    /// The draw's input has a slot of its own from its first frame, kept
+    /// while it lasts; each frame only the changed 64-byte pieces are
+    /// written there (one compare with the last frame's bytes). An input
+    /// placed twice in one frame (an identity that is not one) gets None.
+    pub fn place_steady(&mut self, id: IdKey, bytes: &[u8], size: u64, unit: u64) -> Option<(u64, std::ops::Range<usize>, bool)> {
+        let (f, n) = (self.frame, bytes.len().min(size as usize));
+        let bytes = &bytes[..n];
+        let (cap, al) = (Small::cap(size), Small::align(unit));
+        let (o, w, fresh) = match self.ids.get_mut(&id) {
+            Some(e) if e.last == f => return None,
+            Some(e) if e.size == size && e.unit == unit && e.shadow.len() == n => {
+                e.last = f;
+                let w = changed(&e.shadow, bytes).unwrap_or(0..0);
+                e.shadow[w.clone()].copy_from_slice(&bytes[w.clone()]);
+                (e.slot[0], w, false)
+            }
+            old => {
+                // New, or another input under this identity (its old slot freed).
+                if let Some(e) = old {
+                    let s = e.slot;
+                    self.free.entry((s[1], s[2])).or_default().push(s[0]);
+                    self.ids.remove(&id);
+                }
+                let o = self.alloc(cap, al)?;
+                self.ids.insert(id, IdEnt { shadow: bytes.into(), size, unit, slot: [o, cap, al], last: f });
+                (o, 0..n, true)
+            }
+        };
+        self.id_placed += 1;
+        if !w.is_empty() {
+            self.id_written += 1;
+            self.id_bytes += w.len() as u64;
+        }
+        Some((o, w, fresh))
+    }
+
+    fn hash(bytes: &[u8], size: u64, unit: u64) -> u64 {
+        let mut h = Fx::default();
+        std::hash::Hasher::write(&mut h, bytes);
+        std::hash::Hasher::write_u64(&mut h, size);
+        std::hash::Hasher::write_u64(&mut h, unit);
+        std::hash::Hasher::finish(&h)
     }
 
     /// Where `bytes` (`size` padded, element size `unit`) lie, and whether
     /// the caller writes them there now (`true`: their first frame there);
     /// None when the buffer has no room (the frame's upload memory then).
     pub fn place(&mut self, bytes: &[u8], size: u64, unit: u64) -> Option<(u64, bool)> {
-        let mut h = Fx::default();
-        std::hash::Hasher::write(&mut h, bytes);
-        std::hash::Hasher::write_u64(&mut h, size);
-        std::hash::Hasher::write_u64(&mut h, unit);
-        let h = std::hash::Hasher::finish(&h);
+        let h = Small::hash(bytes, size, unit);
         self.placed += 1;
         if let Some(e) = self.at.get_mut(&h).and_then(|v| v.iter_mut().find(|e| e.1 == size && e.2 == unit && *e.0 == *bytes)) {
             e.3[3] = self.frame;
             return Some((e.3[0], false));
         }
-        let (cap, al) = (size.max(16).next_power_of_two(), bridge::align(unit));
-        let o = match self.free.get_mut(&(cap, al)).and_then(|v| v.pop()) {
-            Some(o) => o,
-            None => {
-                let o = self.end.next_multiple_of(al);
-                if o + cap > self.size {
-                    self.placed -= 1;
-                    return None;
-                }
-                self.end = o + cap;
-                o
-            }
+        let (cap, al) = (Small::cap(size), Small::align(unit));
+        let Some(o) = self.alloc(cap, al) else {
+            self.placed -= 1;
+            return None;
         };
         self.at.entry(h).or_default().push((bytes.into(), size, unit, [o, cap, al, self.frame]));
         self.made += 1;
@@ -856,13 +1332,29 @@ impl Small {
     fn cap(size: u64) -> u64 {
         size.max(16).next_power_of_two()
     }
+
+    /// The start an input of element size `unit` needs here: a constant
+    /// buffer (and a root view, unit 256) 256, a buffer view a multiple of
+    /// its element and of 16 (a view's first element is in elements;
+    /// [`bridge::align`]'s 256 made a 76-byte stride start at 4,864 B,
+    /// and the draws' own slots of pk7a3 f961 then filled the buffer).
+    fn align(unit: u64) -> u64 {
+        let unit = unit.max(4);
+        if unit % 256 == 0 { unit } else { 16 * unit / gcd(16, unit) }
+    }
+}
+
+fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 { a } else { gcd(b, a % b) }
 }
 
 /// Frames a small input stays placed unused (the title alternates some
 /// inputs frame to frame: pk7a3 f962 found 393 of f960's mesh-table blocks).
 const SMALL_FRAMES: u64 = 4;
+/// The frame's upload copy in pieces of this many bytes (threads past 8 of them).
+const PIECE: usize = 4 << 20;
 /// The small inputs' buffer: least size.
-const SMALL_LEAST: u64 = 8 << 20;
+const SMALL_LEAST: u64 = 32 << 20;
 
 /// The bridged rows' device objects, kept by our pass across frames (it
 /// waits for each frame's fence before the next is recorded): one
@@ -873,6 +1365,8 @@ const SMALL_LEAST: u64 = 8 << 20;
 #[derive(Default)]
 pub struct Gpu {
     views: Option<(ID3D12DescriptorHeap, u32)>,
+    /// A null render target (`XNW_BRIDGE_TARGET`: the targets before the one shown).
+    null_rtv: Option<ID3D12DescriptorHeap>,
     /// A CPU heap of typed nulls: a row's slots are filled from it in one copy.
     nulls: Option<(ID3D12DescriptorHeap, u32)>,
     samplers: ByContent<Vec<u32>, (ID3D12DescriptorHeap, u64)>,
@@ -913,9 +1407,11 @@ const GUARDS: u32 = 5;
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Desc {
     Null,
-    NullImage,
+    /// A null image of this dimension ([`view_dim`]).
+    NullImage(u8),
     Buf(Kind, At, u32),
-    Tex(u64),
+    /// A texture by handle; the dimension its stand-in takes.
+    Tex(u64, u8),
     Words,
 }
 
@@ -982,22 +1478,43 @@ impl Cuts {
 pub struct Lay {
     pub roots: Vec<u8>,
     pub named: Vec<u32>,
-    pub images: Vec<Vec<u32>>,
+    /// Per root: the slots read as images, each with the dimension the
+    /// programs declare there ([`image_reads`]; 2D where not known).
+    pub images: Vec<Vec<(u32, u8)>>,
+    /// The dimensions the pair's programs read images in ([`dims_read`]).
+    pub dims_read: u16,
 }
 
 impl Lay {
-    pub fn new(p: &Programs, used: &Used) -> Lay {
+    /// The dimension of the stand-in for a texture whose title view has
+    /// dimension `title` ([`view_dim`]; None: 2D): the title's where the
+    /// programs read images of that dimension, else 2D.
+    pub fn stand_in_dim(&self, title: Option<u8>) -> u8 {
+        title.filter(|d| self.dims_read & 1 << d != 0).unwrap_or(DIM_2D)
+    }
+
+    /// The dimension the programs read table slot (`root`, `slot`) in.
+    pub fn image_dim(&self, root: u16, slot: u32) -> u8 {
+        let Some(k) = self.roots.iter().position(|&r| u16::from(r) == root) else { return DIM_2D };
+        self.images[k].iter().find(|i| i.0 == slot).map_or(DIM_2D, |i| i.1)
+    }
+
+    pub fn new(p: &Programs, used: &Used, reads: &[(u16, u32, u8)], dims_read: u16) -> Lay {
         let roots = table_roots(&p.ms, &p.ps);
         let named = roots.iter().map(|&r| used.keys().filter(|u| u.0 == u16::from(r)).map(|u| u.1 + 1).max().unwrap_or(0)).collect();
         let images = roots
             .iter()
             .map(|&r| {
-                let mut v: Vec<u32> = used.iter().filter(|u| *u.1 == NAMED_IMAGE && u.0.0 == u16::from(r)).map(|u| u.0.1).collect();
+                let mut v: Vec<(u32, u8)> = used
+                    .iter()
+                    .filter(|u| *u.1 == NAMED_IMAGE && u.0.0 == u16::from(r))
+                    .map(|u| (u.0.1, reads.iter().find(|x| x.0 == u16::from(r) && x.1 == u.0.1).map_or(DIM_2D, |x| x.2)))
+                    .collect();
                 v.sort_unstable();
                 v
             })
             .collect();
-        Lay { roots, named, images }
+        Lay { roots, named, images, dims_read }
     }
 }
 
@@ -1030,19 +1547,22 @@ type Texs = ByContent<u64, Option<(ID3D12Resource, D3D12_SHADER_RESOURCE_VIEW_DE
 struct KeyCx<'a> {
     texs: &'a Texs,
     grey: u64,
+    /// Handles whose title view is not 2D, with its dimension ([`Owned::dims`]).
+    dims: &'a HashMap<u64, u8>,
     zc: &'a [xnw_gpu::shared::SharedRange],
 }
 
 /// The key words of one entry: its slot and stride entry, and the exact
 /// descriptor (buffers by where they lie, textures by resource and view,
 /// the grey stand-in); false when a texture's view is not one this key
-/// spells out (only 2D views are), and the block is then made afresh.
+/// spells out (2D, 2D array, cube, cube array, 3D), or an in-place
+/// view's range is unknown: the block is then made afresh.
 fn key_words(e: &Ent, cx: &KeyCx, w: &mut Vec<u64>) -> bool {
     w.push(u64::from(e.j) | u64::from(e.stride[1]) << 32);
     let tag = |t: u64| u64::from(e.stride[0]) | t << 32;
     match e.desc {
         Desc::Null => w.push(tag(0)),
-        Desc::NullImage => w.push(tag(1)),
+        Desc::NullImage(dim) => w.push(tag(1 | u64::from(dim) << 8)),
         Desc::Words => w.push(tag(2)),
         Desc::Buf(kind, at, n) => {
             let k = match kind {
@@ -1062,16 +1582,40 @@ fn key_words(e: &Ent, cx: &KeyCx, w: &mut Vec<u64>) -> bool {
                 }
             }
         }
-        Desc::Tex(h) => match cx.texs.get(&h) {
-            Some(Some((tr, desc))) => {
-                if desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D {
-                    return false;
-                }
-                // SAFETY: a 2D view's description holds its Texture2D member.
-                let t2 = unsafe { desc.Anonymous.Texture2D };
-                w.extend([tag(6), windows::core::Interface::as_raw(tr) as u64, u64::from(desc.Format.0 as u32) | u64::from(desc.Shader4ComponentMapping) << 32, u64::from(t2.MostDetailedMip) | u64::from(t2.MipLevels) << 32, u64::from(t2.PlaneSlice) | u64::from(t2.ResourceMinLODClamp.to_bits()) << 32]);
+        Desc::Tex(h, dim) => match real(cx.texs, h, dim) {
+            Some((tr, desc)) => {
+                // 2D, 2D array, cube, cube array and 3D views (the
+                // texture table's views of the title's arrays, cubes and volumes).
+                let pair = |a: u32, b: u32| u64::from(a) | u64::from(b) << 32;
+                // SAFETY: each arm reads the member its view dimension names.
+                let u: [u64; 3] = unsafe {
+                    match desc.ViewDimension {
+                        D3D12_SRV_DIMENSION_TEXTURE2D => {
+                            let t = desc.Anonymous.Texture2D;
+                            [pair(t.MostDetailedMip, t.MipLevels), pair(t.PlaneSlice, t.ResourceMinLODClamp.to_bits()), 0]
+                        }
+                        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                            let t = desc.Anonymous.Texture2DArray;
+                            [pair(t.MostDetailedMip, t.MipLevels), pair(t.FirstArraySlice, t.ArraySize), pair(t.PlaneSlice, t.ResourceMinLODClamp.to_bits())]
+                        }
+                        D3D12_SRV_DIMENSION_TEXTURECUBE => {
+                            let t = desc.Anonymous.TextureCube;
+                            [pair(t.MostDetailedMip, t.MipLevels), u64::from(t.ResourceMinLODClamp.to_bits()), 0]
+                        }
+                        D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+                            let t = desc.Anonymous.TextureCubeArray;
+                            [pair(t.MostDetailedMip, t.MipLevels), pair(t.First2DArrayFace, t.NumCubes), u64::from(t.ResourceMinLODClamp.to_bits())]
+                        }
+                        D3D12_SRV_DIMENSION_TEXTURE3D => {
+                            let t = desc.Anonymous.Texture3D;
+                            [pair(t.MostDetailedMip, t.MipLevels), u64::from(t.ResourceMinLODClamp.to_bits()), 0]
+                        }
+                        _ => return false,
+                    }
+                };
+                w.extend([tag(6 | (desc.ViewDimension.0 as u64) << 8), windows::core::Interface::as_raw(tr) as u64, u64::from(desc.Format.0 as u32) | u64::from(desc.Shader4ComponentMapping) << 32, u[0], u[1], u[2]]);
             }
-            _ => w.extend([tag(7), cx.grey]),
+            None => w.extend([tag(7 | u64::from(dim) << 8), cx.grey]),
         },
     }
     true
@@ -1197,8 +1741,8 @@ fn cut(b: &bridge::Binding, lay: &Lay, views: &[(u32, Kind, At, u32)], base: u32
     }
     for (k, images) in lay.images.iter().enumerate() {
         if reused(tb + k).is_none() {
-            for &j in images {
-                out.dense[at(tb + k, j)].1 = Desc::NullImage;
+            for &(j, dim) in images {
+                out.dense[at(tb + k, j)].1 = Desc::NullImage(dim);
             }
         }
     }
@@ -1214,7 +1758,7 @@ fn cut(b: &bridge::Binding, lay: &Lay, views: &[(u32, Kind, At, u32)], base: u32
     }
     for &(s, h) in &b.handles {
         if let Some(i) = place(out, s) {
-            out.dense[i].1 = Desc::Tex(h);
+            out.dense[i].1 = Desc::Tex(h, lay.stand_in_dim(cx.dims.get(&h).copied()));
         }
     }
     if let Some(k) = lay.roots.iter().position(|&r| r == 0)
@@ -1367,14 +1911,25 @@ impl Gpu {
         // bus in-place reads that depend on each other ran ~30x slower
         // (an idea from upstream; a copy path stays for hot data).
         let zc_on = xnw_gpu::shared::world_part(xnw_gpu::shared::WORLD_BRIDGE);
+        let zc_cbv = zc_on && zc_cbv_on();
         let mut zc: Vec<xnw_gpu::shared::SharedRange> = Vec::new();
         let mut zc_bytes = 0u64;
+        // [`steady_on`]: each row's identity and occurrence among the frame's rows of it.
+        let steady = steady_on();
+        let mut occurs: ByContent<(u64, Key), u32> = ByContent::default();
+        // Their small inputs placed this frame by the bytes' address: rows handing over the same bytes share one place.
+        let mut by_ptr: ByContent<(usize, usize, u64, u64), u64> = ByContent::default();
         for i in 0..f.rows.len() {
             let o = &f.rows[i].1;
             let Some(built) = cache().get(o.key) else {
                 st.no_pipeline += 1;
                 continue;
             };
+            let rid = (steady && o.ident != 0).then(|| {
+                let n = occurs.entry((o.ident, o.key)).or_insert(0);
+                *n += 1;
+                (o.ident, o.key, *n - 1)
+            });
             let refuse = |st: &mut Stats, why: String| {
                 st.refused += 1;
                 if st.why.is_empty() {
@@ -1401,6 +1956,7 @@ impl Gpu {
                 None => next,
             };
             let p = &built.programs;
+            let tb = std::time::Instant::now();
             let b = match bridge::bind_at(&p.ms, &p.ps, &f.draw(i, SAMPLER_SLOTS), next) {
                 Ok(b) if b.groups > 0 => b,
                 r => {
@@ -1417,16 +1973,42 @@ impl Gpu {
             // `align`: the offset an in-place view of these bytes needs.
             let canon = &mut canon;
             let small_in = &mut self.small;
-            let mut place = |a: &mut Arena, c: &mut Vec<(usize, usize, u64, u64)>, bytes: &'f [u8], size: u64, unit: u64, align: u64, cbv: bool| -> At {
+            let mut place = |a: &mut Arena, c: &mut Vec<(usize, usize, u64, u64)>, bytes: &'f [u8], size: u64, unit: u64, align: u64, cbv: bool, input: u32| -> At {
                 if zc_on
-                    && !cbv
+                    && (!cbv || zc_cbv)
                     && let Some(&(_, title)) = addrs.iter().find(|x| x.0 == bytes.as_ptr() as usize)
                     && let Some(r) = xnw_gpu::shared::world_range(title, size)
-                    && r.offset.is_multiple_of(align)
+                    && r.offset.is_multiple_of(if cbv { 256 } else { align })
                 {
                     zc_bytes += size;
                     zc.push(r);
                     return At::Shared(zc.len() as u32 - 1);
+                }
+                let pk = (bytes.as_ptr() as usize, bytes.len(), size, unit);
+                if small
+                    && bytes.len() < KEEP_MIN
+                    && rid.is_some()
+                    && let Some(&o) = by_ptr.get(&pk)
+                {
+                    return At::Small(o);
+                }
+                if small
+                    && bytes.len() < KEEP_MIN
+                    && let Some((ident, key, occ)) = rid
+                    && let Some((o, w, fresh)) = small_in.place_steady((ident, key, occ, input), bytes, size, unit)
+                {
+                    by_ptr.insert(pk, o);
+                    // SAFETY: as below: the draw's own slot lies inside the
+                    // mapped buffer, and no list in flight reads it (the pass
+                    // waited for the last frame's fence; one row a frame writes it).
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(bytes.as_ptr().add(w.start), small_to.add(o as usize + w.start), w.len());
+                        if fresh {
+                            let n = bytes.len().min(size as usize);
+                            std::ptr::write_bytes(small_to.add(o as usize + n), 0, Small::cap(size) as usize - n);
+                        }
+                    }
+                    return At::Small(o);
                 }
                 if small
                     && bytes.len() < KEEP_MIN
@@ -1451,31 +2033,34 @@ impl Gpu {
                 }
                 at
             };
+            let tp = std::time::Instant::now();
+            st.bind_ms[0] += (tp - tb).as_secs_f64() * 1e3;
             let mut views = Vec::new();
             for &(s, v) in &b.views.slots {
                 if let Kind::RawUav { .. } = v.kind {
                     continue;
                 }
                 if let Some((size, n)) = v.kind.extent(v.bytes.len() as u64) {
-                    views.push((s, v.kind, place(&mut arena, &mut copies, v.bytes, size, unit(v.kind), unit(v.kind), v.kind == Kind::Cbv), n));
+                    views.push((s, v.kind, place(&mut arena, &mut copies, v.bytes, size, unit(v.kind), unit(v.kind), v.kind == Kind::Cbv, s - next), n));
                 }
             }
-            let mut roots = |vs: &[(u8, bool, &'f [u8])], params: &[(u8, bool, u32)]| -> Result<Vec<(u32, bool, At)>, String> {
+            let mut roots = |vs: &[(u8, bool, &'f [u8])], params: &[(u8, bool, u32)], stage: u32| -> Result<Vec<(u32, bool, At)>, String> {
                 params
                     .iter()
                     .map(|&(r, is_srv, param)| {
                         let v = vs.iter().find(|v| v.0 == r && v.1 == is_srv).ok_or_else(|| format!("root view {r} not bound"))?;
-                        Ok((param, is_srv, place(&mut arena, &mut copies, v.2, (v.2.len() as u64).next_multiple_of(256), 256, 4, !is_srv)))
+                        Ok((param, is_srv, place(&mut arena, &mut copies, v.2, (v.2.len() as u64).next_multiple_of(256), 256, 4, !is_srv, stage << 24 | param)))
                     })
                     .collect()
             };
-            let (mroots, proots) = match (roots(&b.mesh.views, &built.cp.views), roots(&b.pixel.views, &built.gp.views)) {
+            let (mroots, proots) = match (roots(&b.mesh.views, &built.cp.views, 1), roots(&b.pixel.views, &built.gp.views, 2)) {
                 (Ok(m), Ok(p)) => (m, p),
                 (Err(x), _) | (_, Err(x)) => {
                     refuse(&mut st, x);
                     continue;
                 }
             };
+            st.bind_ms[1] += tp.elapsed().as_secs_f64() * 1e3;
             words_at.entry(o.words_at).or_insert((words_base, o.words, &o.heap[..]));
             // The row's stride entries at its slots in the frame's one table.
             let base = next as usize;
@@ -1494,6 +2079,8 @@ impl Gpu {
         }
         st.slots = next;
         (st.small, st.small_bytes) = ([self.small.placed, self.small.made], self.small.made_bytes);
+        (st.steady, st.steady_bytes) = ([self.small.id_placed, self.small.id_written], self.small.id_bytes);
+        st.small_end = [self.small.end, self.small.size];
         let base_at = arena.place(&[0; 16], 16, 16);
         let stride_bytes: Vec<u8> = strides.iter().flatten().flat_map(|w| w.to_le_bytes()).collect();
         // The kept inputs' copies go through the upload memory too.
@@ -1536,9 +2123,34 @@ impl Gpu {
                 self.up = Some((r, to.cast::<u8>(), size));
             }
             let (up, to, _) = self.up.clone().ok_or("no upload buffer")?;
+            // Pieces of at most 4 MiB on up to 4 threads (a test run-br12:
+            // two 16 MiB views a frame, 3-9 ms of copying into write-combined memory on one thread).
+            let mut pieces: Vec<(usize, usize, usize, usize)> = Vec::new();
             for &(o, ptr, n, size) in &arena.parts {
-                std::ptr::copy_nonoverlapping(ptr as *const u8, to.add(o as usize), n);
-                std::ptr::write_bytes(to.add(o as usize + n), 0, size.max(16) as usize - n);
+                let (o, all) = (o as usize, size.max(16) as usize);
+                for at in (0..all).step_by(PIECE) {
+                    let len = PIECE.min(all - at);
+                    pieces.push((o + at, ptr + at.min(n), n.saturating_sub(at).min(len), len));
+                }
+            }
+            let to_at = to as usize;
+            let copy = |p: &[(usize, usize, usize, usize)]| {
+                // `from..from + n` lies in an input of `f`, `o..o + len` in the mapped upload buffer (the block's SAFETY).
+                for &(o, from, n, len) in p {
+                    std::ptr::copy_nonoverlapping(from as *const u8, (to_at + o) as *mut u8, n);
+                    std::ptr::write_bytes((to_at + o + n) as *mut u8, 0, len - n);
+                }
+            };
+            let bytes: usize = pieces.iter().map(|p| p.3).sum();
+            if bytes < 8 * PIECE {
+                copy(&pieces);
+            } else {
+                let per = pieces.len().div_ceil(4);
+                std::thread::scope(|sc| {
+                    for part in pieces.chunks(per) {
+                        sc.spawn(|| copy(part));
+                    }
+                });
             }
             // The stride table: this frame's entries, zeros past them.
             if self.strides.is_none() {
@@ -1634,6 +2246,22 @@ impl Gpu {
             let mut texs = Texs::default();
             let mut cuts = std::mem::take(&mut self.cuts);
             cuts.clear();
+            // The title's view dimension of every texture that is not 2D,
+            // and the stand-in of a dimension: its texture and view.
+            let mut dims: HashMap<u64, u8> = HashMap::new();
+            for r in &rows {
+                dims.extend(f.rows[r.i].1.dims.iter().copied());
+            }
+            let stand_in = |dim: u8| -> (&ID3D12Resource, D3D12_SHADER_RESOURCE_VIEW_DESC) {
+                let tex = match dim {
+                    9 => t.grey_shapes[0],
+                    8 => t.grey_shapes[1],
+                    2 | 3 => t.grey_shapes[2],
+                    _ => t.grey,
+                };
+                (tex, one_texel_view(dim))
+            };
+            let dim_at = |dim: u8| DIMS.iter().position(|d| d.0 == dim).unwrap_or(0);
             if tables {
                 for r in &rows {
                     for &(_, h) in &r.b.handles {
@@ -1644,7 +2272,7 @@ impl Gpu {
                     keep.push(windows::core::Interface::cast(tr).map_err(e)?);
                 }
                 lap.to(&mut st.view_ms[7]);
-                let cx = KeyCx { texs: &texs, grey: windows::core::Interface::as_raw(t.grey) as u64, zc: &zc };
+                let cx = KeyCx { texs: &texs, grey: windows::core::Interface::as_raw(t.grey) as u64, dims: &dims, zc: &zc };
                 // A table whose inputs are an earlier row's (same pipeline and
                 // root, the same bytes by pointer) takes that row's block uncut:
                 // the frame table of most rows.
@@ -1695,6 +2323,9 @@ impl Gpu {
             let vh: ID3D12DescriptorHeap = if tables {
                 // The buffers blocks name: another one flushes them.
                 let mut ids: Vec<windows::core::IUnknown> = vec![windows::core::Interface::cast(&up).map_err(e)?, windows::core::Interface::cast(&kept).map_err(e)?, windows::core::Interface::cast(t.words.0).map_err(e)?, windows::core::Interface::cast(t.grey).map_err(e)?];
+                for g in t.grey_shapes {
+                    ids.push(windows::core::Interface::cast(g).map_err(e)?);
+                }
                 if let Some((b, _)) = &self.small_buf {
                     ids.push(windows::core::Interface::cast(b).map_err(e)?);
                 }
@@ -1832,8 +2463,8 @@ impl Gpu {
                                 let s = first + en.j;
                                 match en.desc {
                                     Desc::Null => {}
-                                    Desc::NullImage => {
-                                        dev.CreateShaderResourceView(None, Some(&tex2d(DXGI_FORMAT_R8G8B8A8_UNORM)), at(s));
+                                    Desc::NullImage(dim) => {
+                                        dev.CreateShaderResourceView(None, Some(&one_texel_view(dim)), at(s));
                                         st.writes[2] += 1;
                                     }
                                     Desc::Buf(kind, where_, n) => {
@@ -1861,14 +2492,15 @@ impl Gpu {
                                         dev.CreateShaderResourceView(t.words.0, Some(&srv(DXGI_FORMAT_R32_TYPELESS, 0, (t.words.1 / 4) as u32, 0, D3D12_BUFFER_SRV_FLAG_RAW)), at(s));
                                         st.writes[7] += 1;
                                     }
-                                    Desc::Tex(h) => match texs.get(&h) {
-                                        Some(Some((tr, desc))) => {
+                                    Desc::Tex(h, dim) => match real(&texs, h, dim) {
+                                        Some((tr, desc)) => {
                                             dev.CreateShaderResourceView(tr, Some(desc), at(s));
                                             self.held.entry(windows::core::Interface::as_raw(tr) as usize).or_insert(windows::core::Interface::cast(tr).map_err(e)?);
                                             st.writes[8] += 1;
                                         }
-                                        _ => {
-                                            dev.CreateShaderResourceView(t.grey, Some(&tex2d(DXGI_FORMAT_R8G8B8A8_UNORM)), at(s));
+                                        None => {
+                                            let (tex, view) = stand_in(dim);
+                                            dev.CreateShaderResourceView(tex, Some(&view), at(s));
                                             st.writes[9] += 1;
                                         }
                                     },
@@ -1941,10 +2573,13 @@ impl Gpu {
                 let (o, b) = (&f.rows[r.i].1, &r.b);
                 if tables {
                     for &(_, h) in &b.handles {
-                        if let Some(Some(_)) = texs.get(&h) {
+                        let dim = r.built.lay.stand_in_dim(dims.get(&h).copied());
+                        if let Some((_, desc)) = real(&texs, h, dim) {
                             st.textures += 1;
+                            st.shaped += u32::from(desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D);
                         } else {
                             st.grey += 1;
+                            st.grey_dims[dim_at(dim)] += 1;
                             if let Some(n) = st.grey_why.get_mut((t.flat)(h)) {
                                 *n += 1;
                             }
@@ -1968,7 +2603,7 @@ impl Gpu {
                             && let Some(c) = b.views.constants.get(usize::from(root))
                             && c / 32 + slot < g[0]
                         {
-                            dev.CreateShaderResourceView(None, Some(&tex2d(DXGI_FORMAT_R8G8B8A8_UNORM)), at(c / 32 + slot));
+                            dev.CreateShaderResourceView(None, Some(&one_texel_view(r.built.lay.image_dim(root, slot))), at(c / 32 + slot));
                             st.writes[2] += 1;
                         }
                     }
@@ -1997,16 +2632,20 @@ impl Gpu {
                         st.writes[7] += 1;
                     }
                     for &(s, h) in &b.handles {
-                        match (t.texture)(h) {
+                        let dim = r.built.lay.stand_in_dim(dims.get(&h).copied());
+                        match (t.texture)(h).filter(|x| view_fits(&x.1, dim)) {
                             Some((tr, desc)) => {
                                 dev.CreateShaderResourceView(&tr, Some(&desc), at(s));
                                 keep.push(windows::core::Interface::cast(&tr).map_err(e)?);
                                 st.textures += 1;
+                                st.shaped += u32::from(desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D);
                                 st.writes[8] += 1;
                             }
                             None => {
-                                dev.CreateShaderResourceView(t.grey, Some(&tex2d(DXGI_FORMAT_R8G8B8A8_UNORM)), at(s));
+                                let (tex, view) = stand_in(dim);
+                                dev.CreateShaderResourceView(tex, Some(&view), at(s));
                                 st.grey += 1;
+                                st.grey_dims[dim_at(dim)] += 1;
                                 st.writes[9] += 1;
                                 if let Some(n) = st.grey_why.get_mut((t.flat)(h)) {
                                     *n += 1;
@@ -2049,6 +2688,19 @@ impl Gpu {
             }
             st.parts[2] = t2.elapsed().as_secs_f64() * 1e3;
             let t3 = std::time::Instant::now();
+            // Each row's pixel pipeline: the pair's, or its blend's.
+            let mut psos = Vec::with_capacity(rows.len());
+            for r in &rows {
+                let b = f.rows[r.i].1.blend;
+                st.blended += u32::from(blend_ok(b));
+                st.blend_refused += u32::from(b[0] != 0 && !blend_ok(b));
+                match st.blends.iter().position(|x| x.0 == b) {
+                    Some(i) => st.blends[i].1 += 1,
+                    None if st.blends.len() < 8 => st.blends.push((b, 1)),
+                    None => {}
+                }
+                psos.push(r.built.pixel_pipeline(dev, b)?);
+            }
             // Heaps and pipelines are set only when they change. A root
             // signature that indexes the heaps directly is set again after
             // new heaps (the driver takes the heaps with it: on the RX 5700 XT
@@ -2098,23 +2750,37 @@ impl Gpu {
             let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
             l.ResourceBarrier(&[transition(&records, uav, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE), transition(&indices, uav, D3D12_RESOURCE_STATE_INDEX_BUFFER)]);
             // The pixel programs into our targets.
-            l.OMSetRenderTargets(1, Some(&t.rtv), false, Some(&t.dsv));
+            let target = shown_target() as usize;
+            if target == 0 {
+                l.OMSetRenderTargets(1, Some(&t.rtv), false, Some(&t.dsv));
+            } else {
+                // `XNW_BRIDGE_TARGET`: null targets before the one shown.
+                if self.null_rtv.is_none() {
+                    let h: ID3D12DescriptorHeap = dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: 1, ..Default::default() }).map_err(e)?;
+                    dev.CreateRenderTargetView(None, Some(&D3D12_RENDER_TARGET_VIEW_DESC { Format: DXGI_FORMAT_R8G8B8A8_UNORM, ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D, ..Default::default() }), h.GetCPUDescriptorHandleForHeapStart());
+                    self.null_rtv = Some(h);
+                }
+                let mut rtvs = [self.null_rtv.as_ref().ok_or("no null target")?.GetCPUDescriptorHandleForHeapStart(); 8];
+                rtvs[target] = t.rtv;
+                l.OMSetRenderTargets(target as u32 + 1, Some(rtvs.as_ptr()), false, Some(&t.dsv));
+            }
             l.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: t.width as f32, Height: t.height as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
             l.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: t.width as i32, bottom: t.height as i32 }]);
             l.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             pipe = std::ptr::null_mut();
             bound = None;
-            for (r, sh) in rows.iter().zip(&sheaps) {
+            for (k, (r, sh)) in rows.iter().zip(&sheaps).enumerate() {
                 let (built, b) = (&r.built, &r.b);
                 if set_heaps(sh, &mut bound) {
                     pipe = std::ptr::null_mut();
                 }
                 let lay = &built.programs.layout;
-                if windows::core::Interface::as_raw(&built.gpso) != pipe {
-                    l.SetPipelineState(&built.gpso);
+                let gpso = &psos[k];
+                if windows::core::Interface::as_raw(gpso) != pipe {
+                    l.SetPipelineState(gpso);
                     l.SetGraphicsRootSignature(&built.groot);
                     l.SetGraphicsRoot32BitConstants(0, 1, [0u32].as_ptr().cast(), 0);
-                    pipe = windows::core::Interface::as_raw(&built.gpso);
+                    pipe = windows::core::Interface::as_raw(gpso);
                 }
                 l.SetGraphicsRoot32BitConstants(1, b.pixel.constants.len() as u32, b.pixel.constants.as_ptr().cast(), 0);
                 for &(param, is_srv, a) in &r.proots {
@@ -2154,7 +2820,7 @@ pub fn line(frame: u64, f: &Frame, st: &Stats) -> String {
     }
     let lacks: Vec<String> = LACKS.iter().zip(lacks).filter(|(_, n)| *n > 0).map(|(w, n)| format!("{w} {n}")).collect();
     format!(
-        "world render: frame {frame}: bridgeps: rows {} (drawn {}, no pipelines {}, refused {}; draws not ready {}, unread {}), textures from our table {} (grey {}), buffers {} ({:.1} MiB), record {:.1} ms; pipelines made {}, building {}, failed {}; lacking: {}{}; record parts: bindings {:.1} ms, uploads {:.1} ms, views {:.1} ms, list {:.1} ms; view heap {} slots, kept on the device {:.1} MiB ({:.1} MiB new); in place {} ({:.1} MiB); small inputs {} (made {}, {:.0} KiB); grey by reason: {}; descriptor writes: {}; views by part: {}; {}",
+        "world render: frame {frame}: bridgeps: rows {} (drawn {}, no pipelines {}, refused {}; draws not ready {}, unread {}), textures from our table {} (grey {}), buffers {} ({:.1} MiB), record {:.1} ms; pipelines made {}, building {}, failed {}; rows with the title's blend {} (on but not taken {}; blends {:?}); lacking: {}{}; record parts: bindings {:.1} ms (bind {:.1}, place {:.1}), uploads {:.1} ms, views {:.1} ms, list {:.1} ms; view heap {} slots, kept on the device {:.1} MiB ({:.1} MiB new); in place {} ({:.1} MiB); small inputs {} (made {}, {:.0} KiB; buffer {:.1} of {:.0} MiB); steady {} (rewritten {}, {:.0} KiB); grey by reason: {}; descriptor writes: {}; views by part: {}; {}",
         f.rows.len(),
         st.drawn,
         st.no_pipeline,
@@ -2169,9 +2835,14 @@ pub fn line(frame: u64, f: &Frame, st: &Stats) -> String {
         c[0],
         c[1],
         c[2],
+        st.blended,
+        st.blend_refused,
+        st.blends,
         if lacks.is_empty() { "nothing".into() } else { lacks.join(", ") },
         if st.why.is_empty() { String::new() } else { format!("; first refused: {}", st.why) },
         st.parts[0],
+        st.bind_ms[0],
+        st.bind_ms[1],
         st.parts[1],
         st.parts[2],
         st.parts[3],
@@ -2183,9 +2854,15 @@ pub fn line(frame: u64, f: &Frame, st: &Stats) -> String {
         st.small[0],
         st.small[1],
         st.small_bytes as f64 / 1024.0,
+        st.small_end[0] as f64 / f64::from(1 << 20),
+        st.small_end[1] as f64 / f64::from(1 << 20),
+        st.steady[0],
+        st.steady[1],
+        st.steady_bytes as f64 / 1024.0,
         {
             let g: Vec<String> = super::textures::FLAT_REASONS.iter().zip(st.grey_why).filter(|x| x.1 > 0).map(|(w, n)| format!("{w} {n}")).collect();
-            if g.is_empty() { "none".to_string() } else { g.join(", ") }
+            let d: Vec<String> = DIMS.iter().zip(st.grey_dims).filter(|x| x.1 > 0).map(|(w, n)| format!("{} {n}", w.1)).collect();
+            format!("{}; grey by view dimension: {}; cubes, arrays and 3D bound {}", if g.is_empty() { "none".to_string() } else { g.join(", ") }, if d.is_empty() { "none".to_string() } else { d.join(", ") }, st.shaped)
         },
         WRITES.iter().zip(st.writes).map(|(w, n)| format!("{w} {n}")).collect::<Vec<_>>().join(", "),
         VIEW_PARTS.iter().zip(st.view_ms).map(|(w, n)| format!("{w} {n:.2} ms")).collect::<Vec<_>>().join(", "),
@@ -2301,7 +2978,7 @@ mod tests {
     #[test]
     fn a_binding_cut_into_blocks() {
         use xnw_shader::RootType::{Constants, Table};
-        let sh = |stage, user: &[(u32, u8, xnw_shader::RootType, u32)]| HostShader { stage, dxil: Vec::new(), user_data: user.iter().map(|&(index, slot, root, dword)| emit::UserData { index, slot, root, dword }).collect(), samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: Vec::new(), root_srvs: Vec::new(), root_uavs: Vec::new(), address_map: false, descriptor_words: false };
+        let sh = |stage, user: &[(u32, u8, xnw_shader::RootType, u32)]| HostShader { stage, dxil: Vec::new(), user_data: user.iter().map(|&(index, slot, root, dword)| emit::UserData { index, slot, root, dword }).collect(), samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: Vec::new(), root_srvs: Vec::new(), root_uavs: Vec::new(), half_views: Vec::new(), address_map: false, descriptor_words: false };
         let ms = sh(HwStage::Ms, &[(2, 0, Table, 0), (3, 1, Table, 0), (5, 4, Constants, 0)]);
         let ps = sh(HwStage::Ps, &[(0, 0, Table, 0), (1, 2, Table, 0)]);
         let p = Programs { ms, layout: emit::mesh::Layout { max_vertices: 3, max_prims: 1, rows: 1, elements: Vec::new() }, vs: Vec::new(), ps, wave: 32, vertex: None };
@@ -2323,10 +3000,17 @@ mod tests {
         };
         let b = bridge::bind_at(&p.ms, &p.ps, &d, 500).unwrap();
         let views: Vec<(u32, Kind, At, u32)> = b.views.slots.iter().map(|&(s, v)| (s, v.kind, At::Frame(u64::from(s)), 1)).collect();
-        let lay = Lay::new(&p, &used);
-        assert_eq!(lay, Lay { roots: vec![0, 1, 2], named: vec![2, 3, 6], images: vec![vec![], vec![], vec![3, 5]] });
+        // The programs read root 2 slot 5 as a cube; the draw words' texture
+        // 0x7000 is a cube view of the title's (DIMS: 9).
+        let lay = Lay::new(&p, &used, &[(2, 5, 9)], 1 << DIM_2D | 1 << 9);
+        assert_eq!(lay, Lay { roots: vec![0, 1, 2], named: vec![2, 3, 6], images: vec![vec![], vec![], vec![(3, DIM_2D), (5, 9)]], dims_read: 0x210 });
+        // A title dimension the programs never read stays a 2D stand-in.
+        assert_eq!((lay.stand_in_dim(Some(9)), lay.stand_in_dim(Some(2)), lay.stand_in_dim(None)), (9, DIM_2D, DIM_2D));
+        assert_eq!((dims_text(lay.dims_read), dims_text(0)), ("2D, cube".to_string(), "no images".to_string()));
+        assert_eq!((lay.image_dim(2, 5), lay.image_dim(2, 3), lay.image_dim(7, 0)), (9, DIM_2D, DIM_2D));
         let texs = Texs::default();
-        let cx = KeyCx { texs: &texs, grey: 1, zc: &[] };
+        let dims: HashMap<u64, u8> = [(0x7000, 9)].into_iter().collect();
+        let cx = KeyCx { texs: &texs, grey: 1, dims: &dims, zc: &[] };
         let mut c = Cuts::default();
         cut(&b, &lay, &views, 500, &cx, &[], &mut c);
         // A block's slots written out: descriptors and stride entries.
@@ -2340,14 +3024,14 @@ mod tests {
         let blocks: Vec<(Vec<Desc>, Vec<[u32; 2]>)> = c.blocks.iter().map(|x| dense(&c, x)).collect();
         assert_eq!(c.blocks.iter().map(|x| (x.root, x.len)).collect::<Vec<_>>(), vec![(-1, 10), (0, 87), (1, 4), (2, 6)]);
         assert_eq!(c.rows, vec![0..4]);
-        assert_eq!(blocks[0].0[9], Desc::Tex(0x7000));
+        assert_eq!(blocks[0].0[9], Desc::Tex(0x7000, 9), "the stand-in there is a cube");
         assert!(blocks[0].0[..9].iter().all(|d| *d == Desc::Null));
         assert!(matches!(blocks[1].0[1], Desc::Buf(Kind::Cbv, ..)) && blocks[1].0[86] == Desc::Words);
         // Root 1: the structured view at 2 names its raw twin, the block's slot 3.
         assert!(matches!(blocks[2].0[2], Desc::Buf(Kind::Structured(8), ..)) && matches!(blocks[2].0[3], Desc::Buf(Kind::Raw, ..)));
         assert_eq!(blocks[2].1, vec![[4, 0], [0, 0], [8, 4], [4, 0]]);
-        // Root 2: the texture at 3, the named image at 5 past its views a null 2D texture.
-        assert_eq!((blocks[3].0[3], blocks[3].0[5], blocks[3].0[4]), (Desc::Tex(0x5000), Desc::NullImage, Desc::Null));
+        // Root 2: the texture at 3, the named image at 5 past its views a null of the dimension read there (a cube).
+        assert_eq!((blocks[3].0[3], blocks[3].0[5], blocks[3].0[4]), (Desc::Tex(0x5000, DIM_2D), Desc::NullImage(9), Desc::Null));
         // Only the slots that are not a plain null are listed.
         assert_eq!(c.ents[c.blocks[2].ents.clone()].len(), 3);
         // The same draw at another base cuts into the same blocks and keys, appended.
@@ -2366,6 +3050,99 @@ mod tests {
         assert_eq!((c.blocks[9].ents.clone(), c.blocks[9].len), (c.blocks[1].ents.clone(), 87));
         assert_eq!(c.key(&c.blocks[9]), c.key(&c.blocks[1]));
         assert_eq!(dense(&c, &c.blocks[10]), blocks[2]);
+        // The same words' texture as a 2D view of the title's: another key
+        // (a kept block made for the cube stand-in is not taken for it).
+        let none = HashMap::new();
+        let mut c2 = Cuts::default();
+        cut(&b, &lay, &views, 500, &KeyCx { texs: &texs, grey: 1, dims: &none, zc: &[] }, &[], &mut c2);
+        assert_ne!(c2.key(&c2.blocks[0]), c.key(&c.blocks[0]));
+        assert_eq!(c2.key(&c2.blocks[3]), c.key(&c.blocks[3]));
+    }
+
+    /// The view at a texture slot takes the title's dimension among the
+    /// kinds translated programs declare, and a one-texel view of each is
+    /// one D3D12 accepts over the stand-in of that shape.
+    #[test]
+    fn stand_in_views_take_the_titles_dimension() {
+        // Title view dimensions (D3D12): 4 2D, 5 2D array, 8 3D, 9 cube, 10 cube array, 2 1D, 3 1D array; 0 none; 6, 7 multisampled.
+        assert_eq!([4, 5, 8, 9, 10, 2, 3, 0, 6, 7, 99].map(view_dim), [4, 5, 8, 9, 9, 2, 3, 4, 4, 4, 4]);
+        // The title's dimension from a view's words: the view's own, a
+        // resource view's default (slices: an array; a 3D resource), none
+        // for a buffer or a capture without words.
+        let words = |res: u32, depth: u32, dim: u32| {
+            let mut w = [0u32; 30];
+            (w[0], w[7], w[15]) = (res, depth, dim);
+            w
+        };
+        assert_eq!([title_dim(view::PLACED, &words(3, 6, 9)), title_dim(view::TEXTURE, &words(3, 6, 10)), title_dim(view::TEXTURE, &words(3, 6, 0)), title_dim(view::TEXTURE, &words(3, 1, 0)), title_dim(view::TEXTURE, &words(4, 8, 0)), title_dim(view::TEXTURE, &[0; 30]), title_dim(view::BUFFER, &words(3, 6, 9))], [9, 10, 5, 0, 8, 0, 0]);
+        // A view from our table stands only where its dimension is read.
+        let v = |d| D3D12_SHADER_RESOURCE_VIEW_DESC { ViewDimension: d, ..Default::default() };
+        let fits = |d, dims: [u8; 6]| dims.map(|x| view_fits(&v(d), x));
+        assert_eq!(fits(D3D12_SRV_DIMENSION_TEXTURE2D, [4, 2, 3, 5, 8, 9]), [true, true, true, false, false, false]);
+        assert_eq!(fits(D3D12_SRV_DIMENSION_TEXTURECUBE, [4, 2, 3, 5, 8, 9]), [false, false, false, false, false, true]);
+        assert_eq!(fits(D3D12_SRV_DIMENSION_TEXTURE2DARRAY, [4, 2, 3, 5, 8, 9]), [false, false, false, true, false, false]);
+        assert_eq!(fits(D3D12_SRV_DIMENSION_TEXTURE3D, [4, 2, 3, 5, 8, 9]), [false, false, false, false, true, false]);
+        assert_eq!(fits(D3D12_SRV_DIMENSION_TEXTURECUBEARRAY, [4, 2, 3, 5, 8, 9]), [false; 6]);
+        // GFX10 image instruction dimensions 0..7.
+        assert_eq!([0, 1, 2, 3, 4, 5, 6, 7].map(read_dim), [2, 4, 8, 9, 3, 5, 4, 4]);
+        for (dim, d3d) in [(4, D3D12_SRV_DIMENSION_TEXTURE2D), (5, D3D12_SRV_DIMENSION_TEXTURE2DARRAY), (9, D3D12_SRV_DIMENSION_TEXTURECUBE), (8, D3D12_SRV_DIMENSION_TEXTURE3D), (2, D3D12_SRV_DIMENSION_TEXTURE1D), (3, D3D12_SRV_DIMENSION_TEXTURE1DARRAY)] {
+            let v = one_texel_view(dim);
+            assert_eq!((v.ViewDimension, v.Format), (d3d, DXGI_FORMAT_R8G8B8A8_UNORM), "{dim}");
+            assert!(DIMS.iter().any(|d| d.0 == dim));
+        }
+        // SAFETY: each description's own member.
+        unsafe {
+            assert_eq!((one_texel_view(5).Anonymous.Texture2DArray.ArraySize, one_texel_view(5).Anonymous.Texture2DArray.MipLevels), (1, 1));
+            assert_eq!(one_texel_view(9).Anonymous.TextureCube.MipLevels, 1);
+        }
+    }
+
+    /// A draw's textures whose title view is not 2D are listed with their
+    /// dimension, table slots and draw words alike (pk6 f1205 row 1401:
+    /// words 4 and 11 are 256x256x6 cube views, word 3 a 32-slice array).
+    #[test]
+    fn take_lists_the_textures_that_are_not_2d() {
+        struct S;
+        impl Source for S {
+            fn roots(&self) -> Vec<SrcRoot> {
+                vec![SrcRoot::Table(0x4000)]
+            }
+            fn table(&self, _root: u16, slot: u32) -> Option<SrcView> {
+                match slot {
+                    2 => Some(SrcView { kind: view::PLACED, dim: 5, ..SrcView::default() }),
+                    3 => Some(SrcView { kind: view::PLACED, dim: 4, ..SrcView::default() }),
+                    4 => Some(SrcView { kind: view::TEXTURE, ..SrcView::default() }),
+                    _ => None,
+                }
+            }
+            fn bytes(&self, _root: u16, _slot: u32, _v: &SrcView) -> Option<Arc<Vec<u8>>> {
+                None
+            }
+            fn root_view(&self, _root: u16, _addr: u64) -> Option<Arc<Vec<u8>>> {
+                None
+            }
+            fn words(&self) -> Option<[u32; WORDS]> {
+                let mut w = [NO_VIEW + 1; WORDS];
+                (w[4], w[11], w[12]) = (43499, 43442, 26992);
+                Some(w)
+            }
+            fn heap(&self, index: u32) -> Option<(u64, SrcView)> {
+                let dim = match index {
+                    43499 => 9,
+                    43442 => 10,
+                    _ => 4,
+                };
+                Some((0x10_0000 + 32 * u64::from(index), SrcView { kind: view::PLACED, dim, ..SrcView::default() }))
+            }
+            fn samplers(&self) -> Option<Arc<Vec<(u32, SamplerDesc)>>> {
+                None
+            }
+        }
+        let used: Used = [((0, 2), NAMED_IMAGE), ((0, 3), NAMED_IMAGE), ((0, 4), NAMED_IMAGE)].into_iter().collect();
+        let o = take(&S, (1, 2), &used);
+        let mut dims = o.dims.clone();
+        dims.sort_unstable();
+        assert_eq!(dims, vec![(0x4000 + 32 * 2, 5), (0x10_0000 + 32 * 43442, 9), (0x10_0000 + 32 * 43499, 9)]);
     }
 
     /// Small inputs by content: equal bytes at one offset on every
@@ -2394,6 +3171,44 @@ mod tests {
         assert_eq!(m.place(&b, 256, 256), Some((256, false)));
     }
 
+    #[test]
+    fn a_draws_changing_constants_keep_one_place() {
+        let mut m = Small::default();
+        m.start(4096);
+        m.next_frame();
+        let id = |occ| (7u64, (1u128, 2u128), occ, 3u32);
+        let (a, mut b) = ([1u8; 200], [1u8; 200]);
+        // Frame 1: each draw's input in a slot of its own, written whole.
+        assert_eq!(m.place_steady(id(0), &a, 256, 256), Some((0, 0..200, true)));
+        assert_eq!(m.place_steady(id(1), &a, 256, 256), Some((256, 0..200, true)));
+        // A second place of one id in a frame: refused (the caller goes by content).
+        assert_eq!(m.place_steady(id(0), &a, 256, 256), None);
+        // Frame 2: the same bytes, the same place, nothing written.
+        m.next_frame();
+        assert_eq!(m.place_steady(id(0), &a, 256, 256), Some((0, 0..0, false)));
+        // Frame 3: one byte changes: the same slot, only its 64-byte piece written.
+        m.next_frame();
+        b[130] = 5;
+        assert_eq!(m.place_steady(id(0), &b, 256, 256), Some((0, 128..192, false)));
+        m.next_frame();
+        assert_eq!(m.place_steady(id(0), &b, 256, 256), Some((0, 0..0, false)));
+        assert_eq!((m.id_placed, m.id_written), (1, 0));
+        // Another size under the id: a new slot, the old one freed for the next input of its size.
+        m.next_frame();
+        assert_eq!(m.place_steady(id(0), &a, 512, 256), Some((512, 0..200, true)));
+        assert_eq!(m.place_steady(id(2), &a, 256, 256), Some((0, 0..200, true)));
+        // Unused for ID_FRAMES frames: the entries go, their slots free.
+        for _ in 0..=ID_FRAMES {
+            m.next_frame();
+        }
+        assert!(m.ids.is_empty());
+        assert_eq!(m.free.values().map(Vec::len).sum::<usize>(), 3);
+        assert_eq!(changed(&[0; 130], &[0; 130]), None);
+        assert_eq!(changed(&[0; 130], &[[0; 129].as_slice(), &[1]].concat()), Some(128..130));
+        assert_eq!(Small::align(76), 304);
+        assert_eq!(Small::align(256), 256);
+    }
+
     /// Cut cost on a frame shaped like pk7c2 f1400 (722 rows; a frame
     /// table of 160 slots, 40 views; a mesh table of 12; a material table
     /// of 24 with 10 textures; 8 word textures): `cargo test -p xnw-world
@@ -2402,10 +3217,10 @@ mod tests {
     #[ignore]
     fn cut_cost() {
         use xnw_shader::RootType::Table;
-        let sh = |stage, user: &[(u32, u8)]| HostShader { stage, dxil: Vec::new(), user_data: user.iter().map(|&(index, slot)| emit::UserData { index, slot, root: Table, dword: 0 }).collect(), samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: Vec::new(), root_srvs: Vec::new(), root_uavs: Vec::new(), address_map: false, descriptor_words: false };
+        let sh = |stage, user: &[(u32, u8)]| HostShader { stage, dxil: Vec::new(), user_data: user.iter().map(|&(index, slot)| emit::UserData { index, slot, root: Table, dword: 0 }).collect(), samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: Vec::new(), root_srvs: Vec::new(), root_uavs: Vec::new(), half_views: Vec::new(), address_map: false, descriptor_words: false };
         let p = Programs { ms: sh(HwStage::Ms, &[(0, 0), (1, 1)]), layout: emit::mesh::Layout { max_vertices: 3, max_prims: 1, rows: 1, elements: Vec::new() }, vs: Vec::new(), ps: sh(HwStage::Ps, &[(0, 0), (1, 2)]), wave: 32, vertex: None };
         let used: Used = (0..160).map(|k| ((0u16, k), NAMED_CBV)).chain((0..12).map(|k| ((1, k), 4))).chain((0..24).map(|k| ((2, k), NAMED_IMAGE))).collect();
-        let lay = Lay::new(&p, &used);
+        let lay = Lay::new(&p, &used, &[], 0);
         let bytes = vec![0u8; 4096];
         let v = |kind| Slot::Buffer(View { kind, bytes: &bytes });
         let d = Draw {
@@ -2422,7 +3237,8 @@ mod tests {
         let rows: Vec<_> = (0..722u32).map(|i| bridge::bind_at(&p.ms, &p.ps, &d, i * 300).unwrap()).collect();
         let views: Vec<Vec<(u32, Kind, At, u32)>> = rows.iter().map(|b| b.views.slots.iter().map(|&(s, v)| (s, v.kind, At::Frame(u64::from(s)), 1)).collect()).collect();
         let texs = Texs::default();
-        let cx = KeyCx { texs: &texs, grey: 1, zc: &[] };
+        let none = HashMap::new();
+        let cx = KeyCx { texs: &texs, grey: 1, dims: &none, zc: &[] };
         let mut c = Cuts::default();
         for round in 0..3 {
             for reuse in [&[][..], &[Some(1), None, None][..]] {

@@ -138,7 +138,12 @@ static HOST_BARYCENTRICS: std::sync::atomic::AtomicU8 = std::sync::atomic::Atomi
 /// Whether the device made last supports SM 6.1 barycentrics
 /// (`SV_Barycentrics`, `GetAttributeAtVertex`); `None` before any device.
 /// The RX 5700 XT reports no (inbox and Agility 1.610.5); WARP 1.0.22 yes.
+/// `XNW_HOST_BARYCENTRICS=off` says no on any device (HANG2): WARP then
+/// translates the title's programs in the card's form.
 pub fn host_barycentrics() -> Option<bool> {
+    if std::env::var("XNW_HOST_BARYCENTRICS").is_ok_and(|v| matches!(v.trim(), "off" | "0")) {
+        return Some(false);
+    }
     match HOST_BARYCENTRICS.load(std::sync::atomic::Ordering::Relaxed) {
         0 => None,
         n => Some(n == 2),

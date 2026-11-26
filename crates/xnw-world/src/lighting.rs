@@ -58,6 +58,22 @@ pub const SHADE_FRACTION: f32 = 0.2;
 /// night EV of -2 (exposure min = max = -2) stays readable.
 pub const AMBIENT_FLOOR: f32 = 0.08;
 
+/// `ourlight=on` ([`Lighting::ours`]; our choices, not the title's values):
+/// a white surface facing up in shade against the same surface under a
+/// full sun at N.L = 1, sky and ground; their tints (a faint cool sky, a
+/// warm ground); the moon set's level, the moon fill with the directional
+/// light off; the exposure keys (a white surface facing up maps to about
+/// 0.9 on screen by day, 0.7 by night with the default curve) and the sky's.
+pub const AMB_SKY: f32 = 0.25;
+pub const AMB_GROUND: f32 = 0.10;
+pub const SKY_TINT: [f32; 3] = [0.94, 1.0, 1.08];
+pub const GROUND_TINT: [f32; 3] = [1.06, 1.0, 0.92];
+pub const MOON_LEVEL: f32 = 0.35;
+pub const MOON_FILL: f32 = 0.25;
+pub const DAY_KEY: f32 = 2.0;
+pub const NIGHT_KEY: f32 = 0.7;
+pub const SKY_KEY: f32 = 1.6;
+
 /// The default exposure bias (EV) for a timecycle EV `ev`: night-range
 /// EVs are lifted (EV -2 -> +1.5, exposure 0.25 -> 0.71), day
 /// (EV >= -0.5) is left alone: clamp(-ev - 0.5, 0, 2).
@@ -107,6 +123,9 @@ pub struct Lighting {
     pub sky_scale: f32,
     /// Hable A, B, C, D, E, F, W.
     pub curve: [f32; 7],
+    /// The fog colour (display value, the sky stand-in's horizon) for
+    /// `ourlight=on`'s pass; zero otherwise.
+    pub fog: [f32; 3],
 }
 
 /// Hable's curve (((x(Ax+CB)+DE)/(x(Ax+B)+DF)) - E/F).
@@ -183,6 +202,70 @@ impl Lighting {
             moon,
             sky_scale: (lum(&radiance) / std::f32::consts::PI).max(AMBIENT_FLOOR / exposure),
             curve,
+            fog: [0.0; 3],
+        };
+        (lit, table)
+    }
+
+    /// `ourlight=on` (LITE1): the light of our own pass from the same
+    /// timecycle values ([`Lighting::from_timecycle`] reads them).
+    /// - Directional: the title's final light direction (TC+0x1630, towards
+    ///   it) in the hue of its colour (sun TC[0..2], or moon TC[9..11] when
+    ///   the moon set is in use, TC+0x1670), at its strength TC+0x1650
+    ///   (0..1; the moon set at [`MOON_LEVEL`] of it). Units are relative:
+    ///   a white surface at N.L = 1 under a full sun gives 1 before exposure
+    ///   (the radiance is that x pi), so the title's light_dir_mult (1 in
+    ///   every capture, 14.75 by default) does not set the picture's level.
+    /// - The title's directional light off (strength 0: night or interior):
+    ///   a moon fill at [`MOON_FILL`] from the same direction when it is
+    ///   above the horizon, else none; the ambient stays.
+    /// - Ambient: a hemisphere, sky [`AMB_SKY`] x [`SKY_TINT`], ground
+    ///   [`AMB_GROUND`] x [`GROUND_TINT`], x the timecycle's ambient sky
+    ///   intensity TC[204] and colour mult TC[205..207] [I names]. Not the
+    ///   sky stand-in's zenith: that hue (light colour x the Rayleigh beta
+    ///   TC[395..397] plus a night floor (0.04, 0.06, 0.12)) is what made
+    ///   [`Lighting::from_timecycle`]'s ambient deep blue.
+    /// - Exposure: [`DAY_KEY`] (directional on) or [`NIGHT_KEY`] over the
+    ///   level of a white surface facing up, x exp2(the `ev=` bias): a fixed
+    ///   stand-in for the title's GPU exposure. The timecycle EV is not used: its
+    ///   clamp is the title's on its own units (pk7a f960: min = max = -2, which
+    ///   took two stops off a night already lit in relative units).
+    pub fn ours(tc: &[f32], sky: Option<([f32; 3], [f32; 3])>) -> (Lighting, Vec<(&'static str, usize, f32, bool, &'static str)>) {
+        let (base, table) = Lighting::from_timecycle(tc, sky);
+        let read = |at: usize, def: f32| tc.get(at).copied().filter(|x| x.is_finite()).unwrap_or(def);
+        let col = if base.moon { [read(9, 1.0), read(10, 1.0), read(11, 1.0)] } else { [read(0, 1.0), read(1, 1.0), read(2, 1.0)] }.map(|c| c.max(0.0));
+        let hue = |c: [f32; 3]| {
+            let l = lum(&c);
+            if l > 1e-6 { c.map(|x| (x / l).min(3.0)) } else { [0.0; 3] }
+        };
+        let strength = base.strength.clamp(0.0, 1.0);
+        let on = lum(&base.radiance) > 0.0 && lum(&hue(col)) > 0.0;
+        let (dir_hue, level) = if on {
+            (hue(col), if base.moon { MOON_LEVEL * strength } else { strength })
+        } else if base.dir[2] > 0.05 {
+            (hue([read(9, 1.0), read(10, 1.0), read(11, 1.0)].map(|c| c.max(0.0))), MOON_FILL)
+        } else {
+            ([0.0; 3], 0.0)
+        };
+        let dir_hue = if lum(&dir_hue) > 0.0 { dir_hue } else { [1.0; 3] };
+        let amb_i = read(204, 1.0).clamp(0.0, 4.0);
+        let amb_c = [read(205, 1.0), read(206, 1.0), read(207, 1.0)].map(|c| c.clamp(0.0, 4.0));
+        let amb_sky: [f32; 3] = std::array::from_fn(|i| AMB_SKY * SKY_TINT[i] * amb_i * amb_c[i]);
+        let amb_ground: [f32; 3] = std::array::from_fn(|i| AMB_GROUND * GROUND_TINT[i] * amb_i * amb_c[i]);
+        let direct = dir_hue.map(|x| x * level);
+        let white_up = lum(&direct) * base.dir[2].max(0.25) + lum(&amb_sky);
+        let key = if on && !base.moon { DAY_KEY } else { NIGHT_KEY };
+        let bias = ev_bias().unwrap_or(0.0);
+        let exposure = key / white_up.max(1e-3) * bias.exp2();
+        let lit = Lighting {
+            radiance: direct.map(|x| x * std::f32::consts::PI),
+            amb_sky,
+            amb_ground,
+            exposure,
+            bias,
+            sky_scale: SKY_KEY / exposure,
+            fog: sky.map_or([0.0; 3], |s| s.1),
+            ..base
         };
         (lit, table)
     }
@@ -197,7 +280,7 @@ impl Lighting {
             self.amb_ground[0], self.amb_ground[1], self.amb_ground[2], 0.0,
             c[0], c[1], c[2], c[3],
             c[4], c[5], c[6], 1.0 / hable(c[6], c),
-            self.sky_scale, 0.0, 0.0, 0.0,
+            self.sky_scale, self.fog[0], self.fog[1], self.fog[2],
         ]
     }
 
@@ -250,6 +333,42 @@ mod tests {
         let lum3 = |c: [f32; 3]| 0.2125 * c[0] + 0.7154 * c[1] + 0.0721 * c[2];
         let shade = (lum3(l.amb_sky) + lum3(l.amb_ground.map(|x| x * 2.0))) * 0.5;
         assert!((shade * l.exposure - 2.0 * AMBIENT_FLOOR).abs() < 1e-4, "{shade}");
+    }
+
+    /// `ourlight=on`: no blue cast in the ambient, the sun's hue kept, the
+    /// exposure from the keys; the directional off leaves the moon fill.
+    #[test]
+    fn ours_is_neutral_and_keyed() {
+        let lum3 = |c: [f32; 3]| 0.2125 * c[0] + 0.7154 * c[1] + 0.0721 * c[2];
+        let mut tc = vec![0f32; 0x16C0 / 4];
+        tc[..4].copy_from_slice(&[0.89, 0.675, 0.392, 1.0]);
+        tc[9..13].copy_from_slice(&[0.76, 0.9, 1.0, 0.05]);
+        tc[204..208].copy_from_slice(&[1.0; 4]);
+        (tc[0x1630 / 4], tc[0x1630 / 4 + 1], tc[0x1630 / 4 + 2]) = (0.07, -0.75, 0.66);
+        tc[0x1650 / 4] = 1.0;
+        // The a test run sky stand-in's linear zenith was (0.011, 0.049, 0.358): deep blue.
+        let sky = Some(([0.13, 0.25, 0.63], [0.4, 0.45, 0.55]));
+        let (l, _) = Lighting::ours(&tc, sky);
+        assert!(l.amb_sky[2] / l.amb_sky[0] < 1.2, "no blue cast: {:?}", l.amb_sky);
+        assert!(l.radiance[0] > l.radiance[2], "warm sun kept: {:?}", l.radiance);
+        assert!((lum3(l.radiance) / std::f32::consts::PI - 1.0).abs() < 1e-4, "full sun = 1");
+        let white_up = l.dir[2] + lum3(l.amb_sky);
+        assert!((white_up * l.exposure - DAY_KEY).abs() < 1e-3, "{}", l.exposure);
+        assert_eq!(l.fog, [0.4, 0.45, 0.55]);
+        assert_eq!(&l.constants(false)[25..28], &[0.4, 0.45, 0.55]);
+        // The title's directional light off: a moon fill, the night key.
+        tc[0x1650 / 4] = 0.0;
+        let (n, _) = Lighting::ours(&tc, sky);
+        assert!((lum3(n.radiance) / std::f32::consts::PI - MOON_FILL).abs() < 1e-4, "{:?}", n.radiance);
+        assert!(n.radiance[2] > n.radiance[0], "moon hue");
+        assert!(((MOON_FILL * n.dir[2] + lum3(n.amb_sky)) * n.exposure - NIGHT_KEY).abs() < 1e-3);
+        // Below the horizon: ambient only.
+        tc[0x1630 / 4 + 2] = -0.5;
+        let (d, _) = Lighting::ours(&tc, None);
+        assert_eq!(d.radiance, [0.0; 3]);
+        assert!(d.exposure.is_finite() && d.exposure > 0.0);
+        // The old path's constants keep zeros there.
+        assert_eq!(&Lighting::from_timecycle(&tc, sky).0.constants(false)[25..28], &[0.0; 3]);
     }
 
     #[test]

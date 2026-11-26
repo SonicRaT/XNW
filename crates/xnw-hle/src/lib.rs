@@ -304,6 +304,7 @@ exports! {
         waits::InitializeCriticalSectionAndSpinCount,
         // Thread names, affinity, the processor count.
         threads::CreateThread,
+        threads::SetThreadPriority,
         threads::SetThreadGroupAffinity,
         threads::GetLogicalProcessorInformation,
         // The title's own stack walks and memory queries.

@@ -38,6 +38,11 @@ pub(super) struct Parts {
     /// their header copied), and their bytes.
     pub in_place: u32,
     pub in_place_bytes: u64,
+    /// `skinrules` bit 5 (VEH4): one-bone vehicle parts given index and
+    /// weight streams (`one_bone_streams`), and one-bone parts left as they
+    /// were because their vertex buffer is drawn in place.
+    pub one_bone: u32,
+    pub one_bone_in_place: u32,
 }
 
 impl Parts {
@@ -49,13 +54,16 @@ impl Parts {
         self.bytes += o.bytes;
         self.in_place += o.in_place;
         self.in_place_bytes += o.in_place_bytes;
+        self.one_bone += o.one_bone;
+        self.one_bone_in_place += o.one_bone_in_place;
     }
 
     /// `asks A ms, copies C ms (N reads, K KiB), decode D ms`.
     pub fn line(&self) -> String {
         let ms = |ns: u64| ns as f64 / 1e6;
         let zc = if self.in_place > 0 { format!(" (vertex buffers in place {}, {} KiB not copied)", self.in_place, self.in_place_bytes >> 10) } else { String::new() };
-        format!("asks {:.1} ms, copies {:.1} ms ({} reads, {} KiB{zc}), decode {:.1} ms", ms(self.ask_ns), ms(self.copy_ns), self.reads, self.bytes >> 10, ms(self.decode_ns))
+        let ob = if self.one_bone + self.one_bone_in_place > 0 { format!(", one-bone parts {} (in place, not skinned {})", self.one_bone, self.one_bone_in_place) } else { String::new() };
+        format!("asks {:.1} ms, copies {:.1} ms ({} reads, {} KiB{zc}), decode {:.1} ms{ob}", ms(self.ask_ns), ms(self.copy_ns), self.reads, self.bytes >> 10, ms(self.decode_ns))
     }
 }
 
@@ -104,7 +112,7 @@ pub(super) fn read(key: &GeomKey, direct: bool, capped: bool, p: &mut Parts) -> 
     if capped {
         return Err(SKIP_RETRY_CAP);
     }
-    let vb = vb.ok_or(SKIP_UNREADABLE)?;
+    let mut vb = vb.ok_or(SKIP_UNREADABLE)?;
     let t = Instant::now();
     let (blob, elem) = if key.mesh_len != 0 {
         (copy(key.mesh_at, key.mesh_len.min(16 << 20) as usize, direct), 0)
@@ -122,8 +130,35 @@ pub(super) fn read(key: &GeomKey, direct: bool, capped: bool, p: &mut Parts) -> 
         4 => Some(blob.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect()),
         _ => None,
     };
+    let indices = indices.ok_or(SKIP_INDICES)?;
+    // `skinrules` bit 5: a one-bone vehicle part (MSR programs: one bone per
+    // vertex or per mesh, no weights) gets ordinary index and weight streams,
+    // so the pass poses it with its bone (an open door) instead of drawing
+    // the bind pose (the closed door). The program is not known here: the
+    // data rule picks exactly those parts in the captures (VEH4).
+    if elem == 0 && super::skinhook::rules() & super::skinhook::VEH_ONE_BONE != 0 {
+        one_bone(&mut vb, &blob, &indices, place.is_some(), p);
+    }
     p.decode_ns += since(t);
-    Ok(HostGeometry { vertices: Vec::new(), indices: indices.ok_or(SKIP_INDICES)?, raw_vb: Some(vb), vb_place: place.unwrap_or(0) })
+    Ok(HostGeometry { vertices: Vec::new(), indices, raw_vb: Some(vb), vb_place: place.unwrap_or(0) })
+}
+
+/// `skinrules` bit 5 on one meshlet geometry: index and weight streams
+/// appended to its vertex buffer copy when the data rule says it is a
+/// one-bone part. `in_place`: only the header was copied (the title's bytes
+/// are bound): nothing appended, counted (whole-mesh form only: the array
+/// form's bounds need the buffer).
+fn one_bone(vb: &mut Vec<u8>, blob: &[u8], indices: &[u32], in_place: bool, p: &mut Parts) {
+    let Some(w0) = blob.get(0..4).map(|b| u32::from_le_bytes(b.try_into().unwrap())) else { return };
+    let verts = indices.iter().max().map_or(0, |m| m + 1);
+    if in_place {
+        let n = u32::from(w0 >> 29 & 3 == 3 && xnw_frame::audit::one_bone_data_rule(vb, w0, 0));
+        p.one_bone_in_place += n;
+        super::skinhook::ONE_BONE[1].fetch_add(u64::from(n), std::sync::atomic::Ordering::Relaxed);
+    } else if xnw_frame::audit::one_bone_data_rule(vb, w0, verts) && xnw_frame::audit::one_bone_streams(vb, w0, verts) {
+        p.one_bone += 1;
+        super::skinhook::ONE_BONE[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// The vertex header the reader copies of a vertex buffer read in place.
@@ -279,7 +314,7 @@ struct Reader {
 }
 
 /// The reader's parts since the last [`stats`].
-static STATS: Mutex<Parts> = Mutex::new(Parts { ask_ns: 0, copy_ns: 0, decode_ns: 0, reads: 0, bytes: 0, in_place: 0, in_place_bytes: 0 });
+static STATS: Mutex<Parts> = Mutex::new(Parts { ask_ns: 0, copy_ns: 0, decode_ns: 0, reads: 0, bytes: 0, in_place: 0, in_place_bytes: 0, one_bone: 0, one_bone_in_place: 0 });
 
 /// The reader's parts since the last call, and the keys in flight.
 pub(super) fn stats() -> (Parts, usize) {
@@ -370,6 +405,30 @@ pub(super) fn meshlets(idx: &[u32]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_bone_parts() {
+        // Whole-mesh form (bone 170): streams appended, counted once.
+        let mut vb = vec![0u8; 0x80];
+        let (blob, idx) = (0xe154_0001u32.to_le_bytes(), [0u32, 1, 2]);
+        let mut p = Parts::default();
+        one_bone(&mut vb, &blob, &idx, false, &mut p);
+        assert_eq!((p.one_bone, p.one_bone_in_place, vb.len()), (1, 0, 0x80 + 3 * 8));
+        assert_eq!(u32::from_le_bytes(vb[0x80..0x84].try_into().unwrap()), 170);
+        // Again (streams there now): untouched.
+        let before = vb.clone();
+        one_bone(&mut vb, &blob, &idx, false, &mut p);
+        assert_eq!((p.one_bone, vb), (1, before));
+        // In place: only the header, nothing appended, counted.
+        let mut head = vec![0u8; 0x80];
+        one_bone(&mut head, &blob, &idx, true, &mut p);
+        assert_eq!((p.one_bone_in_place, head.len()), (1, 0x80));
+        // Not a one-bone word (array form at offset 0): untouched.
+        let mut vb = vec![0u8; 0x80];
+        one_bone(&mut vb, &5u32.to_le_bytes(), &idx, false, &mut p);
+        assert_eq!((p.one_bone, vb.len()), (1, 0x80));
+        assert!(p.line().ends_with("one-bone parts 1 (in place, not skinned 1)"));
+    }
 
     #[test]
     fn meshlet_encoder_round_trips() {

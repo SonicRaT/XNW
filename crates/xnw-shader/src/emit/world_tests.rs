@@ -687,6 +687,7 @@ fn stride_table_reads_own_views() {
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        half_views: Vec::new(),
         address_map: l.address_map,
         descriptor_words: l.descriptor_words,
     };
@@ -767,6 +768,7 @@ fn constant_loads_cbv_vs_raw() {
             root_cbvs: if srv { vec![] } else { vec![0] },
             root_srvs: if srv { vec![0] } else { vec![] },
             root_uavs: Vec::new(),
+            half_views: Vec::new(),
             address_map: false,
             descriptor_words: false,
         };
@@ -860,7 +862,7 @@ fn page_table_reads_tagged_buffer_records() {
             barycentrics: false,
         })
         .unwrap();
-        let cs = super::HostShader { stage: crate::HwStage::Cs, dxil: l.dxil, user_data: l.user_data, samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: l.root_cbvs, root_srvs: l.root_srvs, root_uavs: l.root_uavs, address_map: l.address_map, descriptor_words: l.descriptor_words };
+        let cs = super::HostShader { stage: crate::HwStage::Cs, dxil: l.dxil, user_data: l.user_data, samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: l.root_cbvs, root_srvs: l.root_srvs, root_uavs: l.root_uavs, half_views: Vec::new(), address_map: l.address_map, descriptor_words: l.descriptor_words };
         assert_eq!(cs.reads_page_table(), pagetable);
         assert_eq!(cs.host_copies(), pagetable.then_some(0));
         // Every heap index is bounded by the heap-limit constants.
@@ -930,7 +932,7 @@ fn page_table_reads_root_views_by_address() {
             barycentrics: false,
         })
         .unwrap_or_else(|e| panic!("pagetable {pagetable}: {e:?}"));
-        let cs = super::HostShader { stage: crate::HwStage::Cs, dxil: l.dxil, user_data: l.user_data, samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: l.root_cbvs, root_srvs: l.root_srvs, root_uavs: l.root_uavs, address_map: l.address_map, descriptor_words: l.descriptor_words };
+        let cs = super::HostShader { stage: crate::HwStage::Cs, dxil: l.dxil, user_data: l.user_data, samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: l.root_cbvs, root_srvs: l.root_srvs, root_uavs: l.root_uavs, half_views: Vec::new(), address_map: l.address_map, descriptor_words: l.descriptor_words };
         assert_eq!(cs.reads_page_table(), pagetable);
         if pagetable {
             assert!(cs.root_srvs.is_empty() && cs.root_cbvs.is_empty(), "{:?} {:?}", cs.root_srvs, cs.root_cbvs);
@@ -989,7 +991,7 @@ fn bindless_texture_reads_bound_their_heap_index() {
         barycentrics: false,
     })
     .unwrap();
-    let cs = super::HostShader { stage: crate::HwStage::Cs, dxil: l.dxil, user_data: l.user_data, samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: l.root_cbvs, root_srvs: l.root_srvs, root_uavs: l.root_uavs, address_map: l.address_map, descriptor_words: l.descriptor_words };
+    let cs = super::HostShader { stage: crate::HwStage::Cs, dxil: l.dxil, user_data: l.user_data, samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: l.root_cbvs, root_srvs: l.root_srvs, root_uavs: l.root_uavs, half_views: Vec::new(), address_map: l.address_map, descriptor_words: l.descriptor_words };
     assert!(cs.reads_heap_bounds());
     if let Ok(mut v) = Validator::load(Validator::default_path().as_deref()) {
         v.validate(&mut cs.dxil.clone()).unwrap();
@@ -997,7 +999,7 @@ fn bindless_texture_reads_bound_their_heap_index() {
 }
 #[test]
 fn gpu_descriptor_records() {
-    use super::host::{Dispatch, Root, Stride, View};
+    use super::host::{Dispatch, Stride, View};
     let words: &[u32] = &[
         0xBE85_0380, // s_mov_b32 s5, 0
         0xF408_0202,
@@ -1064,6 +1066,7 @@ fn gpu_descriptor_records() {
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        half_views: Vec::new(),
         address_map: l.address_map,
         descriptor_words: l.descriptor_words,
     };
@@ -1096,7 +1099,7 @@ fn gpu_descriptor_records() {
         ud[5] = 0;
         ud[6] = at;
         let out = host
-            .dispatch(&root, &pso, &Dispatch { roots: vec![(0, Root::Constants(ud))], views: &views, samplers: &[], groups: [1, 1, 1] })
+            .dispatch(&root, &pso, &Dispatch { roots: Host::roots(&cs, ud, views.len(), 0), views: &views, samplers: &[], groups: [1, 1, 1] })
             .unwrap();
         let want = if tagged { 101 } else { 901 };
         assert_eq!(out[0][2], want, "{case}");

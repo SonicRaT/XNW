@@ -163,6 +163,8 @@ pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
+    /// VIctory-7900XTX 389db9e: rasterizer ordered views.
+    pub const ROVS: u64 = 1 << 18;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const INT64: u64 = 1 << 20;
     /// victory-fork 578d459: `SV_Barycentrics` or `attributeAtVertex`.
@@ -777,6 +779,7 @@ impl Shader {
             }
             let used = self.m.usage();
             for (flag, used) in [
+                (flags::ROVS, used.rovs),
                 (flags::WAVE_OPS, used.wave_ops),
                 (flags::INT64, used.int64),
                 (flags::TYPED_UAV_LOADS, used.typed_uav_loads),
@@ -1222,6 +1225,9 @@ impl Shader {
         }
         if self.flags & flags::TYPED_UAV_LOADS != 0 {
             features |= 0x800;
+        }
+        if self.flags & flags::ROVS != 0 {
+            features |= 0x1000;
         }
         if self.flags & flags::WAVE_OPS != 0 {
             features |= 0x4000;

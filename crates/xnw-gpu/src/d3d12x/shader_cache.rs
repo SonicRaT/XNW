@@ -347,6 +347,11 @@ fn encode(s: &HostShader) -> Vec<u8> {
         out.extend(slots);
     }
     word(&mut out, u32::from(s.address_map) | u32::from(s.descriptor_words) << 1);
+    word(&mut out, s.half_views.len() as u32);
+    for &(slot, dword) in &s.half_views {
+        word(&mut out, u32::from(slot));
+        word(&mut out, dword);
+    }
     out
 }
 
@@ -401,7 +406,12 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     let root_uavs = r.list()?;
     let bits = r.word()?;
     let (address_map, descriptor_words) = (bits & 1 != 0, bits & 2 != 0);
-    r.0.is_empty().then_some(HostShader { stage, dxil, user_data, samplers, static_samplers, root_cbvs, root_srvs, root_uavs, address_map, descriptor_words })
+    let n = r.word()? as usize;
+    let mut half_views = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        half_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
+    }
+    r.0.is_empty().then_some(HostShader { stage, dxil, user_data, samplers, static_samplers, root_cbvs, root_srvs, root_uavs, half_views, address_map, descriptor_words })
 }
 
 #[cfg(test)]
@@ -418,6 +428,7 @@ mod tests {
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
             root_uavs: Vec::new(),
+            half_views: vec![(1, 8)],
             address_map: false,
             descriptor_words: false,
         }

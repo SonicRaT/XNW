@@ -190,7 +190,7 @@ pub fn audit_pixels(args: &[String], dir: &Path, out: &Path, host: &xnw_gpu::hos
         }
         let row: &DrawRecord = &all[k];
         let pipeline = pack.data.sinks.iter().find(|s| s.index == sink).map_or(0, |s| s.pipeline);
-        let entry = progs.entry(pipeline).or_insert_with(|| programs(&pack, sink));
+        let entry = progs.entry(pipeline).or_insert_with(|| programs(&pack, sink).and_then(|x| crate::bridge::pixel_refused(&pack, &x.2, host.caps.software).map_or(Ok(x), Err)));
         let (ms_hash, ps_hash) = match entry {
             Ok((_, _, h)) => (format!("{:08x}", h[0] >> 96), format!("{:08x}", h[1] >> 96)),
             Err(_) => ("-".into(), "-".into()),
@@ -322,7 +322,9 @@ impl<'a> PackSource<'a> {
 }
 
 fn src_view(v: &xnw_formats::framepack::SlotView) -> SrcView {
-    SrcView { kind: v.kind, addr: v.addr, bytes: v.bytes, format: v.format, width: v.width }
+    // A placed view's words: its resource description (14), then its view
+    // description, whose second word is the view's dimension.
+    SrcView { kind: v.kind, addr: v.addr, bytes: v.bytes, format: v.format, width: v.width, dim: bridged::title_dim(v.kind, &v.words) }
 }
 
 impl Source for PackSource<'_> {
@@ -397,6 +399,7 @@ impl Source for PackSource<'_> {
 /// table by handle. Prints both timings; `--out` writes the sheet (our
 /// pass alone above, with the title's rows below).
 pub fn bridgeps_cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, pass: &mut Pass, wanted: &[u32]) -> Result<(), String> {
+    xnw_world::bridge::title_programs_here(host).map_err(|e| format!("bridgeps: {e}"))?;
     let (mut list, geoms) = load_list(dir)?;
     let pack = Pack::open(dir)?.ok_or("--bridgeps needs a v2 capture (pack\\manifest.tsv)")?;
     let mut args = args.to_vec();
@@ -510,17 +513,33 @@ pub fn bridgeps_cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, pas
     list.frame = 1;
     pass.bridge_warm = true;
     let t0 = std::time::Instant::now();
-    let st = pass.draw(&list, &mut decode, true)?;
-    let ours = pass.read_rgba()?;
+    crate::replay::watchdog_arm();
+    let r = pass.draw(&list, &mut decode, true).and_then(|st| Ok((st, pass.read_rgba()?)));
+    crate::replay::watchdog_disarm();
+    println!("  {}", crate::replay::watch_line("bridgeps ours"));
+    let (st, ours) = r?;
     let t_ours = t0.elapsed().as_secs_f64();
     pass.bridge_warm = false;
     pass.bridge_on = true;
+    // `--warm`: the bridged frame once first (bindings, kept inputs), its picture thrown away.
+    if args.iter().any(|a| a == "--warm") {
+        crate::replay::watchdog_arm();
+        let r = pass.draw(&list, &mut decode, true);
+        crate::replay::watchdog_disarm();
+        println!("  {}", crate::replay::watch_line("bridgeps bridged warm-up"));
+        r?;
+        // What the warm-up frame drew and bound (its inputs go with the frame; the next one keeps them).
+        let warm = pass.read_rgba()?;
+        let changed = ours.chunks_exact(4).zip(warm.chunks_exact(4)).filter(|(a, b)| a[..3] != b[..3]).count();
+        println!("bridgeps: warm-up: {changed} pixels changed; {}", bridged::line(list.frame, list.bridged.as_deref().unwrap_or(&bridged::Frame::default()), &pass.bridge_stats));
+    }
     let t2 = std::time::Instant::now();
+    // Every submission of the bridged frame (with `--chunk N`: N of our draws, then N bridged rows, a submission each) under the watchdog.
     crate::replay::watchdog_arm();
-    let r = pass.draw(&list, &mut decode, true);
+    let r = pass.draw(&list, &mut decode, true).and_then(|_| pass.read_rgba());
     crate::replay::watchdog_disarm();
-    r?;
-    let theirs = pass.read_rgba()?;
+    println!("  {}", crate::replay::watch_line("bridgeps bridged"));
+    let theirs = r?;
     let t_with = t2.elapsed().as_secs_f64();
     // `--bridgeps-repeat N`: the same frame N more times (the inputs again
     // as the same bytes, as the live tap gives kept views): each frame's
@@ -528,10 +547,10 @@ pub fn bridgeps_cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, pas
     if let Some(n) = args.iter().position(|a| a == "--bridgeps-repeat").and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<u32>().ok()) {
         for k in 1..=n {
             crate::replay::watchdog_arm();
-            let r = pass.draw(&list, &mut decode, true);
+            let r = pass.draw(&list, &mut decode, true).and_then(|_| pass.read_rgba());
             crate::replay::watchdog_disarm();
-            r?;
-            let again = pass.read_rgba()?;
+            println!("  {}", crate::replay::watch_line(&format!("bridgeps repeat {k}")));
+            let again = r?;
             let differ = theirs.chunks_exact(4).zip(again.chunks_exact(4)).filter(|(a, b)| a[..3] != b[..3]).count();
             let s = &pass.bridge_stats;
             println!("bridgeps repeat {k}: record {:.2} ms (bindings {:.2}, uploads {:.2}, views {:.2}, list {:.2}); uploaded {:.1} MiB, kept {:.1} MiB ({:.1} MiB new); {differ} pixels differ from the first; {}", s.ms, s.parts[0], s.parts[1], s.parts[2], s.parts[3], s.bytes as f64 / f64::from(1 << 20), s.kept as f64 / f64::from(1 << 20), s.kept_new as f64 / f64::from(1 << 20), bridged::blocks_text(s));

@@ -993,17 +993,25 @@ fn install() {
         let write = r.params[0] == WRITE;
         // A trapped block: noted, settled (copy-back on demand), access
         // back; a write then faults again on a guard if there is one.
-        let (trapped, filling) = {
-            let g = guards();
-            (g.trapped.get(&(at / BLOCK)).copied(), g.filling.contains_key(&(at / BLOCK)))
-        };
-        if let Some(tag) = trapped {
+        //
+        // One hold of the lock from this look to the verdict below. The
+        // look used to be its own hold: a fault on a trap another thread
+        // had just lifted found the block neither trapped nor filling, and
+        // a trap laid again before the verdict asked the kernel made the
+        // page no-access once more, so the fault was passed on as someone
+        // else's and ended the process (0xc0000005; test
+        // `a_trap_laid_again_while_a_fault_is_judged_is_settled`, 20 of 20
+        // runs). Under the lock no trap is laid or lifted in between.
+        let mut g = guards();
+        if let Some(tag) = g.trapped.get(&(at / BLOCK)).copied() {
+            drop(g);
             VEH[VEH_TRAPPED].fetch_add(1, Ordering::Relaxed);
             note_fault(tag, write, r.address);
             settle(at / BLOCK, tag, true, write);
             return win::EXCEPTION_CONTINUE_EXECUTION;
         }
-        if filling {
+        if g.filling.contains_key(&(at / BLOCK)) {
+            drop(g);
             VEH[VEH_FILLING].fetch_add(1, Ordering::Relaxed);
             // Another thread's callback fills the block: wait, then retry.
             wait_filled(at / BLOCK);
@@ -1019,10 +1027,9 @@ fn install() {
                 win::EXCEPTION_CONTINUE_SEARCH
             };
         }
-        // Held across both checks: another thread may have opened the block
-        // since this one faulted, and a copy may have guarded it again since
-        // (then it is ours again, not read-only for some other reason).
-        let mut g = guards();
+        // Still held: another thread may have opened the block since this
+        // one faulted, and a copy may have guarded it again since (then it
+        // is ours again, not read-only for some other reason).
         if open(&mut g, at, at.saturating_add(1)) {
             VEH[VEH_OPENED].fetch_add(1, Ordering::Relaxed);
             return win::EXCEPTION_CONTINUE_EXECUTION;
@@ -1308,14 +1315,27 @@ mod tests {
     /// (and, here, not writable). Neither may wait for the other. One
     /// thread does it holding a lock, as the submission lock is held by our
     /// own reads at submission.
+    ///
+    /// The test took the other block's access away with nothing holding
+    /// the two callbacks together after that: where one fill had ended
+    /// (its entry gone, its protection given back) before the other
+    /// callback took the access away, that write faulted on a page no
+    /// state of ours stood for, and the handler rightly passed it on:
+    /// 0xc0000005, 21 of 30 runs, every stack `cross` <- `settle`, block
+    /// "trapped None filling None", protection no-access. The barriers
+    /// keep both fills open until both writes have landed, so each write
+    /// faults on a block that is being filled.
     #[test]
-    #[ignore = "kills the test process (0xc0000005) in about 40-60 % of runs even with the watch tests serialised (so not shared state): an AV inside the nested fill/handler path; run with --ignored to reproduce; needs its owner"]
     fn crossed_fills_do_not_wait_on_each_other() {
         let _serial = serial();
         // Below the roles' tags (0x10000 on) and the texture bypass's (0x1000-0x1FFF).
         const TAGS: std::ops::Range<u32> = 0x2000..0x2002;
         static BLOCKS: std::sync::OnceLock<[usize; 2]> = std::sync::OnceLock::new();
         static BOTH: std::sync::Barrier = std::sync::Barrier::new(2);
+        static CLOSED: std::sync::Barrier = std::sync::Barrier::new(2);
+        static WRITTEN: std::sync::Barrier = std::sync::Barrier::new(2);
+        // Writes made while the block written had no access (so they faulted).
+        static FAULTED: AtomicU64 = AtomicU64::new(0);
         fn cross(tag: u32, _address: usize, _len: usize) {
             let blocks = BLOCKS.get().unwrap();
             let other = blocks[1 - (tag - TAGS.start) as usize];
@@ -1323,9 +1343,15 @@ mod tests {
             BOTH.wait();
             // As if the other's protection had not been opened yet.
             set_protection(other / BLOCK, win::PAGE_NOACCESS);
+            CLOSED.wait();
+            if query(other).is_some_and(|i| i.protect == win::PAGE_NOACCESS) {
+                FAULTED.fetch_add(1, Ordering::Relaxed);
+            }
             // SAFETY: a write into the other test view: the handler lets it
             // through without waiting for the other thread.
             unsafe { std::ptr::write_volatile(other as *mut u8, 0xCD) };
+            // Neither fill ends before both writes have gone through.
+            WRITTEN.wait();
         }
         on_trap(TAGS, cross);
         let (a, b) = (view(1), view(1));
@@ -1348,6 +1374,8 @@ mod tests {
         for _ in 0..2 {
             finished.recv_timeout(std::time::Duration::from_secs(10)).expect("a fill waited on the other");
         }
+        // Both writes met a block without access that was being filled.
+        assert_eq!(FAULTED.load(Ordering::Relaxed), 2);
         // SAFETY: both views are ours.
         unsafe { assert_eq!((*(a as *const u8), *(b as *const u8)), (0xCD, 0xCD)) };
         // SAFETY: our views.
@@ -1357,6 +1385,61 @@ mod tests {
         }
         title_memory_remapped(a, BLOCK);
         title_memory_remapped(b, BLOCK);
+    }
+
+    /// A fault is judged on the block's state when it is judged, not when
+    /// the handler first looked: one thread reads and writes a block while
+    /// another lays and lifts a trap on it, until the handler has met
+    /// `XNW_WATCH_STRESS` (default 5,000) faults whose trap was lifted
+    /// before it looked, or 3 s have passed. Such a fault found the block
+    /// neither trapped nor filling, and where the trap was laid again
+    /// before the handler asked the kernel whether the access may go on,
+    /// it took the no-access page for someone else's and passed the
+    /// exception on (0xc0000005, the process ends: 20 of 20 runs before
+    /// the fix on each PC, at "unhandled write, block trapped
+    /// Some(0x2800)" or at the read's query).
+    #[test]
+    fn a_trap_laid_again_while_a_fault_is_judged_is_settled() {
+        let _serial = serial();
+        // No callback for this tag.
+        const TAG: u32 = 0x2800;
+        static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let env = |name: &str, default: u64| std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
+        // Spins the trap is held for, so the reader meets it.
+        let (wanted, hold) = (env("XNW_WATCH_STRESS", 5000), env("XNW_WATCH_HOLD", 16));
+        let lifted = || VEH[VEH_READ_OTHER].load(Ordering::Relaxed) + VEH[VEH_WRITE_OTHER].load(Ordering::Relaxed);
+        let view = view(1);
+        let before = lifted();
+        let trapper = std::thread::spawn(move || {
+            let (start, mut laid) = (std::time::Instant::now(), 0u64);
+            while lifted() - before < wanted && (laid % 256 != 0 || start.elapsed().as_secs() < 3) {
+                trap_reads(view, BLOCK, TAG);
+                for _ in 0..hold {
+                    std::hint::spin_loop();
+                }
+                untrap(view, BLOCK);
+                laid += 1;
+            }
+            DONE.store(true, Ordering::Relaxed);
+            laid
+        });
+        let (mut sum, mut rounds) = (0u32, 0u64);
+        while !DONE.load(Ordering::Relaxed) {
+            // SAFETY: our view; the handler gives the access back.
+            unsafe {
+                sum += u32::from(std::ptr::read_volatile((view + 8) as *const u8));
+                std::ptr::write_volatile((view + 16) as *mut u8, rounds as u8);
+            }
+            rounds += 1;
+        }
+        let laid = trapper.join().unwrap();
+        let (reads, writes, _) = read_trap_stats(TAG);
+        println!("{laid} traps laid, {rounds} rounds: {reads} reads and {writes} writes trapped, {} faults whose trap was lifted before the look", lifted() - before);
+        assert_eq!(sum, 0);
+        assert!(reads + writes > 0, "the reader met no trap");
+        // SAFETY: our view.
+        unsafe { win::UnmapViewOfFile(view as *const _) };
+        title_memory_remapped(view, BLOCK);
     }
 
     /// A callback registered for a tag range runs on the faulting

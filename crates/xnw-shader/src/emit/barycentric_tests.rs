@@ -282,6 +282,7 @@ fn copy_vs(ps: &HostShader) -> HostShader {
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
+        half_views: Vec::new(),
         address_map: false,
         descriptor_words: false,
     }

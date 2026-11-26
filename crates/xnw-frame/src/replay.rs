@@ -56,6 +56,7 @@ pub fn render_cli(args: &[String]) -> Result<(), String> {
     }
     let t_setup = Instant::now();
     let (host, mut pass) = pass_from_args(args)?;
+    crate::ui::set_caps(&host.caps);
     // `headgraph=on` (XNW_WORLD_RENDER, default off; HEAD1): the title's head compute graph first; its table feeds t74/t75 and the strands' slot 7.
     if let Some(line) = crate::head_graph::prepare(dir, &host) {
         println!("{line}");
@@ -153,7 +154,9 @@ pub fn render_one(args: &[String], dir: &std::path::Path, out: &std::path::Path,
         // `--gpucull[=check|cpu]`: the instanced rows culled by our compute pass (PERF3); `cpu`: by the reference, drawn from the CPU buffer.
         let gpucull = args.iter().find(|a| a.starts_with("--gpucull")).cloned();
         if let Some(g) = &gpucull {
-            let rep = crate::gpucull::fill(dir, &mut list, g != "--gpucull=cpu")?;
+            // `--near-rows k[,k..]`: these rows' batches near-flagged (VEH3 lab instrument).
+            let near_rows: Vec<u32> = args.iter().position(|a| a == "--near-rows").and_then(|i| args.get(i + 1)).map(|v| v.split(',').filter_map(|k| k.trim().parse().ok()).collect()).unwrap_or_default();
+            let rep = crate::gpucull::fill(dir, &mut list, g != "--gpucull=cpu", &near_rows)?;
             for l in crate::gpucull::lines(&rep, &list.cull) {
                 println!("  {l}");
             }
@@ -163,6 +166,14 @@ pub fn render_one(args: &[String], dir: &std::path::Path, out: &std::path::Path,
             }
         }
         list_options(args, &mut list);
+        // HAIR6 `XNW_HAIR_OVERLAY=pass`: the strand pixels drawn by our pass (the live path's way).
+        if crate::hair::overlay_in_pass()
+            && let Some(s) = crate::hair::take_overlay()
+        {
+            let px = s.pixels(pass.width);
+            println!("hair overlay: {} strand pixels drawn by our pass under its depth test", px.len());
+            list.hair = Some(std::sync::Arc::new(px));
+        }
         // A v2 frame gives its texels (pack origin or stored bytes) unless
         // `--tex=checker` or `--tex=off`; slots it has none for stay flat.
         let counts = std::sync::Arc::new([const { std::sync::atomic::AtomicU64::new(0) }; 3]);
@@ -170,7 +181,7 @@ pub fn render_one(args: &[String], dir: &std::path::Path, out: &std::path::Path,
         match crate::pack::Pack::open(dir)?.filter(|_| packed) {
             Some(p) => {
                 pass.tex.opts.mode = xnw_world::TexMode::Provided;
-                pass.tex.set_provider(Some(p.texel_provider(counts.clone())));
+                pass.tex.set_provider_keyed(Some(p.texel_provider(counts.clone())), Some(p.texel_keys()));
             }
             None if pass.tex.opts.mode == xnw_world::TexMode::Provided => {
                 pass.tex.opts.mode = xnw_world::TexMode::Checker;
@@ -218,6 +229,10 @@ pub fn render_one(args: &[String], dir: &std::path::Path, out: &std::path::Path,
         println!("  {}", watch_line(&format!("frame {frame_no}")));
         let scene = if crate::hair::overlay_pending() { Some(pass.read_depth()?) } else { None };
         crate::hair::overlay(&mut rgba, scene.as_deref());
+        // UI1 `ui=on` (XNW_WORLD_RENDER, default off): the frame's UI draws through the title's programs, composed over the picture.
+        if xnw_world::ui::switch_on(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default()) {
+            crate::ui::compose_frame(dir, pass, &mut rgba)?;
+        }
         write_png(out, pass.width, pass.height, &rgba).map_err(|e| e.to_string())?;
         if preskin_gpu {
             println!("  {}", xnw_world::preskin_gpu::line(list.frame, &list.preskin, &pass.preskin_stats()));
@@ -355,9 +370,13 @@ pub fn render_one(args: &[String], dir: &std::path::Path, out: &std::path::Path,
     if raw_path {
         skinned = first.skinned;
     }
-    let rgba = pass.read_rgba()?;
+    let mut rgba = pass.read_rgba()?;
     watchdog_disarm();
     println!("  {}", watch_line("probe frame, cached"));
+    // UI1 `ui=on`: the probe frame's UI draws over the picture too.
+    if xnw_world::ui::switch_on(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default()) {
+        crate::ui::compose_frame(dir, pass, &mut rgba)?;
+    }
     let skin_meshes = frame.meshes.values().filter(|m| !m.skin.is_empty()).count();
     write_png(out, w, h, &rgba).map_err(|e| e.to_string())?;
     let cam = list.main_camera().map_or(0, |c| c.viewport);
@@ -509,6 +528,8 @@ pub fn pass_from_args(args: &[String]) -> Result<(xnw_gpu::host::Host, xnw_world
     let mut pass = xnw_world::Pass::new(&host, w, h)?;
     // `--chunk N`: N draws per submission, each waited for before the next is sent.
     pass.chunk = opt("--chunk").and_then(|v| v.parse().ok()).unwrap_or(0);
+    // `XNW_WORLD_RENDER=...,cull=title|back|front[,ccw=on]` as the live pass reads it (default off).
+    pass.face_cull = xnw_world::parse_face_cull(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default());
     eprintln!("  {}: device {t_device:.0} ms, pass (pipelines) {:.0} ms", host.caps.adapter, t_setup.elapsed().as_secs_f64() * 1e3 - t_device);
     // `--shader <file>`: the world pass shader from a file (default: the built-in one).
     if let Some(f) = opt("--shader") {

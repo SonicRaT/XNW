@@ -25,7 +25,7 @@
 //!   AmbientMap, whose root 1 slot 4 UAV is slot 72 (128x128x7 RGBA16F).
 //!
 //! What stands in (each printed): the light scale (slot 21, the title's
-//! exposure, a GPU output) is LIT3's (1, 1, 1, 0) in the runner too; the
+//! exposure, a GPU output) is `lighting::LIGHT_SCALE_UNIT` in the runner too; the
 //! 384x384 sky probe the SkyClassified pair reads (root 0 slot 65) has no
 //! writer in the capture (U) and stays zero; LUTs 100 and 132 come from
 //! `--luts` when given.
@@ -85,6 +85,17 @@ pub fn hold_texture(runner: &mut Runner, addr: u64, t: &Provided) -> Result<(), 
     runner.hold(&Res::Image(Image { key: key(addr), shape: Shape::Tex2D, format: t.format, width: t.width, height: t.height, depth: 1, uav: false, texels: &t.rows }))
 }
 
+/// `XNW_CHAIN_DUMP=<dir>` (a debug export, off when unset): each step's
+/// output bytes as `<dir>/<step>-<key>.bin` (a dispatch: what
+/// `Runner::read` gives; the draw: its pixels as f32 rgba).
+fn dump(step: &str, key: u64, bytes: &[u8]) {
+    let Ok(dir) = std::env::var("XNW_CHAIN_DUMP") else { return };
+    let path = std::path::Path::new(&dir).join(format!("{step}-{key:x}.bin"));
+    if let Err(e) = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, bytes)) {
+        println!("  XNW_CHAIN_DUMP {}: {e}", path.display());
+    }
+}
+
 /// Indirect group counts from the counter's three words at `at`.
 pub fn args_at(counter: &[u8], at: u64) -> Option<[u32; 3]> {
     let w = |i: u64| counter.get((at + 4 * i) as usize..(at + 4 * i + 4) as usize).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
@@ -101,7 +112,7 @@ pub fn run(pack: &Pack, host: &xnw_gpu::host::Host, runner: &mut Runner, inputs:
     }
     if let Some((addr, bytes)) = &scale {
         runner.hold(&Res::Buffer(Buffer { key: key(*addr), kind: Kind::Structured(16), uav: false, len: bytes.len() as u64, bytes }))?;
-        lines.push(format!("held {addr:#x}: the light scale stand-in (1, 1, 1, 0)"));
+        lines.push(format!("held {addr:#x}: the light scale stand-in {:?}", crate::lighting::LIGHT_SCALE_UNIT));
     }
     let mut counter = 0u64;
     for step in CHAIN {
@@ -125,6 +136,7 @@ pub fn run(pack: &Pack, host: &xnw_gpu::host::Host, runner: &mut Runner, inputs:
             let alpha = px.iter().filter(|p| **p != xnw_world::bridge::CLEAR).map(|p| p[3]).fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), v| (a.min(v), b.max(v)));
             let max = px.iter().map(|p| p[0].max(p[1]).max(p[2])).fold(0f32, f32::max);
             hold_texture(runner, at, &t)?;
+            dump(name, key(at), &px.iter().flat_map(|p| p.iter().flat_map(|c| c.to_le_bytes())).collect::<Vec<u8>>());
             lines.push(format!("{name} (draw sink {sink}) at {w}x{h} in {secs:.2} s: untouched {untouched}, rgb not zero {nz} of {}, max {max:.4}, a {alpha:?}; held at {at:#x} (AmbientCubeIBR's root 1 slot 0)", px.len()));
             lines.extend(lacks.into_iter().map(|l| format!("    lacks: {l}")));
             let pic: Vec<u8> = px.iter().flat_map(|p| [p[0], p[1], p[2]].map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8).into_iter().chain([255])).collect();
@@ -139,12 +151,20 @@ pub fn run(pack: &Pack, host: &xnw_gpu::host::Host, runner: &mut Runner, inputs:
         let p = compute::program(pack, sink)?;
         let mut loaded = compute::load(pack, sink, &p.uses, &p.named);
         if let Step::Indirect(_, _, at) = step {
-            let words = if counter != 0 && runner.held(key(counter)).is_some() { runner.read(key(counter)).ok() } else { None };
-            match words.as_deref().and_then(|b| args_at(b, at)) {
-                Some(g) => {
+            // The record the capture names (v2.11), else the classify
+            // counter at the step's offset (LIT5, older captures).
+            let got = match compute::indirect_groups(pack, sink, runner) {
+                Some((g, rec)) => Some((g, format!("the held record at {rec:#x}"))),
+                None => {
+                    let words = if counter != 0 && runner.held(key(counter)).is_some() { runner.read(key(counter)).ok() } else { None };
+                    words.as_deref().and_then(|b| args_at(b, at)).map(|g| (g, format!("the classify counter {counter:#x} +{at:#x}")))
+                }
+            };
+            match got {
+                Some((g, from)) => {
                     loaded.groups = g;
                     loaded.lacks.retain(|l| !l.starts_with("the y and z group counts"));
-                    lines.push(format!("{name}: indirect groups {g:?} from the classify counter {counter:#x} +{at:#x}"));
+                    lines.push(format!("{name}: indirect groups {g:?} from {from}"));
                 }
                 None => lines.push(format!("{name}: no classify counter held: groups {:?} (the sink's count)", loaded.groups)),
             }
@@ -158,6 +178,7 @@ pub fn run(pack: &Pack, host: &xnw_gpu::host::Host, runner: &mut Runner, inputs:
                 for &k in &r.wrote {
                     let b = runner.read(k)?;
                     wrote.push(format!("{k:#x} {} of {} B non-zero", b.iter().filter(|x| **x != 0).count(), b.len()));
+                    dump(name, k, &b);
                 }
                 lines.push(format!("{head}: ran in {:.3} s; wrote [{}]", r.seconds, wrote.join("; ")));
             }

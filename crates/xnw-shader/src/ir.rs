@@ -1,6 +1,8 @@
 // Ported from VIctory crates/victory-shader/src/ir.rs, commit d2a4bae1f49533ef5cb512fd1b1ba1513f2e1989, GPL-3.0-or-later.
 // With VIctory open pull requests (GPL-3.0-or-later) where they touch this file: (8ae232f, d112889), (4c9a922, db20637, 3e8f2d3), (815178d), (fa5189d).
 // With victory-fork (fxceless/victory-fork, crates/victory-shader/src/ir.rs, commits 578d459 and 90228a7, GPL-3.0-or-later): `unspill` (scalars parked in VGPR lanes as virtual scalar registers, lane-mask pairs, the v_movrels fix) and scalar codes 128-254 for them.
+// With victory-fork (open pull request, head 5a55384, GPL-3.0-or-later): `operand_reads`.
+// With victory-fork (578d459, ir.rs, GPL-3.0-or-later): `thread_edges` (renaming split out as `rename`; UP6).
 //! One-to-one SSA form of a native program (decision 0003, step 1).
 //!
 //! Every machine instruction becomes one [`Inst`], except scheduling-only
@@ -427,9 +429,15 @@ pub fn build_with(
         });
     }
     split_irreducible(&mut blocks)?;
-
-    let order = reverse_postorder(&blocks);
     crate::emit::lap("ir.split", t);
+    Ok(rename(blocks, wave64, vgprs, entry_reads))
+}
+
+/// SSA renaming of linked `blocks` (registers to values, phis at joins),
+/// then the trivial phis removed. `entry_reads` (block, instruction,
+/// register): reads that take the entry value, kept out of liveness.
+fn rename(mut blocks: Vec<Block>, wave64: bool, vgprs: u16, entry_reads: Vec<(usize, usize, Reg)>) -> Program {
+    let order = reverse_postorder(&blocks);
     let t = std::time::Instant::now();
     let (live_in, live_out) = liveness(&blocks, &order);
     crate::emit::lap("ir.live", t);
@@ -504,12 +512,46 @@ pub fn build_with(
     let t = std::time::Instant::now();
     remove_trivial_phis(&mut blocks, values);
     crate::emit::lap("ir.trivial", t);
-    Ok(Program {
+    Program {
         wave64,
         vgprs,
         blocks,
         inputs,
-    })
+    }
+}
+
+/// victory-fork 578d459 (ir.rs `thread_edges`, GPL-3.0-or-later): a copy of
+/// the join for each proven (predecessor, join, destination) edge
+/// ([`crate::emit`]'s `threading`), jumping straight to the destination. The
+/// instructions still execute on that path and define fresh SSA values.
+/// Not for a program with entry reads (spilled user SGPRs: renaming again
+/// would make them ordinary reads).
+pub(crate) fn thread_edges(p: &Program, edges: &[(usize, usize, usize)]) -> Result<Program, ShaderError> {
+    let mut blocks = p.blocks.clone();
+    for block in &mut blocks {
+        block.phis.clear();
+    }
+    for &(pred, join, dest) in edges {
+        let mut copy = blocks[join].clone();
+        copy.exit = Exit::Jump(dest);
+        let target = blocks.len();
+        match &mut blocks[pred].exit {
+            Exit::Jump(t) => *t = target,
+            Exit::Branch { taken, not_taken } => {
+                if *taken == join {
+                    *taken = target;
+                }
+                if *not_taken == join {
+                    *not_taken = target;
+                }
+            }
+            _ => unreachable!("threading an incoming edge"),
+        }
+        blocks.push(copy);
+    }
+    link(&mut blocks);
+    split_irreducible(&mut blocks)?;
+    Ok(rename(blocks, p.wave64, p.vgprs, Vec::new()))
 }
 
 /// Scalar registers the compiler parked in lanes of a VGPR, as scalar moves.
@@ -1148,6 +1190,18 @@ const DROPPED: &[&str] = &[
 /// Registers read, registers written.
 type Effects = (Vec<Reg>, Vec<Reg>);
 
+/// The registers `inst` of `p` reads as operands: its reads without the old
+/// value of a VGPR it only writes. (victory-fork, ir.rs, 578d459; with the
+/// d16 half views of victory-fork 5a55384.)
+pub(crate) fn operand_reads(p: &Program, inst: &Inst) -> Vec<Reg> {
+    let lanes = 1 + u8::from(p.wave64);
+    // XNW: our `effects` adds the old values itself; here without them.
+    effects_with(&inst.machine, &inst.fields, inst.name(), lanes, p.vgprs, false)
+        .ok()
+        .flatten()
+        .map_or_else(Vec::new, |e| e.0)
+}
+
 /// Registers an instruction reads and writes, one per dword, or `None` if
 /// the IR drops it.
 fn effects(
@@ -1156,6 +1210,18 @@ fn effects(
     name: &'static str,
     lanes: u8,
     vgprs: u16,
+) -> Result<Option<Effects>, ShaderError> {
+    effects_with(inst, fields, name, lanes, vgprs, true)
+}
+
+/// [`effects`]; `old`: a written VGPR's old value counts as read.
+fn effects_with(
+    inst: &Instruction,
+    fields: &Fields,
+    name: &'static str,
+    lanes: u8,
+    vgprs: u16,
+    old: bool,
 ) -> Result<Option<Effects>, ShaderError> {
     if DROPPED.contains(&name) {
         return Ok(None);
@@ -1418,7 +1484,9 @@ fn effects(
     if vector {
         r.extend(mask(EXEC));
         // Lanes disabled in EXEC keep the old value.
-        r.extend(w.iter().filter(|w| matches!(w, Reg::V(_))));
+        if old {
+            r.extend(w.iter().filter(|w| matches!(w, Reg::V(_))));
+        }
     }
     let mut seen = Vec::with_capacity(r.len());
     r.retain(|reg| {

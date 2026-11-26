@@ -26,6 +26,14 @@
 //!   started.
 //! - Read failures set the queue's error event (slot 9) and fill its error
 //!   record (slot 10), after VIctory (8632869).
+//! - `XNW_DS_IO=handles` (off by default): a file handle per worker
+//!   (VIctory-7900XTX fbc1830).
+//! - A page list still naming page 0 when its read lands is read again for
+//!   up to 8 ms (VIctory main d09f3aa).
+//! - A physical-page write the host refuses is tried again for a quarter
+//!   of a second before its request fails (`retried`): DexNom-VIctory,
+//!   `crates/victory-hle/src/modules/dstorage.rs` at 570a941 (GPL-3.0-or-
+//!   later), proposed for the base as VIctory.
 //!
 //! zlib requests inflate with `miniz_oxide` (a stream that ends short of the
 //! destination passes). BCPack modes 1 and 3-7 decode; another mode, or an
@@ -159,7 +167,8 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
             crate::texbypass::start();
             crate::texbypass::opened(&name);
             let origin = texture_index(&host);
-            put(out, Instance::create("dstorage file", &FILE_VTABLE, File { file, name, reads, origin }))
+            let others = (0..if handles() { workers() } else { 0 }).map(|_| OnceLock::new()).collect();
+            put(out, Instance::create("dstorage file", &FILE_VTABLE, File { file, others, name, reads, origin }))
         }
         Err(error) => {
             xnw_core::warn!("dstorage: opening {name} ({}) failed: {error}; from {}", host.display(), caller());
@@ -240,6 +249,9 @@ static FACTORY_VTABLE: Table = methods(&[
 
 struct File {
     file: std::fs::File,
+    /// With `XNW_DS_IO=handles`: a handle per worker, opened at its first
+    /// read of this file ([`file_for_worker`]); empty otherwise.
+    others: Box<[OnceLock<Option<std::fs::File>>]>,
     /// The title's path, for the log.
     name: String,
     /// What has been read from the host file, for `XNW_TRACE=perf`.
@@ -607,13 +619,14 @@ fn scheduler() -> Option<&'static Scheduler> {
         // `XNW_DS_WORKERS=<n>` (default: one per logical CPU) and
         // `XNW_DS_PRIORITY=below` (workers below normal priority, so the
         // title's 20-odd job threads come first on a 12-thread CPU).
-        let workers = std::env::var("XNW_DS_WORKERS").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|&n| n > 0).unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+        let workers = workers();
         let below = std::env::var("XNW_DS_PRIORITY").is_ok_and(|v| v.trim() == "below");
         let started = (0..workers)
-            .filter(|i| {
+            .filter(|&worker| {
                 std::thread::Builder::new()
-                    .name(format!("dstorage {i}"))
+                    .name(format!("dstorage {worker}"))
                     .spawn(move || {
+                        WORKER.set(Some(worker));
                         if below {
                             // SAFETY: this thread's own priority.
                             unsafe { xnw_core::win::SetThreadPriority(xnw_core::win::GetCurrentThread(), -1) };
@@ -623,7 +636,11 @@ fn scheduler() -> Option<&'static Scheduler> {
                     .is_ok()
             })
             .count();
-        xnw_core::info!("dstorage: {started} workers{}", if below { " (below normal priority, XNW_DS_PRIORITY)" } else { "" });
+        xnw_core::info!(
+            "dstorage: {started} workers{}{}",
+            if below { " (below normal priority, XNW_DS_PRIORITY)" } else { "" },
+            if handles() { ", a file handle each (XNW_DS_IO=handles)" } else { "" }
+        );
     });
     Some(scheduler)
 }
@@ -1270,6 +1287,47 @@ fn read_source(request: &Request) -> Result<Source, HRESULT> {
 /// Nanoseconds workers spent reading files, for the summary.
 static READING: AtomicU64 = AtomicU64::new(0);
 
+/// The workers: `XNW_DS_WORKERS=<n>`, default one per logical CPU.
+fn workers() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("XNW_DS_WORKERS").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|&n| n > 0).unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()))
+    })
+}
+
+/// `XNW_DS_IO=handles`: each worker reads a file through a handle of its
+/// own; otherwise (`one`, the default) all through the title's one handle.
+/// The host does the reads of one synchronous handle one after the other:
+/// upstream measured 48 KiB random reads of levels.rpf on 24 threads at
+/// 185 MB/s through one handle, 990 MB/s through a handle each
+/// (VIctory-7900XTX fbc1830 `read_bench`, GPL-3.0-or-later; their
+/// `overlapped` and `direct` modes are not taken).
+fn handles() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XNW_DS_IO").is_ok_and(|v| v.trim() == "handles"))
+}
+
+std::thread_local! {
+    /// This thread's worker number; `None` off the pool.
+    static WORKER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// The handle this thread reads `file` through: its own (opened again by
+/// path at its first read) with `XNW_DS_IO=handles`, else the first.
+fn file_for_worker(file: &File) -> &std::fs::File {
+    let Some(i) = WORKER.get().filter(|_| !file.others.is_empty()) else {
+        return &file.file;
+    };
+    let own = file.others[i % file.others.len()].get_or_init(|| match std::fs::File::open(&file.reads.path) {
+        Ok(f) => Some(f),
+        Err(error) => {
+            xnw_core::warn!("dstorage: {} could not be opened again for a worker: {error}; the first handle is used", file.name);
+            None
+        }
+    });
+    own.as_ref().unwrap_or(&file.file)
+}
+
 /// Fills `out` (the source size) from the request's file or memory.
 fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     if request.options & MEMORY_SOURCE != 0 {
@@ -1278,7 +1336,7 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         return Ok(());
     }
     // SAFETY: a file object we created; the queued read holds it.
-    let file = &unsafe { &*request.source.cast::<Instance<File>>() }.state.file;
+    let file = file_for_worker(&unsafe { &*request.source.cast::<Instance<File>>() }.state);
     let started = std::time::Instant::now();
     let mut done = 0;
     let result = loop {
@@ -1321,9 +1379,25 @@ fn into_destination(request: &Request, len: usize, fill: impl FnOnce(&mut [u8]) 
     origins.forget_pages(pages, offset, len);
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
-    if !crate::xmem::write_physical(pages, offset, &data[..n]) {
-        return Err(E_INVALIDARG);
-    }
+    let pages = if crate::xmem::write_physical(pages, offset, &data[..n]) {
+        pages
+    } else if pages.contains(&0) {
+        late_list(request, pages, offset, &data[..n]).ok_or(E_INVALIDARG)?
+    } else {
+        // Every page is named, so the host refused the view or the commit
+        // (commit short while a load maps many pages at once): that can
+        // come right a little later, so the write is tried again before the
+        // request fails. The title polls for completion and never reads a
+        // request's result: a page left unwritten silently keeps what it held.
+        let (written, tries) = retried(|| crate::xmem::write_physical(pages, offset, &data[..n]), |ms| std::thread::sleep(std::time::Duration::from_millis(ms)));
+        if !written {
+            let error = std::io::Error::last_os_error();
+            xnw_core::warn!("dstorage: {n} bytes for physical pages not written in {tries} more tries (a page freed meanwhile, or the host refuses the view: {error}); the pages keep what they held");
+            return Err(E_INVALIDARG);
+        }
+        xnw_core::info!("dstorage: {n} bytes for physical pages written after a refusal ({tries} waits)");
+        pages
+    };
     // SAFETY: a file object we created; the queued read holds it.
     let file = file_of(request).and_then(|f| unsafe { &*f }.state.origin);
     let Some(file) = file else { return Ok(()) };
@@ -1338,6 +1412,64 @@ fn into_destination(request: &Request, len: usize, fill: impl FnOnce(&mut [u8]) 
     }
     origins.record_pages(file, request.offset, pages, offset, n);
     Ok(())
+}
+
+/// Milliseconds a page list naming page 0 is read again for (VIctory
+/// d09f3aa).
+const LATE_LIST_TRIES: u32 = 8;
+/// Page lists written late, for the log.
+static LATE_LISTS: AtomicU64 = AtomicU64::new(0);
+
+/// A destination whose pages could not be written. Page 0 is no page
+/// (numbers start at 0x10_0000), so a list naming it is one the title has
+/// not filled in yet. Ours runs nothing before `Submit` unless a queue is
+/// full, so a read should not start first; when one does, the list is read
+/// again for up to `LATE_LIST_TRIES` ms before the request fails, since the
+/// title never reads a request's result and a failed one is a model or
+/// texture left unwritten. Returns the list the bytes went to. After VIctory
+/// main d09f3aa (GPL-3.0-or-later), also in VIctory-7900XTX and DexNom-VIctory.
+fn late_list<'a>(request: &Request, pages: &'a [usize], offset: usize, data: &[u8]) -> Option<&'a [usize]> {
+    if !pages.contains(&0) {
+        return None;
+    }
+    for _ in 0..LATE_LIST_TRIES {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        // SAFETY: the title's list, read again (as in `into_destination`).
+        let again: &'a [usize] = unsafe { std::slice::from_raw_parts(request.destination.cast::<usize>(), pages.len()) };
+        if again.contains(&0) {
+            continue;
+        }
+        xnw_formats::origin::registry().forget_pages(again, offset, data.len());
+        if crate::xmem::write_physical(again, offset, data) {
+            let late = LATE_LISTS.fetch_add(1, Ordering::Relaxed) + 1;
+            if late.is_power_of_two() {
+                xnw_core::info!("dstorage: a page list filled in after its request started, written late ({late} so far)");
+            }
+            return Some(again);
+        }
+        break;
+    }
+    xnw_core::warn!("dstorage: a page list still names page 0 after {LATE_LIST_TRIES} ms ({} pages); its request fails", pages.len());
+    None
+}
+
+/// Tries of a physical-page write after the first. Before try `k` (from
+/// 0) the worker waits 2 << k ms: 2, 4,... 128, 254 ms in all (VIctory;
+/// DexNom-VIctory 570a941 `into_destination` has the same steps, 12 of them).
+const PAGE_WRITE_RETRIES: u32 = 7;
+
+/// Runs `write` until it passes, at most `PAGE_WRITE_RETRIES` more times
+/// with `wait(ms)` before each: whether it passed, and the tries after the
+/// first.
+fn retried(mut write: impl FnMut() -> bool, mut wait: impl FnMut(u64)) -> (bool, u32) {
+    let mut tries = 0;
+    let mut written = write();
+    while !written && tries < PAGE_WRITE_RETRIES {
+        wait((2u64 << tries.min(6)).min(128));
+        tries += 1;
+        written = write();
+    }
+    (written, tries)
 }
 
 /// Slots by the 2020 order, which the argument shapes at the title's call
@@ -1356,6 +1488,27 @@ static QUEUE_VTABLE: Table = methods(&[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refused physical-page write is tried again with growing waits and
+    /// given up after seven.
+    #[test]
+    fn a_refused_page_write_is_tried_again() {
+        let mut waits = Vec::new();
+        assert_eq!(retried(|| true, |ms| waits.push(ms)), (true, 0));
+        assert!(waits.is_empty());
+        let mut left = 3;
+        let third = retried(
+            || {
+                left -= 1;
+                left < 0
+            },
+            |ms| waits.push(ms),
+        );
+        assert_eq!((third, &waits[..]), ((true, 3), &[2, 4, 8][..]));
+        waits.clear();
+        assert_eq!(retried(|| false, |ms| waits.push(ms)), (false, PAGE_WRITE_RETRIES));
+        assert_eq!(waits, [2, 4, 8, 16, 32, 64, 128]);
+    }
 
     fn call<F: Copy>(object: *mut c_void, slot: usize) -> F {
         // SAFETY: every object here starts with the runtime header.
@@ -1712,6 +1865,31 @@ mod tests {
         assert!(l.start().is_some());
     }
 
+    /// With handles per worker, a worker reads the file through its own
+    /// handle, opened once, and gets the same bytes; a thread off the pool
+    /// reads through the first.
+    #[test]
+    fn a_worker_reads_through_its_own_handle() {
+        use std::os::windows::io::AsRawHandle;
+        let path = PathBuf::from(env!("CARGO_MANIFEST_PATH"));
+        let reads: &'static FileReads = Box::leak(Box::new(FileReads { path: path.clone(), package: false, counts: Default::default(), logged: AtomicU64::new(0) }));
+        let file = File { file: std::fs::File::open(&path).unwrap(), others: (0..2).map(|_| OnceLock::new()).collect(), name: "test".into(), reads, origin: None };
+        let first = file.file.as_raw_handle() as usize;
+        assert_eq!(file_for_worker(&file).as_raw_handle() as usize, first, "off the pool");
+        let want = std::fs::read(&path).unwrap();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                WORKER.set(Some(3));
+                let own = file_for_worker(&file).as_raw_handle() as usize;
+                assert_ne!(own, first);
+                assert_eq!(file_for_worker(&file).as_raw_handle() as usize, own, "opened once");
+                let mut got = vec![0; want.len()];
+                assert_eq!(file_for_worker(&file).seek_read(&mut got, 0).unwrap(), want.len());
+                assert_eq!(got, want);
+            });
+        });
+    }
+
     /// At most `PACKAGE_READERS` reads of the full package run; other
     /// queues' reads still start meanwhile.
     #[test]
@@ -1719,7 +1897,7 @@ mod tests {
         let reads: &'static FileReads =
             Box::leak(Box::new(FileReads { path: PathBuf::from("slow"), package: true, counts: Default::default(), logged: AtomicU64::new(0) }));
         let file = std::fs::File::open(env!("CARGO_MANIFEST_PATH")).unwrap();
-        let slow = Instance::create("dstorage file", &FILE_VTABLE, File { file, name: "slow".into(), reads, origin: None });
+        let slow = Instance::create("dstorage file", &FILE_VTABLE, File { file, others: Box::new([]), name: "slow".into(), reads, origin: None });
         let mut l = lanes(STAGING);
         l.lanes.insert(0, lane(0, 64));
         l.lanes.insert(1, lane(0, 64));

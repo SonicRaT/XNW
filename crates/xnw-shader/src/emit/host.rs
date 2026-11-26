@@ -126,14 +126,10 @@ impl Host {
         self.root_signature_records(stages, &[])
     }
 
-    /// [`Host::root_signature_for`] plus root raw-buffer views in
-    /// [`super::mesh::RECORD_SPACE`] after the others: (UAV, register)
-    /// (XNW: the mesh fallback's record and index buffers).
-    pub fn root_signature_records(
-        &self,
-        stages: &[(&HostShader, D3D12_SHADER_VISIBILITY)],
-        records: &[(bool, u32)],
-    ) -> Result<ID3D12RootSignature, String> {
+    /// The root parameters of [`Host::root_signature_records`] (constants
+    /// and root views only: nothing in them points anywhere) and the index
+    /// of the heap-bounds constants, when a stage reads them.
+    fn root_parameters(stages: &[(&HostShader, D3D12_SHADER_VISIBILITY)], records: &[(bool, u32)]) -> (Vec<D3D12_ROOT_PARAMETER1>, Option<u32>) {
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = stages
             .iter()
             .map(|&(s, vis)| D3D12_ROOT_PARAMETER1 {
@@ -254,9 +250,13 @@ impl Host {
             });
         }
         // XNW: the heap-limit constants (`b0` in HEAP_BOUNDS_SPACE),
-        // one parameter for every stage. shortcut (tests): left unset, so a
-        // device test that indexes a heap must set them.
+        // one parameter for every stage, last. Unset they read 0 on the
+        // software adapter: every heap index then names slot 0 (the "null"
+        // word), so a device test that indexes a heap sets them
+        // ([`Host::roots`], [`Host::heap_bounds_parameter`]).
+        let mut bounds = None;
         if stages.iter().any(|(s, _)| s.reads_heap_bounds()) {
+            bounds = Some(params.len() as u32);
             params.push(D3D12_ROOT_PARAMETER1 {
                 ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
@@ -265,6 +265,38 @@ impl Host {
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
         }
+        (params, bounds)
+    }
+
+    /// The root parameter of the heap-bounds constants (eight words, see
+    /// `Shader::bounded`) in the signature [`Host::root_signature_records`]
+    /// makes for these stages; `None` when no stage reads them.
+    pub fn heap_bounds_parameter(stages: &[(&HostShader, D3D12_SHADER_VISIBILITY)], records: &[(bool, u32)]) -> Option<u32> {
+        Self::root_parameters(stages, records).1
+    }
+
+    /// For tests: the root arguments of a compute program from
+    /// [`Host::compute_pipeline`]: its user data, then the heap bounds when
+    /// it reads them (`views` view slots and `samplers` sampler slots are
+    /// in range; the null of every kind is slot 0).
+    #[cfg(test)]
+    pub fn roots(cs: &HostShader, user_data: Vec<u32>, views: usize, samplers: usize) -> Vec<(u32, Root)> {
+        let mut roots = vec![(0, Root::Constants(user_data))];
+        if let Some(p) = Self::heap_bounds_parameter(&[(cs, D3D12_SHADER_VISIBILITY_ALL)], &[]) {
+            roots.push((p, Root::Constants(vec![views as u32, 0, 0, 0, 0, 0, samplers as u32, 0])));
+        }
+        roots
+    }
+
+    /// [`Host::root_signature_for`] plus root raw-buffer views in
+    /// [`super::mesh::RECORD_SPACE`] after the others: (UAV, register)
+    /// (XNW: the mesh fallback's record and index buffers).
+    pub fn root_signature_records(
+        &self,
+        stages: &[(&HostShader, D3D12_SHADER_VISIBILITY)],
+        records: &[(bool, u32)],
+    ) -> Result<ID3D12RootSignature, String> {
+        let (params, _) = Self::root_parameters(stages, records);
         let mut samplers = Vec::new();
         for &(s, vis) in stages {
             for (n, d) in s.static_samplers.iter().enumerate() {
@@ -340,6 +372,7 @@ impl Host {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            half_views: Vec::new(),
             address_map: false,
             descriptor_words: false,
         };
@@ -672,6 +705,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
+        half_views: Vec::new(),
         address_map: false,
         descriptor_words: false,
     }
@@ -1069,6 +1103,10 @@ pub enum View<'a> {
     UintTextureUav(u32, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
+    /// The same buffer viewed as R16G16B16A16_UINT: what a translated
+    /// program that moves halves is shown ([`super::HostShader::half_views`];
+    /// victory-fork 5a55384).
+    HalfUintUav(u32),
     /// A constant buffer of these dwords.
     Cbv(&'a [u32]),
     /// A buffer SRV over these dwords.
@@ -1318,12 +1356,18 @@ impl Host {
                         );
                         keep.push(tex);
                     }
-                    View::RawUav(_) | View::HalfUav(_) => {
+                    View::RawUav(_) | View::HalfUav(_) | View::HalfUintUav(_) => {
                         // (dwords, format, elements, flags)
                         let (n, format, elements, flags) = match *v {
                             View::HalfUav(e) => (
                                 2 * e,
                                 DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                e,
+                                D3D12_BUFFER_UAV_FLAG_NONE,
+                            ),
+                            View::HalfUintUav(e) => (
+                                2 * e,
+                                DXGI_FORMAT_R16G16B16A16_UINT,
                                 e,
                                 D3D12_BUFFER_UAV_FLAG_NONE,
                             ),

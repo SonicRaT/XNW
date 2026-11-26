@@ -80,7 +80,7 @@ pub(crate) unsafe fn read(block: *const u8, phases: *const u32) -> (u32, u32) {
 }
 
 /// This thread's (phase, stage), if it has a title TLS block.
-fn here() -> Option<(u32, u32)> {
+pub(crate) fn here() -> Option<(u32, u32)> {
     let base = super::object::title_base();
     let index = xnw_core::TITLE_TLS_INDEX.load(Relaxed) as usize;
     if base == 0 {

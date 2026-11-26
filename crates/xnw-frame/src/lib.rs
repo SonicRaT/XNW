@@ -25,6 +25,7 @@ pub mod pack;
 pub mod preskin;
 pub mod preskin_gpu;
 pub mod replay;
+pub mod ui;
 pub mod world;
 
 pub use decode::*;

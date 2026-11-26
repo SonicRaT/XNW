@@ -130,7 +130,8 @@ fn textures(title: usize) -> Vec<(String, u64, usize)> {
     out
 }
 
-/// Once a frame from the writer thread (worldprobe's render_frame).
+/// Once a frame: from the writer thread (worldprobe's render_frame), or
+/// without the render path from the first hook draw of the frame.
 pub(crate) fn tick(title: usize, frame: u64) {
     let m = mode();
     if m == Mode::Off {
@@ -138,7 +139,7 @@ pub(crate) fn tick(title: usize, frame: u64) {
     }
     static FIRST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
     let first = FIRST.load(std::sync::atomic::Ordering::Relaxed);
-    if first != u64::MAX && !(frame - first).is_multiple_of(600) {
+    if first != u64::MAX && !frame.wrapping_sub(first).is_multiple_of(600) {
         return;
     }
     let tex = textures(title);

@@ -66,7 +66,13 @@ fn f32s<const N: usize>(b: &[u8]) -> [f32; N] {
 /// `device` false (`--gpucull=cpu`): the rows draw the reference's instances
 /// from the list's CPU buffer instead (the same batches and origins), so a
 /// picture against `--gpucull` isolates the device path.
-pub fn fill(dir: &Path, list: &mut FrameList, device: bool) -> Result<Report, String> {
+/// `near_rows` (`--near-rows k[,k..]`, list rows): every instance of these
+/// rows' batches counts as flagged in the batch's near fade-in bitset (VEH3).
+/// The captures hold no near bitset (nor the hide one), and the fp16 the
+/// rule reads is set on most batch props (h = 60, 150, 300 in pk8a f1030's
+/// stage 21), so "all flagged" for every batch is wrong; this is a lab
+/// instrument for one batch whose flagged instance is known, not a rule.
+pub fn fill(dir: &Path, list: &mut FrameList, device: bool, near_rows: &[u32]) -> Result<Report, String> {
     let mut rep = Report::default();
     let rows_v1: HashMap<u32, usize> = std::fs::read_to_string(dir.join("list-draws.tsv")).map_err(|e| format!("list-draws.tsv: {e}"))?.lines().skip(1).filter_map(|l| l.split_once('\t')).filter_map(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?))).collect();
     let tsv = std::fs::read_to_string(dir.join("draws.tsv")).map_err(|e| format!("draws.tsv: {e}"))?;
@@ -139,7 +145,8 @@ pub fn fill(dir: &Path, list: &mut FrameList, device: bool) -> Result<Report, St
                 };
                 let n = (records.len() / 64) as u32;
                 // The live batch test already passed (the row is listed): every record is tested against the planes.
-                let Some(i) = list.cull.push(Batch { records: records.clone(), len: n, keep, lod, hide: Vec::new(), origin, planes: Some(planes), out_first: 0 }) else {
+                let near = if near_rows.contains(&(row as u32)) { vec![u32::MAX; n.div_ceil(32) as usize] } else { Vec::new() };
+                let Some(i) = list.cull.push(Batch { records: records.clone(), len: n, keep, lod, hide: Vec::new(), near, origin, planes: Some(planes), out_first: 0 }) else {
                     left("cull frame full");
                     continue;
                 };

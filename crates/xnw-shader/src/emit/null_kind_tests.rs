@@ -251,6 +251,7 @@ fn null_kind_one() {
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
         root_uavs: vec![0],
+        half_views: Vec::new(),
         address_map: false,
         descriptor_words: false,
     };

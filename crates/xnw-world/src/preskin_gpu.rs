@@ -1040,6 +1040,9 @@ pub fn run(host: &xnw_gpu::host::Host, items: &[Item]) -> Result<(Vec<(Vec<[f32;
         queue.Signal(&fence, 1).map_err(e)?;
         while fence.GetCompletedValue() < 1 {
             dev.GetDeviceRemovedReason().map_err(|x| format!("device removed: {}", e(x)))?;
+            if xnw_gpu::gpuwatch::overdue("preskin gpu", sent) {
+                return Err("preskin gpu: the submission was given up".into());
+            }
             std::thread::yield_now();
         }
         xnw_gpu::gpuwatch::end("preskin gpu", sent, None);

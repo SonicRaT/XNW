@@ -1,4 +1,5 @@
 // Ported from VIctory crates/victory-shader/src/resource.rs, commit d2a4bae1f49533ef5cb512fd1b1ba1513f2e1989, GPL-3.0-or-later.
+// With victory-fork (578d459, GPL-3.0-or-later): copy propagation over every phi edge where skipping undefined edges does not settle.
 // With VIctory (499bd98, GPL-3.0-or-later): multi-term, scaled, masked and phi-joined addresses in resource tracking.
 //! Resource tracking (decision 0003): where each descriptor a program uses
 //! comes from, in terms of the root signature.
@@ -316,13 +317,19 @@ impl<'a> Tracer<'a> {
             origin: Vec::new(),
             sums: RefCell::new(HashMap::new()),
         };
-        t.origin = t.propagate_copies(n)?;
+        // XNW: undefined phi edges are skipped (501b3bc7); where that does
+        // not settle (6 programs: hair resolve, the shallow-water step), the
+        // base's propagation over every edge (victory-fork 578d459).
+        t.origin = match t.propagate_copies(n, true) {
+            Err(ShaderError::Unsupported { .. }) => t.propagate_copies(n, false)?,
+            other => other?,
+        };
         Ok(t)
     }
 
     /// Optimistic copy propagation: a move's result is its source's
     /// origin, a phi's the one origin its arguments agree on.
-    fn propagate_copies(&self, n: usize) -> Result<Vec<Term>, ShaderError> {
+    fn propagate_copies(&self, n: usize, skip_undefined: bool) -> Result<Vec<Term>, ShaderError> {
         let mut o: Vec<Option<Term>> = vec![None; n];
         for &(_, v) in &self.p.inputs {
             o[v.0 as usize] = Some(Term::Value(v));
@@ -338,7 +345,7 @@ impl<'a> Tracer<'a> {
                         .args
                         .iter()
                         .filter_map(|a| o[a.0 as usize])
-                        .filter(|&t| t != own && !self.undefined(t));
+                        .filter(|&t| t != own && !(skip_undefined && self.undefined(t)));
                     let new = args
                         .next()
                         .map(|first| if args.all(|t| t == first) { first } else { own });

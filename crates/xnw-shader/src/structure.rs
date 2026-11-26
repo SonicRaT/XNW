@@ -1,6 +1,9 @@
 // Ported from VIctory crates/victory-shader/src/structure.rs, commit d2a4bae1f49533ef5cb512fd1b1ba1513f2e1989, GPL-3.0-or-later.
 // With VIctory open pull requests (GPL-3.0-or-later) where they touch this file: (8ae232f, d112889), (4c9a922, db20637, 3e8f2d3), (815178d), (fa5189d), (ec337a0, spilled lane masks), #878 (permadiego 7ab94ab, s_bcnt1 SCC of a mask).
 // With DexNom-VIctory (GPL-3.0-or-later) 76749ce: a wave64 mask restored through s_mov_b32 copies.
+// With VIctory (open pull request, 39ba8d3, GPL-3.0-or-later): an opaque mask carries both dwords of its pair.
+// With victory-fork (578d459, GPL-3.0-or-later): lane-mask phi joins (`PhiJoin`, `phi_masks`, derived phis,
+// `check_joins`) and `clear_after_loop`, verbatim.
 //! Control-flow structurisation (decision 0003): the program as one lane
 //! runs it, without EXEC.
 //!
@@ -49,8 +52,9 @@ pub enum Atom {
     Quad(Value),
     /// A mask the pass cannot see into (loaded, built from scalars, an
     /// EXEC write it does not follow): the lane's bit of the register pair
-    /// this value is a dword of.
-    Opaque(Value),
+    /// holding these values, low dword first (the same value in wave32).
+    /// (VIctory open pull request, 39ba8d3: both dwords, not the low one alone.)
+    Opaque(Value, Value),
     /// A constant mask other than all lanes or none.
     Constant(u64),
 }
@@ -396,6 +400,9 @@ pub struct Structured {
     /// ballot there gives the mask as data. No split low dword, as in
     /// `masks`.
     pub active: HashSet<Value>,
+    /// Incoming lane boolean per predecessor edge (in block predecessor order)
+    /// for each [`Atom::Phi`] id.
+    pub phi_masks: HashMap<Value, Vec<Bool>>,
 }
 
 /// Builds the per-lane form of `program`.
@@ -413,15 +420,19 @@ pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
         let cond = l.paths()?;
         lap("st.paths", t);
         let t = Instant::now();
-        let wrong = l.wrong_joins(&cond);
+        let (wrong, new_derived) = l.check_joins(&cond);
         lap("st.wrong", t);
-        if wrong.is_empty() {
+        if l.b.overflow {
+            return Err(TOO_LARGE);
+        }
+        if wrong.is_empty() && new_derived.is_empty() {
             let t = Instant::now();
             let r = l.finish(&execs, &cond);
             lap("st.finish", t);
             return r;
         }
         l.unresolved.extend(wrong);
+        l.derived_phis.extend(new_derived);
         l.reset();
     }
 }
@@ -443,6 +454,9 @@ struct Lanes<'a> {
     phis: Map<Value, (usize, usize)>,
     /// Mask joins found wrong when resolved to a constant: atoms instead.
     unresolved: HashSet<Value>,
+    /// Phi ids whose joins depend on EXEC or VALU results (including along
+    /// back edges), carried across resets so their joins stay in `masks`.
+    derived_phis: HashSet<Value>,
     b: Bools,
     /// Masks derived from EXEC and VALU results.
     masks: Map<Key, Bool>,
@@ -456,6 +470,10 @@ struct Lanes<'a> {
     scc_lane: Map<Value, Bool>,
     /// Joins resolved to a constant, to check once all edges are known.
     joins: Vec<Join>,
+    /// [`Atom::Phi`] joins created in the current pass, resolved in
+    /// `check_joins` and exported in `finish`.
+    phi_joins: Vec<PhiJoin>,
+    phi_join_ids: HashSet<Value>,
     /// Per block: what a lane knows on entry, over forward edges only.
     first: Vec<Bool>,
     /// Per block ending in a branch: when a lane takes it.
@@ -471,6 +489,16 @@ struct Join {
     /// The phi value naming the join.
     id: Value,
     value: bool,
+    derived: bool,
+    args: Vec<Key>,
+}
+
+/// A mask join represented as [`Atom::Phi`], whose incoming edge masks are
+/// resolved once every block (including loop back edges) has been visited.
+struct PhiJoin {
+    block: usize,
+    id: Value,
+    derived: bool,
     args: Vec<Key>,
 }
 
@@ -517,12 +545,15 @@ impl<'a> Lanes<'a> {
             defs,
             phis,
             unresolved: HashSet::new(),
+            derived_phis: HashSet::new(),
             b: Bools::new(),
             masks: Map::default(),
             other: Map::default(),
             seen: Vec::new(),
             scc_lane: Map::default(),
             joins: Vec::new(),
+            phi_joins: Vec::new(),
+            phi_join_ids: HashSet::new(),
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
             active: HashSet::new(),
@@ -536,6 +567,8 @@ impl<'a> Lanes<'a> {
         self.seen.clear();
         self.scc_lane.clear();
         self.joins.clear();
+        self.phi_joins.clear();
+        self.phi_join_ids.clear();
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
         self.active.clear();
@@ -608,28 +641,61 @@ impl<'a> Lanes<'a> {
         }
     }
 
-    /// Joins whose constant fails on some edge, given what lanes know.
-    fn wrong_joins(&mut self, cond: &[Bool]) -> Vec<Value> {
+    /// Joins whose constant fails on some edge, and joins that need another
+    /// pass because a later edge turned out to derive from EXEC or VALU.
+    fn check_joins(&mut self, cond: &[Bool]) -> (Vec<Value>, Vec<Value>) {
         let mut wrong = Vec::new();
+        let mut new_derived = Vec::new();
+        let mut seen_derived = HashSet::new();
         let mut j = 0;
+        let mut p = 0;
         // Checking an argument can resolve another join; it is checked too.
-        while j < self.joins.len() {
-            let (block, id, value) = (self.joins[j].block, self.joins[j].id, self.joins[j].value);
-            for (n, a) in self.joins[j].args.clone().into_iter().enumerate() {
-                let (q, taken) = self.incoming[block][n];
-                let e = self.edge(cond[q], q, taken);
-                let mut m = self.mask(a).0;
-                if !value {
-                    m = self.b.not(m);
+        while j < self.joins.len() || p < self.phi_joins.len() {
+            while j < self.joins.len() {
+                let (block, id, value, was_derived) = (
+                    self.joins[j].block,
+                    self.joins[j].id,
+                    self.joins[j].value,
+                    self.joins[j].derived,
+                );
+                let mut failed = false;
+                for (n, a) in self.joins[j].args.clone().into_iter().enumerate() {
+                    let (q, taken) = self.incoming[block][n];
+                    let e = self.edge(cond[q], q, taken);
+                    let (mut m, d) = self.mask(a);
+                    if !was_derived
+                        && d
+                        && !self.derived_phis.contains(&id)
+                        && seen_derived.insert(id)
+                    {
+                        new_derived.push(id);
+                    }
+                    if !value {
+                        m = self.b.not(m);
+                    }
+                    if !failed && !self.b.implies(e, m) {
+                        wrong.push(id);
+                        failed = true;
+                    }
                 }
-                if !self.b.implies(e, m) {
-                    wrong.push(id);
-                    break;
-                }
+                j += 1;
             }
-            j += 1;
+            while p < self.phi_joins.len() {
+                let (id, was_derived) = (self.phi_joins[p].id, self.phi_joins[p].derived);
+                for a in self.phi_joins[p].args.clone() {
+                    let (_, d) = self.mask(a);
+                    if !was_derived
+                        && d
+                        && !self.derived_phis.contains(&id)
+                        && seen_derived.insert(id)
+                    {
+                        new_derived.push(id);
+                    }
+                }
+                p += 1;
+            }
         }
-        wrong
+        (wrong, new_derived)
     }
 
     fn finish(
@@ -637,6 +703,22 @@ impl<'a> Lanes<'a> {
         execs: &[Vec<Option<Bool>>],
         cond: &[Bool],
     ) -> Result<Structured, ShaderError> {
+        let phi_joins = std::mem::take(&mut self.phi_joins);
+        let mut phi_masks = HashMap::with_capacity(phi_joins.len());
+        for pj in phi_joins {
+            let incoming: Vec<Bool> = pj
+                .args
+                .into_iter()
+                .enumerate()
+                .map(|(n, a)| {
+                    let (q, taken) = self.incoming[pj.block][n];
+                    let e = self.edge(cond[q], q, taken);
+                    let m = self.mask(a).0;
+                    self.b.given(m, e)
+                })
+                .collect();
+            phi_masks.insert(pj.id, incoming);
+        }
         let blocks = &self.p.blocks;
         let b = &mut self.b;
         let guards = blocks
@@ -698,6 +780,7 @@ impl<'a> Lanes<'a> {
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),
             active: self.active,
+            phi_masks,
             bools: self.b,
             exits,
             guards,
@@ -823,15 +906,10 @@ impl<'a> Lanes<'a> {
                     })
                 };
                 let derived = exec_write(lo, k.0) || exec_write(hi, k.1);
-                // shortcut: the atom names the pair by its low dword, and
-                // lowering takes the high dword written beside it. For halves
-                // written apart (two `s_mov_b32`) lanes 32-63 are wrong unless
-                // lowering has no value for the low dword (EXEC, compares)
-                // and refuses. Give the atom both dwords when such code
-                // turns up.
                 let m = m.unwrap_or_else(|| {
-                    let born = self.born(k.0);
-                    self.b.atom(Atom::Opaque(k.0), born)
+                    // Redefined where either dword is (VIctory 39ba8d3).
+                    let born = self.born(k.0).max(self.born(k.1));
+                    self.b.atom(Atom::Opaque(k.0, k.1), born)
                 });
                 (m, derived)
             }
@@ -881,7 +959,7 @@ impl<'a> Lanes<'a> {
             .map(|n| (arg(lo, k.0, n), arg(hi, k.1, n)))
             .collect();
         let id = lo.map_or(k.1, |_| k.0);
-        let mut derived = false;
+        let mut derived = self.derived_phis.contains(&id);
         // (edge condition, mask) per forward edge; back edges come later.
         let mut forward = Vec::new();
         for (n, &a) in args.iter().enumerate() {
@@ -913,12 +991,21 @@ impl<'a> Lanes<'a> {
                         block,
                         id,
                         value,
+                        derived,
                         args,
                     });
                     let m = if value { Bool::TRUE } else { Bool::FALSE };
                     return Some((m, derived));
                 }
             }
+        }
+        if self.phi_join_ids.insert(id) {
+            self.phi_joins.push(PhiJoin {
+                block,
+                id,
+                derived,
+                args,
+            });
         }
         let born = self.index[block];
         Some((self.b.atom(Atom::Phi(id), born), derived))
@@ -1007,9 +1094,13 @@ impl<'a> Lanes<'a> {
             "cselect" => {
                 let (a, c) = (arg(0, self)?, arg(1, self)?);
                 let scc = inst.read(Reg::Scc)?;
-                let born = self.born(scc);
-                let u = self.b.atom(Atom::Uniform(scc), born);
-                (self.b.ite(u, a, c), None)
+                if self.clear_after_loop(scc) {
+                    (c, None)
+                } else {
+                    let born = self.born(scc);
+                    let u = self.b.atom(Atom::Uniform(scc), born);
+                    (self.b.ite(u, a, c), None)
+                }
             }
             _ => {
                 let (a, c) = (arg(0, self)?, arg(1, self)?);
@@ -1023,6 +1114,31 @@ impl<'a> Lanes<'a> {
             derived,
             scc,
         })
+    }
+
+    /// Whether SCC value `scc` is clear wherever it is read: the instruction before an
+    /// `s_cbranch_execnz` that closes a loop wrote it as "the EXEC it leaves is not
+    /// empty" (`s_andn2_wrexec`, say), and the wave leaves `do { .. } while (EXEC)`
+    /// with EXEC empty. A read inside the loop or behind another way out of it sees a
+    /// join of this value, not the value itself. (victory-fork 578d459, verbatim.)
+    fn clear_after_loop(&self, scc: Value) -> bool {
+        let Some(&(b, i)) = self.defs.get(&scc) else {
+            return false;
+        };
+        let block = &self.p.blocks[b];
+        let (Some(writer), Some(last)) = (block.insts.get(i), block.insts.last()) else {
+            return false;
+        };
+        let exec = writer.write(Reg::S(EXEC));
+        let back = match block.exit {
+            Exit::Branch { taken, .. } => self.index[taken] <= self.index[b],
+            _ => false,
+        };
+        back && i + 2 == block.insts.len()
+            && exec.is_some()
+            && last.name() == "s_cbranch_execnz"
+            && last.read(Reg::S(EXEC)) == exec
+            && (!self.p.wave64 || last.read(Reg::S(EXEC + 1)) == writer.write(Reg::S(EXEC + 1)))
     }
 
     fn combine(&mut self, f: &str, a: Bool, c: Bool) -> Option<Bool> {
@@ -1481,5 +1597,82 @@ mod tests {
         assert_eq!(p.blocks[0].exit.successors(), [2, 4]);
         assert_eq!(p.blocks[1].preds, [2]);
         assert!(structure(&p).is_ok());
+    }
+
+    // victory-fork 578d459 (GPL-3.0-or-later): the phi_masks tests, verbatim.
+    #[test]
+    fn mask_phi_joining_constant_and_compare_records_edge_bools() {
+        let cnd = 258 | (259 << 9) | (2 << 18);
+        let p = build(
+            &[
+                0xBF06_8000, // 0: s_cmp_eq_u32 s0, 0
+                0xBF85_0002, // 4: s_cbranch_scc1 -> 16
+                0xBE82_0380, // 8: s_mov_b32 s2, 0
+                0xBF82_0002, // 12: s_branch -> 24
+                0xD4C2_0002,
+                0x0002_0080, // 16: v_cmp_eq_u32 s2, 0, v0
+                0xD501_0001,
+                cnd, // 24: v_cndmask_b32 v1, v2, v3, s2
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let phi = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.phis)
+            .find(|phi| phi.reg == Reg::S(2))
+            .expect("mask phi for s2");
+        assert_eq!(
+            s.masks.get(&phi.value).and_then(|&m| s.bools.node(m)),
+            Some((Atom::Phi(phi.value), Bool::FALSE, Bool::TRUE))
+        );
+        let edges = &s.phi_masks[&phi.value];
+        assert_eq!(edges.len(), 2);
+        assert!(edges.contains(&Bool::FALSE), "{edges:?}");
+        assert!(
+            edges
+                .iter()
+                .any(|&e| matches!(s.bools.support(e)[..], [Atom::Lane(_)])),
+            "{edges:?}"
+        );
+    }
+
+    #[test]
+    fn loop_mask_accumulator_from_zero_tracks_phi_and_edges() {
+        let cnd = 258 | (259 << 9) | (2 << 18);
+        let p = build(
+            &[
+                0xBE82_0480, // 0: s_mov_b64 s[2:3], 0
+                0xBE84_0380, // 4: s_mov_b32 s4, 0
+                0xD501_0001,
+                cnd,         // 8: v_cndmask_b32 v1, v2, v3, s[2:3]
+                0x7D84_0080, // 16: v_cmp_eq_u32 vcc, 0, v0
+                0x8882_026A, // 20: s_or_b64 s[2:3], vcc, s[2:3]
+                0x8004_8104, // 24: s_add_u32 s4, s4, 1
+                0xBF0A_8404, // 28: s_cmp_lt_u32 s4, 4
+                0xBF85_FFF9, // 32: s_cbranch_scc1 -> 8
+                0xD501_0004,
+                cnd, // 36: v_cndmask_b32 v4, v2, v3, s[2:3]
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let phi = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.phis)
+            .find(|phi| phi.reg == Reg::S(2))
+            .expect("loop mask phi for s[2:3]");
+        assert!(s.masks.contains_key(&phi.value));
+        let edges = &s.phi_masks[&phi.value];
+        assert_eq!(edges.len(), 2);
+        assert!(edges.contains(&Bool::FALSE), "{edges:?}");
+        assert!(edges.iter().any(|&e| {
+            let sup = s.bools.support(e);
+            sup.contains(&Atom::Phi(phi.value)) && sup.iter().any(|a| matches!(a, Atom::Lane(_)))
+        }));
     }
 }

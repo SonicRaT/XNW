@@ -212,10 +212,35 @@ pub(crate) const WHY_NAMES: [&str; 5] = ["found", "no albedo variable", "not res
 
 /// The draw's albedo descriptor slot (0: none, not resident, not a view)
 /// and its alpha-clip flag. `shader` is the TLS+0x1220 value of the draw.
+/// Both halves at once: [`head`] (the draw's own shader object and texVars,
+/// which the title reuses after the draw) then [`tail`] (the views they name).
 pub(crate) fn albedo(g: &TexGlobals, shader: u64) -> (u64, bool) {
-    // SAFETY: the shader object of the draw being made.
+    let h = head(shader);
+    tail(g, &h, false)
+}
+
+/// What [`albedo`] reads of the draw's own objects: the effect, the
+/// variable's and the layers' texVars values. `XNW_HOOK_THIN=on` reads it at
+/// the hook and leaves [`tail`] to our threads (worldprobe/thin.rs).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Head {
+    /// The effect `*sh` (0: the shader was unreadable, no albedo).
+    pub(crate) fx: u64,
+    /// The albedo variable's texVars value (0: unreadable), when it has one.
+    var: Option<u64>,
+    clip: bool,
+    /// Layered: each layer's texVars value (None: no such layer, unreadable).
+    layered: bool,
+    layers: [Option<u64>; 4],
+}
+
+/// The first half of [`albedo`]: the effect's variable (table, else guarded
+/// lookups) and the draw's texVars values; the outcome "no albedo variable"
+/// is counted here.
+pub(crate) fn head(shader: u64) -> Head {
     WHY.with(|w| w.set(4));
-    let Some(fx) = (unsafe { dread::<u64>(shader) }) else { return (0, false) };
+    // SAFETY: the shader object of the draw being made.
+    let Some(fx) = (unsafe { dread::<u64>(shader) }) else { return Head::default() };
     // Two ways per set (entries `s` and `s + 1`); a new entry goes to an
     // empty way, else first, the older one moving to the second.
     let h = (shader.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ fx).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -252,66 +277,89 @@ pub(crate) fn albedo(g: &TexGlobals, shader: u64) -> (u64, bool) {
             (var, clip, layers)
         }
     };
-    // The layers' slots (direct reads, as for the albedo below).
-    LAYERS.with(|c| c.set(if layers[0] == NO_VAR && layers[1] == NO_VAR { [0; 4] } else { layers.map(|l| if l == NO_VAR { 0 } else { slot_of(g, shader, l).unwrap_or(0) }) }));
+    // sh[2], the texVars array this draw binds from, and its entries.
+    // SAFETY: the draw's own texVars (direct reads, as for the albedo below).
+    let value = |var: u16| unsafe { dread::<u64>(shader.wrapping_add(0x10)).and_then(|tv| dread::<u64>(tv.wrapping_add(8 * u64::from(var)))) };
+    let layered = !(layers[0] == NO_VAR && layers[1] == NO_VAR);
+    let layers = if layered { layers.map(|l| if l == NO_VAR { None } else { value(l) }) } else { [None; 4] };
     if var == NO_VAR {
         count(C_NO_VAR);
         WHY.with(|w| w.set(1));
-        return (0, clip);
+        return Head { fx, var: None, clip, layered, layers };
     }
-    // SAFETY: sh[2], the texVars array this draw binds from, and its entry.
-    let v = unsafe { dread::<u64>(shader.wrapping_add(0x10)).and_then(|tv| dread::<u64>(tv.wrapping_add(8 * u64::from(var)))) }.unwrap_or(0);
-    let view = if v >> 63 == 0 {
-        v
-    } else {
-        // SAFETY: the handle, its record and object, as 0x144EE12A0 reads them for this draw.
-        unsafe {
-            let h = v & !(1 << 63);
-            let rec = dread::<u16>(h.wrapping_add(6)).zip(dread::<u64>(g.handles)).map(|(i, table)| table.wrapping_add(16 * u64::from(i)));
-            match rec.and_then(|r| dread::<[u8; 16]>(r)) {
-                Some(r) if r[14].min(r[12]) != 0 => dread::<u64>(le(&r, 0, 8).wrapping_add(0x28)).unwrap_or(0),
-                _ => 0,
-            }
-        }
+    Head { fx, var: Some(value(var).unwrap_or(0)), clip, layered, layers }
+}
+
+/// The second half of [`albedo`]: the views the texVars values name (a
+/// handle's residency record, the view's vtable and descriptor slot), the
+/// layers' slots ([`last_layers`]) and the outcome. `fixed`: the reads are
+/// fault-fixed (our threads, after the draw); else direct, as at the hook.
+pub(crate) fn tail(g: &TexGlobals, h: &Head, fixed: bool) -> (u64, bool) {
+    if h.fx == 0 {
+        // As before the split: the layers of the last draw are left as they were.
+        WHY.with(|w| w.set(4));
+        return (0, false);
+    }
+    LAYERS.with(|c| c.set(if h.layered { h.layers.map(|v| v.and_then(|v| slot_of(g, v, fixed)).unwrap_or(0)) } else { [0; 4] }));
+    let Some(v) = h.var else {
+        WHY.with(|w| w.set(1));
+        return (0, h.clip);
     };
+    let view = resolve(g, v, fixed);
     if view == 0 {
         count(C_NOT_RESIDENT);
         WHY.with(|w| w.set(2));
-        return (0, clip);
+        return (0, h.clip);
     }
     // SAFETY: the view this draw binds.
-    let (vt, slot) = unsafe { (dread::<u64>(view), dread::<u64>(view.wrapping_add(0x18))) };
+    let (vt, slot) = unsafe { (rd::<u64>(view, fixed), rd::<u64>(view.wrapping_add(0x18), fixed)) };
     if vt != Some(g.view_vtbl) || g.view_vtbl == 0 {
         count(C_NOT_VIEW);
         WHY.with(|w| w.set(3));
-        return (0, clip);
+        return (0, h.clip);
     }
     count(C_FOUND);
     WHY.with(|w| w.set(0));
-    (slot.unwrap_or(0), clip)
+    (slot.unwrap_or(0), h.clip)
 }
 
-/// The descriptor slot of texVars[var] of `shader` (as [`albedo`]
-/// resolves its one variable): None when not resident or not a view.
-fn slot_of(g: &TexGlobals, shader: u64, var: u16) -> Option<u64> {
-    // SAFETY: as in `albedo`: the draw's own texVars, handle record and view.
+/// A texVars value's view: itself, or with bit 63 a streaming handle's
+/// (record `table + 16 * u16[h+6]`, resident when `min(rec[12], rec[14])
+/// != 0`, view `*(*rec + 0x28)`, as 0x144EE12A0 reads them); 0: none.
+fn resolve(g: &TexGlobals, v: u64, fixed: bool) -> u64 {
+    if v >> 63 == 0 {
+        return v;
+    }
+    // SAFETY: the handle, its record and object, as 0x144EE12A0 reads them for this draw.
     unsafe {
-        let v = dread::<u64>(shader.wrapping_add(0x10)).and_then(|tv| dread::<u64>(tv.wrapping_add(8 * u64::from(var))))?;
-        let view = if v >> 63 == 0 {
-            v
-        } else {
-            let h = v & !(1 << 63);
-            let rec = dread::<u16>(h.wrapping_add(6)).zip(dread::<u64>(g.handles)).map(|(i, table)| table.wrapping_add(16 * u64::from(i)))?;
-            let r = dread::<[u8; 16]>(rec)?;
-            if r[14].min(r[12]) == 0 {
-                return None;
-            }
-            dread::<u64>(le(&r, 0, 8).wrapping_add(0x28))?
-        };
-        if view == 0 || g.view_vtbl == 0 || dread::<u64>(view)? != g.view_vtbl {
+        let h = v & !(1 << 63);
+        let rec = rd::<u16>(h.wrapping_add(6), fixed).zip(rd::<u64>(g.handles, fixed)).map(|(i, table)| table.wrapping_add(16 * u64::from(i)));
+        match rec.and_then(|r| rd::<[u8; 16]>(r, fixed)) {
+            Some(r) if r[14].min(r[12]) != 0 => rd::<u64>(le(&r, 0, 8).wrapping_add(0x28), fixed).unwrap_or(0),
+            _ => 0,
+        }
+    }
+}
+
+/// A direct read ([`dread`]) or, `fixed`, the fault-fixed copy of worldprobe.
+///
+/// # Safety
+/// Without `fixed`: as [`dread`].
+unsafe fn rd<T: Copy>(addr: u64, fixed: bool) -> Option<T> {
+    // SAFETY: the caller's; the fixed read survives a fault.
+    if fixed { unsafe { crate::worldprobe::fixed_read::<T>(addr) } } else { unsafe { dread::<T>(addr) } }
+}
+
+/// The descriptor slot of a layer's texVars value (as [`albedo`] resolves
+/// its one variable): None when not resident or not a view.
+fn slot_of(g: &TexGlobals, v: u64, fixed: bool) -> Option<u64> {
+    let view = resolve(g, v, fixed);
+    // SAFETY: as in `albedo`: the view this draw binds.
+    unsafe {
+        if view == 0 || g.view_vtbl == 0 || rd::<u64>(view, fixed)? != g.view_vtbl {
             return None;
         }
-        dread::<u64>(view.wrapping_add(0x18))
+        rd::<u64>(view.wrapping_add(0x18), fixed)
     }
 }
 

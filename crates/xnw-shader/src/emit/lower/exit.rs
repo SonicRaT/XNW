@@ -685,18 +685,29 @@ impl<'a> Lower<'a> {
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
             self.s.m.set_phi(phi, incoming);
         }
+        // victory-fork (578d459, GPL-3.0-or-later): each edge's mask as the
+        // structure tracked it (`phi_masks`), a constant or a scalar-built
+        // one included. Changed from upstream: where the incoming value has
+        // its own entry in `masks` (every join that translated before) that
+        // entry is taken, as before: with `phi_masks` on every edge the DXIL
+        // of 2,030 programs that already translated changed (43 drawn),
+        // none shown equal yet; only joins with an untracked edge take
+        // `phi_masks`.
+        let st = self.x.st;
         while let Some((v, b, i)) = self.pending_masks.pop() {
             let phi = &p.blocks[b].phis[i];
             let offset = p.blocks[b].offset;
+            let untracked = || unsupported(offset, "a lane-mask join of an untracked mask");
+            let own: Option<Vec<_>> = phi.args.iter().map(|a| st.masks.get(a).copied()).collect();
+            let args = match own {
+                Some(own) => own,
+                None => st.phi_masks.get(&phi.value).ok_or_else(untracked)?.clone(),
+            };
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                let m =
-                    *self.x.st.masks.get(&phi.args[n]).ok_or_else(|| {
-                        unsupported(offset, "a lane-mask join of an untracked mask")
-                    })?;
-                let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
+                let x = self.boolean(args[n], qb).map_err(|w| unsupported(offset, w))?;
                 incoming.push((x, qb));
             }
             self.s.m.set_phi(v, incoming);

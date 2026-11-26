@@ -88,11 +88,43 @@ fn last(kind: u32) -> &'static AtomicU64 {
 fn next_tick(last: &AtomicU64) -> (u64, Duration) {
     let mut clock = clock();
     let c = clock.get_or_insert_with(|| Clock { start: Instant::now(), interval: SIXTIETH, first: 0 });
-    let elapsed = c.start.elapsed().as_nanos();
-    let interval = c.interval.as_nanos().max(1);
-    let tick = (c.first + (elapsed / interval + 1) as u64).max(last.load(Ordering::Relaxed) + 1);
-    let at = u128::from(tick - c.first) * interval;
-    (tick, Duration::from_nanos(at.saturating_sub(elapsed) as u64))
+    let l = last.load(Ordering::Relaxed);
+    let (tick, wait, rebase) = plan_tick(c.start.elapsed().as_nanos(), c.interval.as_nanos(), c.first, l, late_pacing());
+    if rebase {
+        last.fetch_max(tick, Ordering::Relaxed);
+        // Only the origin wait restarts the clock; the vblank and flip waits just
+        // end at once and catch up to the tick in progress.
+        if !std::ptr::eq(last, &LAST[ORIGIN as usize]) {
+            return (tick, Duration::ZERO);
+        }
+        let first = LAST.iter().map(|t| t.load(Ordering::Relaxed)).max().unwrap_or(tick);
+        *c = Clock { start: Instant::now(), interval: c.interval, first };
+    }
+    (tick, Duration::from_nanos(wait as u64))
+}
+
+/// `XNW_PACING=late`: the timer clock, except that a frame which overran
+/// its tick ends its wait at once and the clock restarts at now, instead of
+/// waiting for the next tick.
+pub(crate) fn late_pacing() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("XNW_PACING").is_ok_and(|v| v == "late"));
+    *ON
+}
+
+/// Tick arithmetic: at `elapsed_ns` on a clock of `interval_ns` whose tick
+/// number at start is `first`, with `last` the tick this kind last ended on.
+/// Returns the tick the wait ends on, nanoseconds to wait, and whether the
+/// clock must restart at now (late mode, the frame overran: the tick in
+/// progress is already past `last`).
+fn plan_tick(elapsed_ns: u128, interval_ns: u128, first: u64, last: u64, late: bool) -> (u64, u128, bool) {
+    let interval = interval_ns.max(1);
+    let current = first + (elapsed_ns / interval) as u64;
+    if late && current > last {
+        return (current, 0, true);
+    }
+    let tick = (current + 1).max(last + 1);
+    let at = u128::from(tick - first) * interval;
+    (tick, at.saturating_sub(elapsed_ns), false)
 }
 
 /// Blocks until the next tick after now and after the last one `last`
@@ -104,7 +136,7 @@ fn wait_tick(last: &AtomicU64, limit: Duration) -> bool {
         last.fetch_add(1, Ordering::Relaxed);
         return true;
     }
-    if timer_pacing() {
+    if timer_pacing() || late_pacing() {
         let (tick, wait) = next_tick(last);
         if wait > limit {
             std::thread::sleep(limit);
@@ -131,13 +163,13 @@ fn wait_tick(last: &AtomicU64, limit: Duration) -> bool {
     true
 }
 
-/// `XNW_PACING=free`: frame waits return at once, and presents do not
+/// `XNW_PACING=free` (and `freecap`, which also presents at sync interval 1): frame waits return at once, and presents do not
 /// wait for a blank. The console (and our default) ends a frame-origin wait
 /// at the next interval boundary after now, so a frame that overran its
 /// interval waits to the following one: a 34 ms frame at a 31 ms display
 /// interval (a 32 Hz output) shows as 62.5 ms. Free shows the 34.
 pub(crate) fn free_pacing() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("XNW_PACING").is_ok_and(|v| v == "free"));
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("XNW_PACING").is_ok_and(|v| v == "free" || v == "freecap"));
     *ON
 }
 
@@ -172,7 +204,15 @@ fn divider_for(interval_ns: u64, period_ns: u64) -> u64 {
 /// The sync interval the compositor presents with: the divider (1-4), or
 /// 0 with `XNW_PACING=timer`.
 pub(crate) fn sync_interval() -> u32 {
-    if timer_pacing() || free_pacing() { 0 } else { divider().min(4) as u32 }
+    static CAP: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("XNW_PACING").is_ok_and(|v| v == "freecap"));
+    sync_for(timer_pacing() || late_pacing() || free_pacing(), *CAP, divider())
+}
+
+/// The sync interval: 0 for the free-running modes, 1 for `XNW_PACING=freecap`
+/// (no frame waits, each present waits at most for the display's next refresh,
+/// none shown twice in one refresh), else the divider capped at 4.
+fn sync_for(free_running: bool, cap: bool, divider: u64) -> u32 {
+    if cap { 1 } else if free_running { 0 } else { divider.min(4) as u32 }
 }
 
 /// Blanks counted so far (starts the counter).
@@ -367,6 +407,36 @@ pub(crate) fn present_pace() -> Duration {
 
 #[cfg(test)]
 mod tests {
+    use super::{plan_tick, sync_for};
+
+    #[test]
+    fn freecap_presents_at_one_refresh() {
+        assert_eq!(sync_for(true, true, 2), 1);
+        assert_eq!(sync_for(true, false, 2), 0);
+        assert_eq!(sync_for(false, false, 2), 2);
+        assert_eq!(sync_for(false, false, 9), 4);
+    }
+    const I: u128 = 33_000_000;
+
+    #[test]
+    fn late_pacing_rebases_only_overrun_frames() {
+        // Early in tick 0 (last = 0): wait to tick 1, timer or late.
+        assert_eq!(plan_tick(10_000_000, I, 0, 0, false), (1, 23_000_000, false));
+        assert_eq!(plan_tick(10_000_000, I, 0, 0, true), (1, 23_000_000, false));
+        // 40 ms in, last = 0: timer waits to tick 2 (26 ms); late ends at once.
+        assert_eq!(plan_tick(40_000_000, I, 0, 0, false), (2, 26_000_000, false));
+        assert_eq!(plan_tick(40_000_000, I, 0, 0, true), (1, 0, true));
+        // 70 ms in, last = 0 (two ticks missed): late ends at once on the tick in progress (2),
+        // so a vblank or flip wait that lagged catches up in one call, not one tick a call.
+        assert_eq!(plan_tick(70_000_000, I, 0, 0, true), (2, 0, true));
+        assert_eq!(plan_tick(70_000_000, I, 0, 1, true), (2, 0, true));
+        assert_eq!(plan_tick(70_000_000, I, 0, 2, true), (3, 29_000_000, false));
+        // Within the tick after last: not an overrun.
+        assert_eq!(plan_tick(40_000_000, I, 0, 1, true), (2, 26_000_000, false));
+        // A tick number already used by another wait kind still moves on.
+        assert_eq!(plan_tick(10_000_000, I, 0, 5, false).0, 6);
+    }
+
     #[test]
     fn a_30_fps_title_takes_whole_refreshes() {
         let thirtieth = 33_333_333;

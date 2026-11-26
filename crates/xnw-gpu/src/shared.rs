@@ -221,7 +221,7 @@ impl SharedMemory {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
                 xnw_core::warn!(
-                    "shared memory: pin cap reached: {} MiB pinned, a heap of {} MiB over {at:#x} not opened (XNW_PAGETABLE_PIN_MB={}); its pages read zero through the page table (counted as failed)",
+                    "shared memory: pin cap reached: {} MiB pinned, a heap of {} MiB over {at:#x} not opened (cap {} MiB); its pages read zero through the page table or stay host copies (counted as failed; XNW_PAGETABLE_PIN_MB, XNW_ZEROCOPY_PIN_MB, XNW_SHARED_PIN_MB)",
                     PINNED.load(std::sync::atomic::Ordering::Relaxed) >> 20,
                     bytes >> 20,
                     cap >> 20
@@ -552,13 +552,28 @@ pub(crate) static PAGE_TABLE_TEST: std::sync::atomic::AtomicBool = std::sync::at
 /// (`XNW_PAGETABLE_PIN_MB`, default 24,576 MiB), or with `XNW_ZEROCOPY`
 /// (`XNW_ZEROCOPY_PIN_MB`, default 12,288 MiB of window bytes: windows
 /// overlap, so a page counts at most twice); none without either.
+/// `XNW_SHARED_PIN_MB=<MiB>` caps every mode, the plain `XNW_SHARED=2`
+/// one too (REF6: on WARP an opened heap counts against the adapter's
+/// local budget; ref4c pinned 63 windows, 7.9 GiB, in 10 s at world entry,
+/// local reached 15,818 of 15,562 MiB and every later heap failed with
+/// E_OUTOFMEMORY). A refused window leaves the range a host copy.
 fn pin_cap() -> Option<u64> {
     static CAP: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| std::env::var("XNW_PAGETABLE_PIN_MB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(24_576) << 20);
     static WORLD_CAP: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| std::env::var("XNW_ZEROCOPY_PIN_MB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(12_288) << 20);
-    if page_table_on() {
-        Some(*CAP)
+    static SHARED_CAP: std::sync::LazyLock<Option<u64>> = std::sync::LazyLock::new(|| std::env::var("XNW_SHARED_PIN_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).map(|m| m << 20));
+    cap_of(page_table_on(), world_on(), *SHARED_CAP, *CAP, *WORLD_CAP)
+}
+
+/// [`pin_cap`] from its parts: the smallest cap that applies.
+fn cap_of(page_table: bool, world: bool, shared: Option<u64>, table_cap: u64, world_cap: u64) -> Option<u64> {
+    let mode = if page_table {
+        Some(table_cap)
     } else {
-        world_on().then_some(*WORLD_CAP)
+        world.then_some(world_cap)
+    };
+    match (mode, shared) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
     }
 }
 
@@ -2611,6 +2626,17 @@ fn step6(rig: &Rig) {
 #[cfg(test)]
 mod zero_copy_tests {
     use super::*;
+
+    /// The pin cap: none in plain `XNW_SHARED=2` unless `XNW_SHARED_PIN_MB`
+    /// names one; with a mode's cap the smaller wins.
+    #[test]
+    fn the_shared_pin_cap_applies_in_every_mode() {
+        assert_eq!(cap_of(false, false, None, 24, 12), None);
+        assert_eq!(cap_of(false, false, Some(3), 24, 12), Some(3));
+        assert_eq!(cap_of(true, false, None, 24, 12), Some(24));
+        assert_eq!(cap_of(true, true, Some(3), 24, 12), Some(3));
+        assert_eq!(cap_of(false, true, Some(30), 24, 12), Some(12));
+    }
 
     /// A copied range splits into its 64 KiB pages with its bytes in
     /// each (partial pages at both ends).

@@ -86,12 +86,27 @@ impl Loaded {
     }
 }
 
+/// An indirect dispatch sink's group counts from its argument record
+/// (`INDIRECT_ARGS`, v2.11): the 12 B there in what the runner holds (an
+/// earlier dispatch wrote them), and the record's address. None before
+/// v2.11 or when nothing held covers the record (the GPU wrote it).
+pub fn indirect_groups(pack: &Pack, sink: u32, runner: &mut Runner) -> Option<([u32; 3], u64)> {
+    let at = pack.data.refs_of(sink).find(|r| r.kind == kind::INDIRECT_ARGS)?.addr;
+    let b = runner.read_at(key(at), 12)?;
+    Some(([le32(&b, 0), le32(&b, 4), le32(&b, 8)], at))
+}
+
 /// Sink `sink`'s group counts: kind 60, else (count, 1, 1) and a lack.
 pub fn groups(pack: &Pack, sink: u32) -> ([u32; 3], Option<String>) {
     if let Some(b) = pack.data.refs_of(sink).find(|r| r.kind == GROUPS).and_then(|r| pack.bytes_of(r)).filter(|b| b.len() >= 12) {
         return ([le32(&b, 0), le32(&b, 4), le32(&b, 8)], None);
     }
-    let x = pack.data.sinks.iter().find(|s| s.index == sink).map_or(1, |s| s.count);
+    let s = pack.data.sinks.iter().find(|s| s.index == sink);
+    let x = s.map_or(1, |s| s.count);
+    if s.is_some_and(|s| s.op == fp::op::INDIRECT_DISPATCH) {
+        // The count is the most commands; the GPU writes x, y, z (`indirect_groups`).
+        return ([x, 1, 1], Some(format!("the y and z group counts of an indirect dispatch (GPU-written; held only when its producer ran): {x} x 1 x 1")));
+    }
     ([x, 1, 1], Some(format!("the y and z group counts (no kind 60 before v2.9): {x} x 1 x 1")))
 }
 
@@ -211,12 +226,48 @@ pub fn program(pack: &Pack, sink: u32) -> Result<Program, String> {
     let pipeline = pack.data.sinks.iter().find(|s| s.index == sink).ok_or("no such sink")?.pipeline;
     let container = pack.data.programs.iter().find(|p| p.pipeline == pipeline && p.stage == "compute").map(|p| p.container).ok_or_else(|| format!("sink {sink}: no compute program"))?;
     let c = pack.blob(container).ok_or_else(|| format!("no container bytes for {container:032x}"))?;
-    let shader = emit::translate_with(&c, xnw_world::bridge::options()).map_err(|e| format!("sink {sink} program {container:032x}: {e}"))?;
+    let words = cs_patch(container);
+    if !words.is_empty() {
+        println!("  XNW_CS_PATCH: sink {sink} program {:08x}: {} words over its code", (container >> 96) as u32, words.len());
+    }
+    let shader = emit::translate_patched(&c, xnw_world::bridge::options(), &words).map_err(|e| format!("sink {sink} program {container:032x}: {e}"))?;
     let wave = preskin::wave_size(&c).ok_or("no wave size")?;
     let uses = cr::uses(&c)?;
     let (mut named, mut w) = (HashMap::new(), 32);
     crate::bridge::named(&c, &mut named, &mut w)?;
     Ok(Program { shader, wave, uses, named, container })
+}
+
+/// The compute-side debug export (LIT6; LIT3's `--ps-patch` for
+/// dispatches): `XNW_CS_PATCH=<container hex prefix>:<off>=<word>,...[;...]`
+/// writes GFX10 words over the code of the programs whose container hash
+/// starts with the prefix (offsets as the listing prints them). Off
+/// when unset; a malformed entry is skipped with a line.
+pub fn cs_patch(container: u128) -> Vec<(u32, u32)> {
+    let Ok(v) = std::env::var("XNW_CS_PATCH") else { return Vec::new() };
+    parse_cs_patch(&v, container)
+}
+
+fn parse_cs_patch(v: &str, container: u128) -> Vec<(u32, u32)> {
+    let hex = |s: &str| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
+    let name = format!("{container:032x}");
+    let mut out = Vec::new();
+    for part in v.split(';').filter(|p| !p.trim().is_empty()) {
+        let Some((prefix, words)) = part.split_once(':') else {
+            println!("  XNW_CS_PATCH {part}: want <container prefix>:<off>=<word>,...");
+            continue;
+        };
+        if !name.starts_with(&prefix.trim().to_ascii_lowercase()) {
+            continue;
+        }
+        for kv in words.split(',').filter(|s| !s.trim().is_empty()) {
+            match kv.split_once('=').and_then(|(k, w)| Some((hex(k)?, hex(w)?))) {
+                Some(p) => out.push(p),
+                None => println!("  XNW_CS_PATCH {kv}: want <off>=<word> (hex)"),
+            }
+        }
+    }
+    out
 }
 
 /// Runs `sinks` in order on `runner`; one line per sink (and its lacks),
@@ -240,7 +291,12 @@ pub fn run_chain(pack: &Pack, sinks: &[u32], runner: &mut Runner) -> Result<Vec<
             }
         }
         let p = &programs[&pipeline];
-        let loaded = load(pack, sink, &p.uses, &p.named);
+        let mut loaded = load(pack, sink, &p.uses, &p.named);
+        if let Some((g, at)) = indirect_groups(pack, sink, runner) {
+            loaded.groups = g;
+            loaded.lacks.retain(|l| !l.starts_with("the y and z group counts"));
+            lines.push(format!("sink {sink}: indirect groups {g:?} from the held record at {at:#x}"));
+        }
         let images = p.uses.iter().filter(|u| u.image.is_some()).count();
         let head = format!("sink {sink} ({:08x}, groups {:?}, {} slots read, {images} as images)", (p.container >> 96) as u32, loaded.groups, p.uses.len());
         // The line goes out before the dispatch: a device removal names its sink.
@@ -363,5 +419,13 @@ mod tests {
         assert_eq!(shape(&v(view::TEXTURE, 32, 0, 0), None), None, "deeper than 1 without words or a read: unknown");
         assert_eq!(shape(&v(view::TEXTURE, 32, 0, 0), Some(2)).map(|s| s.0), Some(Shape::Tex3D));
         assert_eq!(key(0x5_0000_1000), 0x1_0000_1000);
+    }
+
+    #[test]
+    fn cs_patch_picks_the_program_by_prefix() {
+        let c = 0x7679_96c1_ce51_eace_99da_7699_f9e8_1c52u128;
+        assert_eq!(parse_cs_patch("767996c1:0xd00=7E040302,d2c=BF800000", c), [(0xd00, 0x7e04_0302), (0xd2c, 0xbf80_0000)]);
+        assert_eq!(parse_cs_patch("deadbeef:10=1;767996:20=2", c), [(0x20, 2)]);
+        assert!(parse_cs_patch("767996c1:zz=1,nokey", c).is_empty());
     }
 }

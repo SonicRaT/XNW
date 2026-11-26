@@ -150,7 +150,7 @@ fn draw_of(k: &GeomKey) -> Draw {
 /// The packs' texel providers, opened ahead in frame order by `PACK_THREADS`
 /// loader threads (thread t takes frames t, t + T, ...; each holds two ready).
 const PACK_THREADS: usize = 4;
-type PackRx = std::sync::mpsc::Receiver<Result<Option<xnw_world::textures::Provider>, String>>;
+type PackRx = std::sync::mpsc::Receiver<Result<Option<(xnw_world::textures::Provider, xnw_world::textures::Keys)>, String>>;
 fn prefetch_packs(frames: &[(u64, PathBuf)], counts: Arc<[AtomicU64; 3]>) -> Vec<PackRx> {
     (0..PACK_THREADS.min(frames.len()))
         .map(|t| {
@@ -159,7 +159,7 @@ fn prefetch_packs(frames: &[(u64, PathBuf)], counts: Arc<[AtomicU64; 3]>) -> Vec
             let counts = counts.clone();
             std::thread::spawn(move || {
                 for d in dirs {
-                    let got = xnw_frame::pack::Pack::open(&d).map(|p| p.map(|p| p.texel_provider(counts.clone())));
+                    let got = xnw_frame::pack::Pack::open(&d).map(|p| p.map(|p| (p.texel_provider(counts.clone()), p.texel_keys())));
                     if tx.send(got).is_err() {
                         return;
                     }
@@ -529,7 +529,14 @@ fn apply(list: &mut xnw_world::FrameList, taps: &mut Taps, n: u64) -> Vec<String
         lines.push(super::preskin::join_line(n, &words, list.preskin.draws.len()));
     }
     if bridge {
-        let rows: Vec<(u32, xnw_world::bridged::Owned)> = (0..list.draws.len()).filter_map(|row| of(row)?.bridged.as_deref().map(|o| (row as u32, o.clone()))).collect();
+        let rows: Vec<(u32, xnw_world::bridged::Owned)> = (0..list.draws.len())
+            .filter_map(|row| {
+                let mut o = of(row)?.bridged.as_deref()?.clone();
+                o.ident = xnw_world::bridged::ident(&list.draws[row].geom, list.draws[row].stage);
+                o.blend = list.draws[row].state.map_or([0; 8], |s| s.blend);
+                Some((row as u32, o))
+            })
+            .collect();
         let (not_ready, unread) = super::bridgeps::take_counts();
         let mut f = xnw_world::bridged::Frame::new(rows);
         (f.not_ready, f.unread) = (not_ready, unread);
@@ -661,7 +668,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
             // The pack's texels (opened ahead on the loader threads; the wait is counted).
             let tk = Instant::now();
             if let Some(rx) = packs.get(k % packs.len().max(1)) {
-                pass.tex.set_provider(rx.recv().map_err(|_| "pack loader gone".to_string())??);
+                // Keyed: a texture the last frames made for the same content is taken again.
+                let (p, k) = rx.recv().map_err(|_| "pack loader gone".to_string())??.unzip();
+                pass.tex.set_provider_keyed(p, k);
             }
             pack_ms += tk.elapsed().as_secs_f64() * 1e3;
             // The sinks' objects and bytes (loading, not timed as the frame).
@@ -685,7 +694,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             }
             let mut cull_rep = None;
             if gpucull {
-                cull_rep = Some(xnw_frame::gpucull::fill(fdir, &mut list, true)?);
+                cull_rep = Some(xnw_frame::gpucull::fill(fdir, &mut list, true, &[])?);
             }
             load_ms += tl.elapsed().as_secs_f64() * 1e3;
             // The list sink's consumers, as the title's threads run them at its list sink.

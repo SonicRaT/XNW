@@ -6,7 +6,8 @@
 //! `ped_standard_head_cs:*` (blend-shape translations, sticky lips,
 //! normals). The nulled GPU never runs them, so every capture holds the
 //! table zero (HAIR3). Here each captured dispatch of the graph runs
-//! translated on the software adapter, the network first, with its captured
+//! translated on the software adapter (the card only as a scheduled sample
+//! under the GPU watchdog, `XNW_BRIDGE_HW=1`), the network first, with its captured
 //! root constants and tables, through the shared compute runner (
 //! `xnw_world::compute`, HEAD2): views bound by the program's declared kind
 //! (typed buffer UAVs included), results kept by title address, so a later
@@ -437,19 +438,52 @@ pub fn prepare(dir: &std::path::Path, host: &xnw_gpu::host::Host) -> Option<Stri
     })
 }
 
-/// `xnw-lab head <frame> [--dump] [--only-head] [--sinks a,b] [--save <file>] [--against <file>]`: the graph
-/// run, a line per dispatch, the lacks, the table's entries per face.
+/// `xnw-lab head <frame> [--adapter warp|hw] [--watchdog-ms N] [--runs N] [--dump] [--only-head] [--sinks a,b] [--save <file>] [--against <file>]`:
+/// the graph run, a line per dispatch, the lacks, the table's entries per face.
+/// `--adapter` (the lab's default is hw; `XNW_ADAPTER` when absent): the
+/// hardware adapter only as a scheduled card sample, `XNW_BRIDGE_HW=1`,
+/// under the per-submission GPU watchdog (one dispatch a submission).
+/// `--runs N`: the graph N times in this process from the captured inputs,
+/// the network output's and the table's hash each time, and how many differ.
 pub fn head_cmd(args: &[String]) -> Result<(), String> {
-    let dir = args.first().ok_or("usage: xnw-lab head <frame dir> [--dump] [--only-head] [--save <file>]")?;
+    let dir = args.first().ok_or("usage: xnw-lab head <frame dir> [--adapter warp|hw] [--runs N] [--dump] [--only-head] [--save <file>]")?;
     let p = Pack::open(std::path::Path::new(dir))?.ok_or("no pack")?;
     if args.iter().any(|a| a == "--dump") {
         return dump(&p);
     }
+    let opt = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned();
+    let hw = match opt("--adapter").as_deref() {
+        Some("warp") => Some(false),
+        Some("hw") => Some(true),
+        Some(o) => return Err(format!("head graph: --adapter warp|hw, not {o}")),
+        None => None,
+    };
+    if let Some(hw) = hw {
+        // SAFETY: set before any thread of ours reads the environment.
+        unsafe { std::env::set_var("XNW_ADAPTER", if hw { "hw" } else { "warp" }) };
+        // The hardware adapter needs the scheduled-sample switch: asked before the device is made.
+        if hw && std::env::var("XNW_BRIDGE_HW").ok().as_deref() != Some("1") {
+            return Err("head graph: the title's translated programs run on the software adapter; --adapter hw needs XNW_BRIDGE_HW=1 (a scheduled card sample)".into());
+        }
+    }
     let host = xnw_gpu::host::Host::new(None).map_err(|e| format!("head graph: device: {e}"))?;
+    if hw.is_some_and(|hw| hw == host.caps.software) {
+        return Err(format!("head graph: asked for the {} adapter, got {}", if host.caps.software { "hardware" } else { "software" }, host.caps.adapter));
+    }
+    if !host.caps.software {
+        crate::replay::watchdog_start(std::time::Duration::from_millis(opt("--watchdog-ms").and_then(|v| v.parse().ok()).unwrap_or(crate::replay::WATCHDOG_MS)));
+    } else if let Some(ms) = opt("--watchdog-ms").and_then(|v| v.parse().ok()) {
+        crate::replay::watchdog_start(std::time::Duration::from_millis(ms));
+    }
     println!("head graph: adapter {}", host.caps.adapter);
     let only = args.iter().any(|a| a == "--only-head");
-    let sinks: Vec<u32> = args.iter().position(|a| a == "--sinks").and_then(|i| args.get(i + 1)).map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_default();
-    let g = run(&p, &host, &|s, n| (!only || n.starts_with("ped_standard_head_cs:")) && (sinks.is_empty() || sinks.contains(&s)))?;
+    let sinks: Vec<u32> = opt("--sinks").map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_default();
+    let keep = |s: u32, n: &str| (!only || n.starts_with("ped_standard_head_cs:")) && (sinks.is_empty() || sinks.contains(&s));
+    crate::replay::watchdog_arm();
+    let g = run(&p, &host, &keep);
+    crate::replay::watchdog_disarm();
+    println!("  {}", crate::replay::watch_line("head graph"));
+    let g = g?;
     for l in &g.lines {
         println!("  {l}");
     }
@@ -457,6 +491,28 @@ pub fn head_cmd(args: &[String]) -> Result<(), String> {
         println!("  lacks: {l}");
     }
     println!("{}", g.line());
+    if let Some(n) = opt("--runs").and_then(|v| v.parse::<u32>().ok()).filter(|n| *n > 1) {
+        let hash = |g: &Graph| (g.network.map(|x| x.3), g.table.as_ref().map(|(_, b)| xnw_core::hash128(&[b]) as u32));
+        let first = hash(&g);
+        let mut seen: BTreeSet<(Option<u32>, Option<u32>)> = BTreeSet::from([first]);
+        for k in 2..=n {
+            crate::replay::watchdog_arm();
+            let again = run(&p, &host, &keep);
+            crate::replay::watchdog_disarm();
+            println!("  {}", crate::replay::watch_line(&format!("head graph run {k}")));
+            let again = again?;
+            let h = hash(&again);
+            seen.insert(h);
+            println!("head graph run {k}: {} dispatches, network output hash {}, head table hash {}{}", again.ran, h.0.map_or("-".into(), |v| format!("{v:08x}")), h.1.map_or("-".into(), |v| format!("{v:08x}")), if h == first { "" } else { " (differs from run 1)" });
+        }
+        println!("head graph: {n} runs on {}: {} distinct (network, table) hashes", host.caps.adapter, seen.len());
+    }
+    // `XNW_GPU_DEBUG=layer[,gbv=state]`: the validation layer's messages (Card safety 1).
+    if std::env::var("XNW_GPU_DEBUG").is_ok_and(|v| v.contains("layer")) {
+        for l in xnw_world::bridge::layer_messages(&host.device) {
+            println!("head graph: {l}");
+        }
+    }
     if let Some((a, t)) = &g.table {
         let other = match args.iter().position(|a| a == "--against").and_then(|i| args.get(i + 1)) {
             Some(f) => Some(std::fs::read(f).map_err(|e| format!("--against {f}: {e}"))?),

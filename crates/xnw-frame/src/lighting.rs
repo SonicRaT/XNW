@@ -51,6 +51,16 @@ pub const SHADOW_SLOT: u32 = 95;
 pub const B5_SLOT: u32 = 178;
 /// The 16-B buffer whose first two words scale the light (T8+0x2a0).
 pub const LIGHT_SCALE_SLOT: u32 = 21;
+/// Its stand-in (a GPU output the capture holds as zero). The writer is
+/// `avgLuminanceCompute:ComputeLuxCompressionInfo` 64993692 (not sunk; a
+/// direct dispatch): it stores (c, 1/c, k, 1/k), c the lux compression
+/// (0x84..0xa0) and k its constant buffer +0x50 (0x54, 0x70..0x74, the
+/// store at 0xac) [V disasm]. The lighting program reads c and 1/c; the
+/// sky paraboloid draw multiplies its rgb by 1/k (68d222c8 0xf48, 0x11e8)
+/// and AmbientCubeIBR multiplies the result back by k (9ae7b3a3 0x158,
+/// 0x170) [V disasm]. LIT3's (1, 1, 1, 0) made 1/k zero, and with it the
+/// whole sky draw (LIT6). Neutral: c = k = 1.
+pub const LIGHT_SCALE_UNIT: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 /// The sun's other GPU-made inputs (LIT3, `--ps-patch` probes): a scalar
 /// buffer, a 1-D curve, a screen-space texture and a 2-D table.
 pub const SUN_SCALE_SLOT: u32 = 29;
@@ -78,7 +88,7 @@ pub fn nearest(rows: &[u8], bpp: usize, w: u32, h: u32, tw: u32, th: u32) -> Vec
 }
 
 fn texture(width: u32, height: u32, format: u32, bpp: u32, rows: Vec<u8>) -> Provided {
-    Provided { width, height, format, rows, row_bytes: width * bpp, row_count: height, dim: xnw_world::textures::TEX_2D, depth: 1 }
+    Provided { width, height, format, rows, row_bytes: width * bpp, row_count: height, dim: xnw_world::textures::TEX_2D, depth: 1, mips: 1 }
 }
 
 /// The stand-in for slot 100 (LIT3, I): the title reads its .r at
@@ -213,9 +223,9 @@ pub fn cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, pass: &mut x
     // A GPU output (exposure, I) the capture holds as zero, so every pixel is
     // black: 1.0 and 1.0 stand in (neutral) unless `--slot21 captured`.
     if opt("--slot21").as_deref() != Some("captured") {
-        let unit: Vec<u8> = [1.0f32, 1.0, 1.0, 0.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let unit: Vec<u8> = LIGHT_SCALE_UNIT.iter().flat_map(|v| v.to_le_bytes()).collect();
         loaded.set_buffer(0, LIGHT_SCALE_SLOT, xnw_world::preskin::Kind::Structured(16), unit);
-        println!("  slot {LIGHT_SCALE_SLOT} (light scale, captured zero): 1.0, 1.0, 1.0 stand in");
+        println!("  slot {LIGHT_SCALE_SLOT} (light scale, captured zero): {LIGHT_SCALE_UNIT:?} stands in");
     }
     // b5 (frame table slot 178, past the capture's 96 slots: 256 zero bytes
     // stand in): +0x30 == 0 skips the shadow mask at 0xa50 and leaves the
@@ -284,7 +294,7 @@ pub fn cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, pass: &mut x
             if slot == SUN_LUT_SLOT {
                 println!("  slot {slot} falloff (last row): {}", crate::lighting_luts::falloff(&px, tw, th));
             }
-            made.push((view(0, slot).map_or(0, |v| v.addr), Provided { width: t.width, height: t.height, format: t.format, rows: t.rows.clone(), row_bytes: t.row_bytes, row_count: t.row_count, dim: t.dim, depth: t.depth }));
+            made.push((view(0, slot).map_or(0, |v| v.addr), Provided { width: t.width, height: t.height, format: t.format, rows: t.rows.clone(), row_bytes: t.row_bytes, row_count: t.row_count, dim: t.dim, depth: t.depth, mips: t.mips }));
             loaded.set_texture(0, slot, t);
             skip.push(slot);
         }
@@ -297,7 +307,7 @@ pub fn cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, pass: &mut x
     // slot 29's 384 B replace their stand-ins.
     if args.iter().any(|a| a == "--sky-chain") {
         let mut r = xnw_world::compute::Runner::new(host)?;
-        let unit: Vec<u8> = [1.0f32, 1.0, 1.0, 0.0].iter().flat_map(|x| x.to_le_bytes()).collect();
+        let unit: Vec<u8> = LIGHT_SCALE_UNIT.iter().flat_map(|x| x.to_le_bytes()).collect();
         let scale = if opt("--slot21").as_deref() == Some("captured") { None } else { view(0, LIGHT_SCALE_SLOT).map(|v| (v.addr, unit)) };
         made.retain(|m| m.0 != 0);
         let base = opt("--out").map_or_else(|| dir.join("lighting.png"), std::path::PathBuf::from);
@@ -352,6 +362,12 @@ pub fn cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, pass: &mut x
             loaded.set_texture(0, SUN_LUT_SLOT, texture(127, 128, R8G8B8A8_UNORM, 4, lambert_table(127, 128)));
         }
         println!("  sun stand-ins: slot {SUN_SCALE_SLOT} +0x54 = 1.0; slots {SUN_CURVE_SLOT} (16x1), {SUN_SCREEN_SLOT} ({w}x{h}) white; {SUN_LUT_SLOT} Lambert (127x128); skipped {skip:?}");
+    }
+    // `--white 57,126` (a probe, LIT6): those frame-table slots white
+    // (RGBA8 1.0, the pass's size): which input gates a term.
+    for slot in opt("--white").map(|v| v.split(',').filter_map(|x| x.parse::<u32>().ok()).collect::<Vec<_>>()).unwrap_or_default() {
+        loaded.set_texture(0, slot, texture(w, h, R8G8B8A8_UNORM, 4, vec![255; (4 * w * h) as usize]));
+        println!("  --white: slot {slot} white {w}x{h} (a probe)");
     }
     if opt("--shadow").as_deref() != Some("captured") {
         loaded.set_texture(0, SHADOW_SLOT, texture(w, h, R8_UNORM, 1, vec![255; (w * h) as usize]));

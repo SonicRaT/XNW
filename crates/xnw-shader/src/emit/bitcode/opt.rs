@@ -58,6 +58,8 @@ pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
 pub(crate) struct Usage {
     /// A wave or quad operation.
     pub wave_ops: bool,
+    /// A rasterizer ordered view (VIctory-7900XTX 389db9e).
+    pub rovs: bool,
     /// A 64-bit integer, as a result or an operand.
     pub int64: bool,
     /// A typed load of several components from a UAV.
@@ -1121,6 +1123,8 @@ impl Module {
                         Some((_, 0)) => u.heap_views = true,
                         _ => u.heap_samplers = true,
                     }
+                } else if name == "annotateHandle" {
+                    u.rovs |= annotation(V::Inst(i)).is_some_and(|(kind, _)| kind & 0x2000 != 0);
                 } else if name.starts_with("atomic") && name.ends_with(".i64") {
                     u.atomic64 = true;
                 } else if name.starts_with("textureLoad") || name.starts_with("bufferLoad") {

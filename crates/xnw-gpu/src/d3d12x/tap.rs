@@ -61,6 +61,20 @@ pub fn set_tap(f: Option<Tap>) {
     TAP.store(f.map_or(0, |f| f as usize), Ordering::Release);
 }
 
+/// HAIR6: which pipelines' graphics draws go to the tap (None registered:
+/// every draw, as before). The live hair path asks for the strand draws only.
+static TAP_WANT: AtomicUsize = AtomicUsize::new(0);
+
+pub fn set_tap_want(f: Option<DispatchWant>) {
+    TAP_WANT.store(f.map_or(0, |f| f as usize), Ordering::Release);
+}
+
+pub(crate) fn tap_want() -> Option<DispatchWant> {
+    let f = TAP_WANT.load(Ordering::Acquire);
+    // SAFETY: only `set_tap_want` stores, a `DispatchWant` or 0.
+    (f != 0).then(|| unsafe { std::mem::transmute::<usize, DispatchWant>(f) })
+}
+
 pub(crate) fn get() -> Option<Tap> {
     let f = TAP.load(Ordering::Acquire);
     // SAFETY: only `set_tap` stores, a `Tap` or 0.
@@ -239,6 +253,98 @@ pub struct TapStage {
     pub prefix: [u8; 24],
 }
 
+/// UI1: the input assembler's views at a Draw or DrawIndexed sink: the
+/// index view (address, bytes, DXGI format) and the vertex views of the
+/// slots the pipeline's input layout reads (address, bytes, stride; slot
+/// k of `vertex` is IA slot k, `slots` the mask of slots the layout reads).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TapIa {
+    pub index: (u64, u32, u32),
+    pub vertex: [(u64, u32, u32); IA_SLOTS],
+    pub slots: u32,
+    /// The title's primitive topology (D3D numbering; console-only kinds as the title set them).
+    pub topology: u32,
+}
+
+/// Vertex buffer slots [`TapIa`] carries.
+pub const IA_SLOTS: usize = 4;
+
+thread_local! {
+    static IA: std::cell::Cell<Option<TapIa>> = const { std::cell::Cell::new(None) };
+}
+
+/// Sets (draw.rs, around a Draw or DrawIndexed tap) the IA views the
+/// tapped draw reads; None after it.
+pub(crate) fn set_ia(ia: Option<TapIa>) {
+    IA.with(|c| c.set(ia));
+}
+
+/// The IA views of the Draw or DrawIndexed sink being tapped on this
+/// thread (None for other ops and outside a tap).
+pub fn ia() -> Option<TapIa> {
+    IA.with(|c| c.get())
+}
+
+/// UI1: the title's (pass phase, stage) on this thread, read from its TLS
+/// as `ui=keep` reads it (uikeep.rs; phase u32::MAX = outside a pass).
+pub fn title_stage() -> Option<(u32, u32)> {
+    super::uikeep::here()
+}
+
+/// UI1: a graphics pipeline's host state as the warm cache encodes it
+/// (blend, rasterizer, depth, topology, targets, input layout; decode with
+/// [`PipeState::decode`]); None for compute pipelines, unknown objects and
+/// served (burst) pipelines.
+pub fn graphics_state(p: usize) -> Option<Vec<u8>> {
+    if SERVING.load(Ordering::Relaxed) {
+        return None;
+    }
+    pipeline::graphics_state(p as This).map(|g| g.encode())
+}
+
+/// One input element of a pipeline's layout: semantic, index, DXGI
+/// format, IA slot, byte offset (worked out), per instance, step rate.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PipeInput {
+    pub name: String,
+    pub index: u32,
+    pub format: u32,
+    pub slot: u32,
+    pub offset: u32,
+    pub per_instance: bool,
+    pub step: u32,
+}
+
+/// What a replay needs of a pipeline's [`graphics_state`] bytes: render
+/// target 0's blend (enable, source, destination, op, source alpha,
+/// destination alpha, alpha op, write mask; D3D12 numbering), the cull
+/// mode, the topology type, the colour formats and the input layout.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PipeState {
+    pub blend: [u32; 8],
+    pub cull: u32,
+    pub topology: u32,
+    pub targets: Vec<u32>,
+    pub depth_format: u32,
+    pub inputs: Vec<PipeInput>,
+}
+
+impl PipeState {
+    pub fn decode(bytes: &[u8]) -> Option<PipeState> {
+        let g = pipeline::host::GraphicsState::decode(bytes)?;
+        let t = &g.blend.RenderTarget[0];
+        let n = (g.targets.NumRenderTargets as usize).min(8);
+        Some(PipeState {
+            blend: [t.BlendEnable.0 as u32, t.SrcBlend.0 as u32, t.DestBlend.0 as u32, t.BlendOp.0 as u32, t.SrcBlendAlpha.0 as u32, t.DestBlendAlpha.0 as u32, t.BlendOpAlpha.0 as u32, u32::from(t.RenderTargetWriteMask)],
+            cull: g.rasterizer.CullMode.0 as u32,
+            topology: g.topology.0 as u32,
+            targets: g.targets.RTFormats[..n].iter().map(|f| f.0 as u32).collect(),
+            depth_format: g.depth_format.0 as u32,
+            inputs: g.input_list().into_iter().map(|(name, index, format, slot, offset, per_instance, step)| PipeInput { name, index, format, slot, offset, per_instance, step }).collect(),
+        })
+    }
+}
+
 /// The stages of the title's pipeline object `p` (ours).
 pub fn stages(p: usize) -> Vec<TapStage> {
     if let Some(got) = served(|s| s.pipelines.get(&p).map(|v| v.iter().map(|x| x.0.clone()).collect()).unwrap_or_default()) {
@@ -323,7 +429,18 @@ pub fn view(handle: u64) -> TapView {
         Some(View::Constant(addr, size)) => TapView { kind: k::CONSTANT, addr, bytes: u64::from(size), ..TapView::default() },
         Some(v @ (View::Shader(r, _) | View::Unordered(r, _, _))) => {
             if let Some((data, d)) = resource::texture_memory(r as This) {
-                texture(k::TEXTURE, data as u64, &d, r as u64)
+                // The resource's description and the view's own (None: the
+                // resource's default view, zeros) in a placed view's places,
+                // so a reader finds the dimensions where it does for those:
+                // words[0] the resource's, words[15] the view's (4 2D, 5 2D
+                // array, 8 3D, 9 cube, 10 cube array). Before BUG3 a
+                // resource view's words were zeros and it was taken as 2D.
+                let mut out = texture(k::TEXTURE, data as u64, &d, r as u64);
+                out.words[..14].copy_from_slice(&desc_words(&d));
+                if let View::Shader(_, Some(w)) | View::Unordered(_, _, Some(w)) = &v {
+                    out.words[14..24].copy_from_slice(w);
+                }
+                out
             } else if let Some((data, n)) = resource::buffer_bytes(r as This) {
                 // The view's own range: D3D12 buffer view
                 // descriptions as words; SRV: format 0, dimension 1 (1 =
@@ -362,6 +479,12 @@ pub fn view(handle: u64) -> TapView {
         }
         Some(View::Sampler(_) | View::ConsoleSampler(_)) => TapView { kind: k::SAMPLER, ..TapView::default() },
     }
+}
+
+/// A resource description as the 14 words a placed view carries it in
+/// (`ResourceDesc`'s 56 bytes, padding as zeros).
+fn desc_words(d: &resource::ResourceDesc) -> [u32; 14] {
+    [d.dimension, 0, d.alignment as u32, (d.alignment >> 32) as u32, d.width as u32, (d.width >> 32) as u32, d.height, u32::from(d.depth_or_array_size) | u32::from(d.mip_levels) << 16, d.format, d.sample_count, d.sample_quality, d.layout, d.flags, 0]
 }
 
 /// Bytes from `address` to the end of the title buffer holding it (the

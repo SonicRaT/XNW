@@ -5,7 +5,7 @@
 //! GFX10 compute shaders lowered to DXIL, validated by `dxil.dll` when
 //! present, and run on the host GPU and WARP against RDNA2's definitions.
 
-use super::host::{Dispatch, Host, Root, View};
+use super::host::{Dispatch, Host, View};
 use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -144,6 +144,7 @@ fn build(op: u8, pair: bool) -> HostShader {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        half_views: Vec::new(),
         address_map: lowered.address_map,
         descriptor_words: lowered.descriptor_words,
     };
@@ -181,7 +182,7 @@ fn check(name: &str, op: u8, pair: bool, cases: &[[u32; 3]], want: impl Fn(u32, 
                     &root,
                     &pso,
                     &Dispatch {
-                        roots: vec![(0, Root::Constants(ud))],
+                        roots: Host::roots(&shader, ud, 2, 0),
                         views: &[View::RawUav(1), View::UintTextureUav(1, 1)],
                         samplers: &[],
                         groups: [1, 1, 1],

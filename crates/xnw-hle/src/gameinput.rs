@@ -54,8 +54,11 @@ const FALLBACK: usize = PADS;
 const KEYBOARD: usize = PADS + 1;
 const DEVICES: usize = PADS + 2;
 
-/// Readings kept per device for next/previous lookups.
-const HISTORY: usize = 32;
+/// Readings kept per device for next/previous lookups: 256 polls of 8 ms,
+/// about 2 s. At 32 (VIctory-base) a frame slower than 256 ms found the
+/// reading it walks from gone, and presses in between were lost (VIctory
+/// main 04512df, in VIctory-7900XTX).
+const HISTORY: usize = 256;
 const POLL: Duration = Duration::from_millis(8);
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.

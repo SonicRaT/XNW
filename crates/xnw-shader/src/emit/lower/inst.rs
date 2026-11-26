@@ -2,6 +2,7 @@
 // Origin as in lower.rs's header: VIctory crates/victory-shader/src/emit/lower.rs, d2a4bae1f495, and the
 // later VIctory ports named there; GPL-3.0-or-later. Moved out of lower.rs unchanged (XNW BLD2): one stage,
 // one codegen unit.
+// With victory-fork (578d459, emit/lower.rs `ds`, GPL-3.0-or-later): `ds_bpermute_b32` before the LDS check (UP6).
 use super::*;
 
 impl<'a> Lower<'a> {
@@ -108,6 +109,36 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
         }
+        // victory-fork 578d459 (emit/lower.rs `ds`, GPL-3.0-or-later): a
+        // backward permute touches no LDS, so it comes before the check
+        // that the program allocates any. Each lane takes the data register
+        // of the lane its address names, (address + offset) / 4 within the
+        // wave; a source lane outside EXEC gives 0.
+        // shortcut: a source lane that is not at this instruction on the
+        // host (it left through a branch, not a guard) is read as the host
+        // gives it; the console reads 0.
+        if name == "ds_bpermute_b32" {
+            self.cross_lane(false)?;
+            let at = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
+            let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
+            let o = self.s.m.i32(offset);
+            let at = self.s.m.bin(c, Bin::Add, at, o);
+            let two = self.s.m.i32(2);
+            let src = self.s.m.bin(c, Bin::LShr, at, two);
+            let last = self.s.m.i32(self.wave() - 1);
+            let src = self.s.m.bin(c, Bin::And, src, last);
+            let x = match guard {
+                Some(g) => {
+                    let z = self.s.m.i32(0);
+                    self.s.m.select(c, g, x, z)
+                }
+                None => x,
+            };
+            let r = self.read_lane(x, src);
+            let reg = dst_reg.ok_or("a permute result")?;
+            self.write(inst, Reg::V(reg), r, guard);
+            return Ok(());
+        }
         if self.s.lds_dwords == 0 {
             return Err("LDS the program does not allocate");
         }
@@ -139,20 +170,6 @@ impl<'a> Lower<'a> {
                 (u32::from(*offset1) * scale, w),
             ]
         };
-        // XNW: a backward permute: each lane reads data0 of the lane its
-        // address names (byte address over 4, within the wave); no LDS.
-        if name == "ds_bpermute_b32" {
-            let lanes = if self.x.native.wave64 { 64 } else { 32 };
-            let x = self.vgprs(inst, data.first().ok_or("a permute's data")?, 1)?[0];
-            let (o, two, m) = (self.s.m.i32(offset), self.s.m.i32(2), self.s.m.i32(lanes - 1));
-            let at = self.s.m.bin(c, Bin::Add, a, o);
-            let lane = self.s.m.bin(c, Bin::LShr, at, two);
-            let lane = self.s.m.bin(c, Bin::And, lane, m);
-            let r = self.read_lane(x, lane);
-            let reg = dst_reg.ok_or("a permute result")?;
-            self.write(inst, Reg::V(reg), r, guard);
-            return Ok(());
-        }
         // VIctory (b6af8b1, GPL-3.0-or-later), XNW: bytes and
         // halves: (bits, signed) of `ds_read_{u,i}{8,16}` and
         // `ds_write_b{8,16}`, read and written within their dword.

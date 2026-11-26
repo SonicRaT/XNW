@@ -476,6 +476,17 @@ impl GraphicsState {
         Some(g)
     }
 
+    /// UI1: the input layout as (semantic, index, format, slot, byte
+    /// offset worked out, per instance, step rate).
+    pub(crate) fn input_list(&self) -> Vec<(String, u32, u32, u32, u32, bool, u32)> {
+        self.inputs
+            .iter()
+            .zip(&self.names)
+            .zip(self.elements())
+            .map(|((e, name), at)| (name.to_string_lossy().into_owned(), e.SemanticIndex, e.Format.0 as u32, at.slot, at.offset, at.per_instance, e.InstanceDataStepRate))
+            .collect()
+    }
+
     /// The vertex buffer slots the input layout reads.
     fn slots(&self) -> u32 {
         self.inputs.iter().fold(0, |m, e| m | 1 << e.InputSlot.min(31))

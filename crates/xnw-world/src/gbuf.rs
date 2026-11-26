@@ -40,9 +40,17 @@ pub fn parse_switch(v: &str) -> bool {
 }
 
 /// The raw shader source as the pass compiles it: with `#define GBUF 1`
-/// first when the G-buffer is on.
+/// first when the G-buffer is on (and `OURLIGHT` with `ourlight=on`).
 pub fn source(src: &str) -> String {
-    if on() && !src.contains("#define GBUF") { format!("#define GBUF 1\n{src}") } else { src.to_string() }
+    let src = plain_source(src);
+    if on() && !src.contains("#define GBUF") { format!("#define GBUF 1\n{src}") } else { src }
+}
+
+/// The raw source of the entry without the G-buffer outputs (dual-source
+/// states): `#define OURLIGHT 1` first with `ourlight=on` (its rows before
+/// the lighting pass write their albedo), else as it is.
+pub fn plain_source(src: &str) -> String {
+    if crate::ourlight::on() && !src.contains("#define OURLIGHT") { format!("#define OURLIGHT 1\n{src}") } else { src.to_string() }
 }
 
 /// The title's normal packing (PS_DeferredTextured ff2c46ab): octahedral
@@ -189,6 +197,7 @@ pub fn read(device: &ID3D12Device, queue: &ID3D12CommandQueue, t: &Targets, dept
         while fence.GetCompletedValue() < 1 {
             device.GetDeviceRemovedReason().map_err(|x| format!("G-buffer read: {}", e(x)))?;
             if t0.elapsed().as_secs() > 60 {
+                xnw_gpu::gpuwatch::abandon("gbuf read", 60.0, xnw_gpu::gpuwatch::GRACE);
                 return Err("G-buffer read: over 60 s".into());
             }
             std::thread::yield_now();

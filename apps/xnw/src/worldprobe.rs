@@ -45,7 +45,7 @@ use std::sync::{Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 // The instance rule (LOD slot, frustum, sane record) is shared with the device cull (PERF3).
-use xnw_world::gpucull::{MAX_BATCH, frustum_planes, in_frustum, lod_slot, plausible_record};
+use xnw_world::gpucull::{MAX_BATCH, frustum_planes, in_frustum, lod_slot, lod_slot_near, plausible_record};
 use xnw_frame::{Bounds, Mesh, OBJ_MAX_VERTICES, Streams, WaterMap, WorldDraw, WorldSrc, WorldStats, camera_position, decode_indexed, decode_meshlets, expand_meshlets, fnv, light_of, plausible, rigid_world, rstate_text, sky_of, sun_of, vb_ready, water_grid, water_tint, write_world};
 
 const IMAGE_BASE: usize = 0x1_4000_0000;
@@ -106,10 +106,14 @@ macro_rules! miss {
 
 /// The frame pack v2 writer.
 mod pack;
+mod hairlive;
+mod uilive;
 /// Draw-time bones for the live pass (`drawbones=on`).
 mod skinhook;
 /// The ped pre-skin's live reads (`preskin=on`).
 mod preskin;
+/// The thin hook (`XNW_HOOK_THIN=on`): the rest of a draw decoded by our threads.
+mod thin;
 /// The imposter submits' live reads (`imposters=on`).
 mod imposter;
 /// The bridged rows' live reads (`bridgeps=on|<hashes>`).
@@ -464,6 +468,8 @@ struct Draw {
     layer_desc: [u64; 4],
     /// The 2x2-quad sample mask at ctx+0x12360 (u64::MAX: solid).
     stipple: u64,
+    /// `XNW_HOOK_THIN=on`: what the hook left for our threads (thin.rs).
+    thin: thin::Pending,
 }
 
 /// A grc resource object: memory address, bytes, format byte +0x3F, mips
@@ -604,6 +610,7 @@ impl Capture {
                 i.block = shift(i.block, blocks);
                 i.lodrec = shift(i.lodrec, lods);
                 i.mask = shift(i.mask, masks);
+                i.near = shift(i.near, masks);
             }
             d.pal_index = shift(d.pal_index, pals);
             d.pal2_index = shift(d.pal2_index, pals);
@@ -734,6 +741,9 @@ struct State {
     /// resets them.
     late: [AtomicU64; 2],
     tx: Mutex<mpsc::Sender<Capture>>,
+    /// `XNW_HOOK_THIN=on`: the hook reads only what the title may change
+    /// before the frame ends; our threads decode the rest at the cut.
+    thin: bool,
 }
 
 type Slot = std::sync::Arc<Mutex<Option<Capture>>>;
@@ -1003,6 +1013,15 @@ extern "system" fn on_draw(frame: usize, _id: usize) {
 /// A geometry draw (`inst`: the IcDraw* of an instanced one, 0x14006B210).
 fn hook_draw(geom: u64, ret: u64, inst: Option<u64>) {
     let Some(s) = STATE.get() else { return };
+    // Without the render path (no render_frame) the ocean wave ring is
+    // looked at here, on the first hook draw of each frame (XNW_WATER_SIM).
+    if !s.cfg.render {
+        static WATER_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+        let now = frame_key();
+        if WATER_FRAME.swap(now, Ordering::Relaxed) != now {
+            crate::worldwater::tick(s.title, now);
+        }
+    }
     if s.done.load(Ordering::Relaxed) {
         return;
     }
@@ -1111,6 +1130,14 @@ fn hide_mask(c: &mut Capture, ctx: u64) -> u32 {
     }
     // SAFETY: the draw's render context and the bitset it binds (fault-fixed).
     let Some(p) = (unsafe { dread::<u64>(ctx + 0xA10) }).filter(|p| *p != 0) else { return NO_PAL };
+    bitset_copy(c, p)
+}
+
+/// A bitset object P = {u32* bits, u32 words +8, u32 bits +0xC} copied
+/// once per bits pointer per frame (at most 2,048 words) into
+/// `Capture::mask_list`; NO_PAL when it is empty or unreadable.
+fn bitset_copy(c: &mut Capture, p: u64) -> u32 {
+    // SAFETY: the bitset object the title binds for this draw (fault-fixed read).
     let Some(h) = (unsafe { dread::<[u8; 16]>(p) }) else { return NO_PAL };
     let (bits, words) = (le64(&h, 0), le32(&h, 8).min(2048));
     if bits == 0 || words == 0 {
@@ -1162,12 +1189,19 @@ fn capture_instances(c: &mut Capture, draw: u64, ctx: u64) {
     // SAFETY: the IcDraw.
     let lod = unsafe { dread::<u32>(draw + 8) }.unwrap_or(0);
     let mask = hide_mask(c, ctx);
+    // The near fade-in bitset (VEH3): IcRec+0x20 -> P (= h+0x2F0, set when
+    // h+0x33C & 6), whose bits the culling shader reads at R+0x34
+    // (0x144E4AF00: R+0x34 = arena(**(rec+0x20)), else -1) [V 6-8].
+    let near = match le64(&r, 0x20) {
+        0 => NO_PAL,
+        p => bitset_copy(c, p),
+    };
     // The handler and the fields 0x1435A4D50 / 0x144E54970 test.
     let handler = le64(&r, 8).wrapping_sub(0x2C4);
     // SAFETY: the batch's handler (fault-fixed reads).
     let (h228, h33c) = unsafe { (dread::<u32>(handler.wrapping_add(0x228)).unwrap_or(u32::MAX), dread::<u16>(handler.wrapping_add(0x33C)).unwrap_or(u16::MAX)) };
     if let Some(d) = c.draws.last_mut() {
-        d.inst = Some(InstInfo { desc, count: le32(&h, 8), cpu, gpu, lod, block: NO_PAL, first_lod, lodrec, mask, handler, h228, h33c, rec_a0: le32(&r, 0xA0) });
+        d.inst = Some(InstInfo { desc, count: le32(&h, 8), cpu, gpu, lod, block: NO_PAL, first_lod, lodrec, mask, near, handler, h228, h33c, rec_a0: le32(&r, 0xA0) });
     }
     // Kind S (desc+0x68 set) [layout V, CPU list I]: the batch's
     // static map records at L+0x90 (L = desc+0, count u16 L+0x98 == n),
@@ -1420,6 +1454,8 @@ struct InstInfo {
     lodrec: u32,
     /// The batch's hide bitset in `Capture::mask_list` (NO_PAL: none).
     mask: u32,
+    /// The batch's near fade-in bitset in `Capture::mask_list` (NO_PAL: none; VEH3).
+    near: u32,
     /// The batch's handler h = *(rec+8) - 0x2C4, its h+0x228 (dword),
     /// h+0x33C/+0x33D (two bytes) and rec+0xA0 (the call's LOD mask word).
     handler: u64,
@@ -1441,7 +1477,16 @@ const LODREC_BYTES: usize = 140;
 /// (tested, drawn, hidden by the mask).
 #[cfg(test)]
 fn prefilter(block: &[u8], lod: Option<(&[f32; 35], usize)>, hide: Option<&[u32]>, cam: [f32; 3], out: &mut Vec<f32>) -> (u32, u32, u32) {
-    prefilter_why(block, lod, hide, cam, out, None, None, &mut [0; 3])
+    prefilter_why(block, lod, Masks { hide, near: None }, cam, out, None, None, &mut [0; 3])
+}
+
+/// A batch's two bitsets (u32 words, LSB first, bit i&31 of word i>>5):
+/// `hide`, the title's batchdisabledbitfield (instance dropped), and `near`,
+/// the near fade-in set (VEH3: [`xnw_world::gpucull::near_fade`]).
+#[derive(Clone, Copy, Default)]
+struct Masks<'a> {
+    hide: Option<&'a [u32]>,
+    near: Option<&'a [u32]>,
 }
 
 /// [`prefilter`] that can also note, per instance, (index, outcome, distance,
@@ -1499,11 +1544,11 @@ fn cached_bounds(block: &std::sync::Arc<Vec<u8>>, t: &[f32; 35]) -> Option<([f32
 /// grows with distance). Returns (tested, drawn, hidden) as
 /// [`prefilter_why`], with `counts` [outside, wrong LOD].
 #[allow(clippy::too_many_arguments)]
-fn prefilter_batch(block: &std::sync::Arc<Vec<u8>>, len: usize, lod: Option<(&[f32; 35], usize)>, hide: Option<&[u32]>, cam: [f32; 3], out: &mut Vec<f32>, why: Option<&mut Vec<(u32, u8, f32, u8)>>, planes: &[[f32; 4]; 5], counts: &mut [u32; 3]) -> (u32, u32, u32) {
+fn prefilter_batch(block: &std::sync::Arc<Vec<u8>>, len: usize, lod: Option<(&[f32; 35], usize)>, masks: Masks, cam: [f32; 3], out: &mut Vec<f32>, why: Option<&mut Vec<(u32, u8, f32, u8)>>, planes: &[[f32; 4]; 5], counts: &mut [u32; 3]) -> (u32, u32, u32) {
     let n = (len / 64).min(MAX_BATCH as usize) as u32;
     match batch_test(block, n, lod, cam, planes, counts) {
         None => (n, 0, 0),
-        Some(need_planes) => prefilter_why(&block[..len], lod, hide, cam, out, why, need_planes.then_some(planes), counts),
+        Some(need_planes) => prefilter_why(&block[..len], lod, masks, cam, out, why, need_planes.then_some(planes), counts),
     }
 }
 
@@ -1544,7 +1589,7 @@ fn batch_test(block: &std::sync::Arc<Vec<u8>>, n: u32, lod: Option<(&[f32; 35], 
 /// With `planes`, outcome 5 = outside the frustum (tested before the
 /// LOD); `counts` gains [outside the frustum, another LOD slot].
 #[allow(clippy::too_many_arguments)]
-fn prefilter_why(block: &[u8], lod: Option<(&[f32; 35], usize)>, hide: Option<&[u32]>, cam: [f32; 3], out: &mut Vec<f32>, mut why: Option<&mut Vec<(u32, u8, f32, u8)>>, planes: Option<&[[f32; 4]; 5]>, counts: &mut [u32; 3]) -> (u32, u32, u32) {
+fn prefilter_why(block: &[u8], lod: Option<(&[f32; 35], usize)>, masks: Masks, cam: [f32; 3], out: &mut Vec<f32>, mut why: Option<&mut Vec<(u32, u8, f32, u8)>>, planes: Option<&[[f32; 4]; 5]>, counts: &mut [u32; 3]) -> (u32, u32, u32) {
     let (mut tested, mut drawn, mut hidden) = (0, 0, 0);
     for (i, rb) in block.chunks_exact(64).take(MAX_BATCH as usize).enumerate() {
         let r = f32s::<16>(rb);
@@ -1556,7 +1601,8 @@ fn prefilter_why(block: &[u8], lod: Option<(&[f32; 35], usize)>, hide: Option<&[
                 w.push((i as u32, code, d, k));
             }
         };
-        if hide.is_some_and(|h| h.get(i >> 5).is_some_and(|w| w & (1 << (i & 31)) != 0)) {
+        let bit = |m: Option<&[u32]>| m.is_some_and(|h| h.get(i >> 5).is_some_and(|w| w & (1 << (i & 31)) != 0));
+        if bit(masks.hide) {
             hidden += 1;
             note(1, 0);
             continue;
@@ -1576,7 +1622,7 @@ fn prefilter_why(block: &[u8], lod: Option<(&[f32; 35], usize)>, hide: Option<&[
         }
         if let Some((t, slot)) = lod {
             // Translations (dwords 3, 7, 11) are absolute [I strong].
-            match lod_slot(t, &r, d) {
+            match lod_slot_near(t, &r, d, bit(masks.near)) {
                 Some(k) if k == slot => {}
                 Some(k) => {
                     counts[1] += 1;
@@ -1633,6 +1679,15 @@ unsafe fn dread<T: Copy>(addr: u64) -> Option<T> {
     let mut v = std::mem::MaybeUninit::<T>::uninit();
     // SAFETY: a fault-fixed copy into our own local (fcopy); T is plain data.
     (unsafe { fcopy(v.as_mut_ptr().cast(), addr as *const u8, std::mem::size_of::<T>()) }).then(|| unsafe { v.assume_init() })
+}
+
+/// [`dread`] for the crate's other modules (worldtex's reads after the draw).
+///
+/// # Safety
+/// As [`dread`]: a fault is fixed up, the address shape checked.
+pub(crate) unsafe fn fixed_read<T: Copy>(addr: u64) -> Option<T> {
+    // SAFETY: the caller's.
+    unsafe { dread::<T>(addr) }
 }
 
 /// A plain read, only for memory that is always there: the calling
@@ -1986,9 +2041,20 @@ fn last_draw_streams() -> Option<(u64, u64, u64)> {
     }
     let s = STATE.get()?;
     let slot = s.slot();
-    let g = slot.lock().ok()?;
-    let c = g.as_ref().filter(|c| c.frame == frame_key())?;
-    c.draws.last().filter(|d| d.hook_n == c.seen).map(|d| (d.vb_at, d.vb_len, d.mesh_at))
+    let mut g = slot.lock().ok()?;
+    let now = frame_key();
+    let c = g.as_mut().filter(|c| c.frame == now)?;
+    let seen = c.seen;
+    let d = c.draws.last_mut().filter(|d| d.hook_n == seen)?;
+    // Thin: this draw's geometry key now (the sink needs its streams).
+    if d.thin.flags & thin::GEOM != 0 {
+        let mut misses = 0;
+        geom_apply(d, geom_key(d.geom, d.ghash, d.thin.g, &mut misses));
+        d.thin.flags &= !thin::GEOM;
+        c.geom_misses += misses;
+    }
+    let d = c.draws.last()?;
+    Some((d.vb_at, d.vb_len, d.mesh_at))
 }
 
 /// `bridgeps`: gives a draw's binding inputs to this thread's last
@@ -2268,8 +2334,19 @@ fn capture_light(s: &State, c: &mut Capture, geom: u64, ret: u64, tls: u64, samp
     d.palette = (r64(TLS_PALETTE), (r64(TLS_PALETTE_N) & 0xFFFF_FFFF) as u32);
     d.drawable = r64(TLS_DRAWABLE);
     d.model = r64(TLS_MODEL);
+    let thin = s.thin;
+    // The model's header once per model on this thread (thin): skinned, and a rigid part's bone.
+    let model = if thin && d.model != 0 { thin::model(d.model) } else { thin::Model::default() };
+    if thin {
+        if model.rigid
+            && d.palette.0 != 0
+            && u32::from(model.bone) < d.palette.1.min(4096)
+        {
+            // SAFETY: the bone the title composes this part with.
+            d.rigid = unsafe { dread::<[f32; 12]>(d.palette.0 + 48 * u64::from(model.bone)) }.filter(|m| m.iter().all(|v| v.is_finite() && v.abs() < 1e6));
+        }
     // Rigid parts (fragments: bike racks, props): world' = bones[model+0x33] * world.
-    if d.model != 0
+    } else if d.model != 0
         && d.palette.0 != 0
         // SAFETY: the model this draw binds (fault-fixed read).
         && let Some(mh) = unsafe { dread::<[u8; 0x38]>(d.model) }
@@ -2283,8 +2360,14 @@ fn capture_light(s: &State, c: &mut Capture, geom: u64, ret: u64, tls: u64, samp
     d.shader = r64(TLS_SHADER);
     d.viewport = r64(TLS_VIEWPORT);
     if d.shader != 0 && crate::worldtex::enabled() {
-        (d.tex_desc, d.alpha_clip) = crate::worldtex::albedo(&crate::worldtex::globals(), d.shader);
-        d.layer_desc = crate::worldtex::last_layers();
+        if thin {
+            // The draw's own shader object and texVars; the views they name later.
+            d.thin.tex = crate::worldtex::head(d.shader);
+            d.thin.flags |= thin::TEX;
+        } else {
+            (d.tex_desc, d.alpha_clip) = crate::worldtex::albedo(&crate::worldtex::globals(), d.shader);
+            d.layer_desc = crate::worldtex::last_layers();
+        }
     }
     d.stage_tls = (r64(TLS_STAGE) & 0xFFFF_FFFF) as u32;
     let ctx = r64(TLS_CTX);
@@ -2292,7 +2375,12 @@ fn capture_light(s: &State, c: &mut Capture, geom: u64, ret: u64, tls: u64, samp
         // SAFETY: the draw's shader object (fault-fixed).
         d.fx = unsafe { dread::<u64>(d.shader) }.unwrap_or(0);
     }
-    if s.cfg.census && d.shader != 0 {
+    if s.cfg.census && d.shader != 0 && thin {
+        // The program set now; the count once the albedo outcome is known.
+        // SAFETY: the draw's context (fault-fixed read).
+        d.thin.progs = if ctx != 0 { unsafe { dread::<u64>(ctx + CTX_PROGRAMS) }.unwrap_or(0) } else { 0 };
+        d.thin.flags |= thin::CENSUS;
+    } else if s.cfg.census && d.shader != 0 {
         // SAFETY: the draw's shader object and context (fault-fixed reads).
         let (fx, progs) = unsafe { (dread::<u64>(d.shader).unwrap_or(0), if ctx != 0 { dread::<u64>(ctx + CTX_PROGRAMS).unwrap_or(0) } else { 0 }) };
         let why = if crate::worldtex::enabled() { crate::worldtex::last_why() } else { 4 };
@@ -2304,43 +2392,29 @@ fn capture_light(s: &State, c: &mut Capture, geom: u64, ret: u64, tls: u64, samp
         return;
     };
     d.ghash = le64(&g, 0x30);
-    let id = (geom, d.ghash);
-    let cached = GEOMS.with(|m| m.borrow().get(&id).copied());
-    part(c, 1);
-    let key = match cached {
-        Some(k) => k,
-        None => {
-            c.geom_misses += 1;
-            let mut k = GeomKey { hash: d.ghash, ..Default::default() };
-            // Direct reads: the buffer objects this draw binds (a
-            // guarded read is a ReadProcessMemory syscall; 2,200 first-seen
-            // geometries at world entry cost 3 of them each).
-            // SAFETY: the geometry's own buffer objects, used by this draw.
-            if let Some(vb) = unsafe { dread::<[u8; 0x20]>(le64(&g, 8)) } {
-                (k.vb_at, k.vb_len) = grc(&vb);
+    let objects = [le64(&g, 8), le64(&g, 0x10), le64(&g, 0x40)];
+    if thin {
+        // The geometry and its buffer objects live while the frame draws [I]:
+        // their key is looked up (and on first sight read) by our threads.
+        d.thin.g = objects;
+        d.thin.flags |= thin::GEOM;
+        part(c, 1);
+    } else {
+        let id = (geom, d.ghash);
+        let cached = GEOMS.with(|m| m.borrow().get(&id).copied());
+        part(c, 1);
+        let key = match cached {
+            Some(k) => k,
+            None => {
+                c.geom_misses += 1;
+                let k = geom_read(d.ghash, objects);
+                geom_keep(id, k);
+                part(c, 2);
+                k
             }
-            // SAFETY: as above (the meshlet buffer object and its grc header).
-            if let Some(buf) = unsafe { dread::<u64>(le64(&g, 0x40)).and_then(|m| dread::<[u8; 0x20]>(m)) } {
-                (k.mesh_at, k.mesh_len) = grc(&buf);
-            // SAFETY: as above.
-            } else if let Some(ib) = unsafe { dread::<[u8; 0x20]>(le64(&g, 0x10)) } {
-                // A classic geometry: its index buffer stands in for the meshlets (mesh_len 0 marks it).
-                k.mesh_at = le64(&ib, 0x18);
-                k.ib = u64::from(le32(&ib, 8)) << 8 | u64::from(le16(&ib, 0xC) & 0xFFF);
-            }
-            GEOMS.with(|m| {
-                let mut m = m.borrow_mut();
-                if m.len() > MAP_CAP {
-                    m.clear();
-                }
-                m.insert(id, k);
-            });
-            part(c, 2);
-            k
-        }
-    };
-    (d.mesh_at, d.mesh_len, d.vb_at, d.vb_len) = (key.mesh_at, key.mesh_len, key.vb_at, key.vb_len);
-    d.ib_len = key.ib;
+        };
+        geom_apply(&mut d, key);
+    }
     if ctx != 0 {
         transform_direct(s, c, &mut d, ctx);
         // SAFETY: the live render context of this draw.
@@ -2352,7 +2426,9 @@ fn capture_light(s: &State, c: &mut Capture, geom: u64, ret: u64, tls: u64, samp
         };
     }
     part(c, 3);
-    if d.model != 0 {
+    if thin {
+        d.skinned = model.skinned;
+    } else if d.model != 0 {
         let known = MODELS.with(|m| m.borrow().get(&d.model).copied());
         d.skinned = known.unwrap_or_else(|| {
             // Skinned when model+0x14 (u16) != 0 or model+0x35 bit 0.
@@ -2453,7 +2529,9 @@ fn capture_light(s: &State, c: &mut Capture, geom: u64, ret: u64, tls: u64, samp
     // this capture began (per-thread frame boundaries).
     // SAFETY: a plain query of the calling thread.
     d.thread = unsafe { xnw_core::win::GetCurrentThreadId() };
-    d.hook_us = c.t0.elapsed().as_micros() as u32;
+    // Thin: one clock read for both times.
+    let now = thin.then(Instant::now);
+    d.hook_us = now.map_or_else(|| c.t0.elapsed(), |n| n - c.t0).as_micros() as u32;
     d.title_frame = title_frame();
     if s.cfg.seq && ctx != 0 {
         // The context's sample mask word (ctx+0x12360) at the draw.
@@ -2478,9 +2556,61 @@ fn capture_light(s: &State, c: &mut Capture, geom: u64, ret: u64, tls: u64, samp
             d.hook_cam = camera_position(&v);
         }
     }
-    d.abs_us = T_START.get_or_init(Instant::now).elapsed().as_micros() as u64;
+    let start = *T_START.get_or_init(Instant::now);
+    d.abs_us = now.map_or_else(|| start.elapsed(), |n| n.saturating_duration_since(start)).as_micros() as u64;
     d.seq_no = c.draws.len() as u32;
     c.draws.push(d);
+}
+
+/// A geometry's buffer objects ([vertex buffer object +8, index buffer
+/// object +0x10, meshlet pointer +0x40] of its 0x48-B head) as its key.
+/// Direct reads: the buffer objects this draw binds (a guarded read is a
+/// ReadProcessMemory syscall; 2,200 first-seen geometries at world entry
+/// cost 3 of them each).
+fn geom_read(hash: u64, objects: [u64; 3]) -> GeomKey {
+    let mut k = GeomKey { hash, ..Default::default() };
+    // SAFETY: the geometry's own buffer objects, used by this draw.
+    if let Some(vb) = unsafe { dread::<[u8; 0x20]>(objects[0]) } {
+        (k.vb_at, k.vb_len) = grc(&vb);
+    }
+    // SAFETY: as above (the meshlet buffer object and its grc header).
+    if let Some(buf) = unsafe { dread::<u64>(objects[2]).and_then(|m| dread::<[u8; 0x20]>(m)) } {
+        (k.mesh_at, k.mesh_len) = grc(&buf);
+    // SAFETY: as above.
+    } else if let Some(ib) = unsafe { dread::<[u8; 0x20]>(objects[1]) } {
+        // A classic geometry: its index buffer stands in for the meshlets (mesh_len 0 marks it).
+        k.mesh_at = le64(&ib, 0x18);
+        k.ib = u64::from(le32(&ib, 8)) << 8 | u64::from(le16(&ib, 0xC) & 0xFFF);
+    }
+    k
+}
+
+/// Keeps a geometry's key in this thread's cache (by pointer, hash).
+fn geom_keep(id: (u64, u64), k: GeomKey) {
+    GEOMS.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.len() > MAP_CAP {
+            m.clear();
+        }
+        m.insert(id, k);
+    });
+}
+
+/// This thread's cached key of a geometry, else read and kept (`misses` counts the reads).
+fn geom_key(geom: u64, hash: u64, objects: [u64; 3], misses: &mut u32) -> GeomKey {
+    let id = (geom, hash);
+    if let Some(k) = GEOMS.with(|m| m.borrow().get(&id).copied()) {
+        return k;
+    }
+    *misses += 1;
+    let k = geom_read(hash, objects);
+    geom_keep(id, k);
+    k
+}
+
+fn geom_apply(d: &mut Draw, key: GeomKey) {
+    (d.mesh_at, d.mesh_len, d.vb_at, d.vb_len) = (key.mesh_at, key.mesh_len, key.vb_at, key.vb_len);
+    d.ib_len = key.ib;
 }
 
 const NO_PAL: u32 = u32::MAX;
@@ -3617,11 +3747,14 @@ fn main_viewports(cameras: &[xnw_world::Camera], main: Option<u64>) -> Vec<u64> 
     cameras.iter().filter(|c| same(&c.view, &m.view) && same(&c.proj, &m.proj)).map(|c| c.viewport).collect()
 }
 
-/// A `name=on|off` switch of XNW_WORLD_RENDER (read once).
+/// A `name=on|off` switch of XNW_WORLD_RENDER (read once), with
+/// `XNW_AB_WORLD` over it once the A/B switch has turned B on (`ab.rs`;
+/// only callers that ask every frame see the change: `ab::LIVE_WORLD`).
 fn render_switch(name: &str, default: bool) -> bool {
     static OPTS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     let v = OPTS.get_or_init(|| std::env::var("XNW_WORLD_RENDER").unwrap_or_default());
-    switch_in(v, name, default)
+    let base = switch_in(v, name, default);
+    crate::ab::world_overlay().map_or(base, |b| switch_in(b, name, base))
 }
 
 fn switch_in(v: &str, name: &str, default: bool) -> bool {
@@ -3851,10 +3984,20 @@ fn render_frame(c: Capture, cache: &mut xnw_world::GeometryCache<()>, dump: Opti
     // the worlds are made by the pass's compute; a dumped frame keeps the CPU
     // path (its list.tsv and instances.bin are the replay's input).
     let gpucull = render_switch("gpucull", false) && dump.is_none();
-    // `hair=on` (HAIR2, default off): the strand chain runs in the replay only; the live path is a stub.
-    static HAIR_STUB: std::sync::Once = std::sync::Once::new();
-    if render_switch("hair", false) {
-        HAIR_STUB.call_once(|| xnw_core::info!("world: hair=on: the strand chain and strand draws run in the replay only (world-render); live path stubbed while the card is frozen"));
+    // `hair=on` (HAIR6, default off): the title's strand chain and strand
+    // draws for this frame (the pack writer's live hair mode), their pixels with the list.
+    // `ui=on` (UI1, default off): the title's UI draws for this frame (the
+    // writer's live UI mode), drawn through its programs into the list's UI layer.
+    if pack::live()
+        && let Some((data, blobs)) = pack::take_live(c.frame)
+    {
+        let blobs = std::sync::Arc::new(blobs);
+        if pack::hair_live() {
+            hairlive::frame(c.frame, &mut list, data.clone(), blobs.clone());
+        }
+        if pack::ui_live() {
+            uilive::frame(c.frame, &mut list, data, blobs);
+        }
     }
     // The title's multi-pass techniques (0x1451AD540: one draw
     // per technique pass, passes[base+k] with its own program set) submit the
@@ -3872,6 +4015,8 @@ fn render_frame(c: Capture, cache: &mut xnw_world::GeometryCache<()>, dump: Opti
     let mut inst_why: Vec<u8> = Vec::new();
     // Batches from the static map list (kind S, desc+0x68) among them.
     let mut gpu_batches = 0u32;
+    // Batches with a near fade-in bitset (VEH3).
+    let mut near_batches = 0u32;
     let (mut outside, mut wrong_lod) = (0u32, 0u32);
     // Records failing the sanity rule, by block source (cpu-list, gpu-buffer list, buffer view).
     let mut insane = [0u32; 3];
@@ -3937,6 +4082,8 @@ fn render_frame(c: Capture, cache: &mut xnw_world::GeometryCache<()>, dump: Opti
                 }
                 let room = (4 * xnw_world::MAX_INSTANCES as usize).saturating_sub(list.instances.len() / 12);
                 let hide = c.mask_list.get(i.mask as usize).map(Vec::as_slice);
+                let near = c.mask_list.get(i.near as usize).map(Vec::as_slice);
+                near_batches += u32::from(near.is_some());
                 let mut why = dump.map(|_| Vec::new());
                 // Our camera's planes (the proj as captured; the pass drops the jitter for drawing).
                 let planes = frustum_planes(&xnw_world::Camera { viewport: 0, view: cam.view, proj: cam.proj }.view_proj_relative());
@@ -3948,7 +4095,7 @@ fn render_frame(c: Capture, cache: &mut xnw_world::GeometryCache<()>, dump: Opti
                     let pushed = verdict.and_then(|need_planes| {
                         // Kind S and grass blocks are the same allocation across frames (kept on the device).
                         let keep = c.inst_src.get(i.block as usize).is_some_and(|s| *s != 0);
-                        list.cull.push(xnw_world::gpucull::Batch { records: block.clone(), len: n, keep, lod: lod.map(|(t, s)| (*t, s as u32)), hide: hide.map(<[u32]>::to_vec).unwrap_or_default(), origin, planes: need_planes.then_some(planes), out_first: 0 })
+                        list.cull.push(xnw_world::gpucull::Batch { records: block.clone(), len: n, keep, lod: lod.map(|(t, s)| (*t, s as u32)), hide: hide.map(<[u32]>::to_vec).unwrap_or_default(), near: near.map(<[u32]>::to_vec).unwrap_or_default(), origin, planes: need_planes.then_some(planes), out_first: 0 })
                     });
                     // A full cull frame falls back to the CPU test below.
                     if verdict.is_none() || pushed.is_some() {
@@ -3965,7 +4112,7 @@ fn render_frame(c: Capture, cache: &mut xnw_world::GeometryCache<()>, dump: Opti
                         };
                     }
                 }
-                let (n, k, h) = prefilter_batch(block, block.len().min(64 * room), lod, hide, origin, &mut list.instances, why.as_mut(), &planes, &mut counts);
+                let (n, k, h) = prefilter_batch(block, block.len().min(64 * room), lod, Masks { hide, near }, origin, &mut list.instances, why.as_mut(), &planes, &mut counts);
                 split[0] += tp.elapsed().as_nanos() as u64;
                 // Drawn instances whose bounding sphere (LOD record
                 // radius x scale) covers more than a quarter of the screen.
@@ -4224,7 +4371,18 @@ fn render_frame(c: Capture, cache: &mut xnw_world::GeometryCache<()>, dump: Opti
         }
         // `bridgeps`: the rows whose sinks were read, for the title's own programs in our pass.
         if SINK_BRIDGE.load(Ordering::Relaxed) {
-            let rows: Vec<(u32, xnw_world::bridged::Owned)> = list_v1.iter().enumerate().filter_map(|(row, &i)| c.draws.get(i)?.bridged.as_deref().map(|o| (row as u32, o.clone()))).collect();
+            let rows: Vec<(u32, xnw_world::bridged::Owned)> = list_v1
+                .iter()
+                .enumerate()
+                .filter_map(|(row, &i)| {
+                    let mut o = c.draws.get(i)?.bridged.as_deref()?.clone();
+                    if let Some(d) = list.draws.get(row) {
+                        o.ident = xnw_world::bridged::ident(&d.geom, d.stage);
+                        o.blend = d.state.map_or([0; 8], |s| s.blend);
+                    }
+                    Some((row as u32, o))
+                })
+                .collect();
             let (not_ready, unread) = bridgeps::take_counts();
             let mut f = xnw_world::bridged::Frame::new(rows);
             (f.not_ready, f.unread) = (not_ready, unread);
@@ -4253,7 +4411,7 @@ fn render_frame(c: Capture, cache: &mut xnw_world::GeometryCache<()>, dump: Opti
         }
         let passes: Vec<String> = passes.iter().map(|((p, s), n)| format!("{p:#x}/{s} {n}")).collect();
         xnw_core::info!(
-            "world render: frame {frame}: {} draws seen, {draws} recorded ({main} main view), {palettes} palettes, skinned draws {skin_draws} ({skin_agree} agree with the TLS pointer, extent {skin_extent} bones); {new} new geometries ({} KiB copied, {failed} failed, geometry not ready {not_ready}), cache {} ({evicted} evicted); hook {:.2} ms ({} B read: palettes), list {:.2} ms; lists {published} published, {replaced} replaced; passes {}; entries (60 frames) {}; instanced batches {batches} (cpu-list {}, gpu-buffer {gpu_batches}; instanced calls not recorded: {} without TLS, {} geometry unreadable), ({no_lod} without a LOD record), instances: tested {tested}, outside frustum {outside}, wrong LOD {wrong_lod}, hidden {hidden}, drawn {drawn}; {inst_ms:.2} ms",
+            "world render: frame {frame}: {} draws seen, {draws} recorded ({main} main view), {palettes} palettes, skinned draws {skin_draws} ({skin_agree} agree with the TLS pointer, extent {skin_extent} bones); {new} new geometries ({} KiB copied, {failed} failed, geometry not ready {not_ready}), cache {} ({evicted} evicted); hook {:.2} ms ({} B read: palettes), list {:.2} ms; lists {published} published, {replaced} replaced; passes {}; entries (60 frames) {}; instanced batches {batches} (cpu-list {}, gpu-buffer {gpu_batches}; instanced calls not recorded: {} without TLS, {} geometry unreadable), ({no_lod} without a LOD record), instances: tested {tested}, outside frustum {outside}, wrong LOD {wrong_lod}, hidden {hidden}, drawn {drawn}; {inst_ms:.2} ms; batches with a near fade-in set {near_batches}",
             c.seen,
             copied >> 10,
             cache.len(),
@@ -4288,7 +4446,7 @@ fn render_frame(c: Capture, cache: &mut xnw_world::GeometryCache<()>, dump: Opti
         let alpha = c.draws.iter().filter(|d| d.alpha_clip).count();
         xnw_core::info!("world render: frame {frame}: albedo at the hook (60 frames): slot found {}, no albedo variable {}, not resident {}, not a view {}, effect lookups {}; this frame {alpha} alpha-clip draws", t[0], t[1], t[2], t[3], t[4]);
         let decoded: Vec<String> = states.known.iter().take(12).map(|(k, v)| match v {
-            Some(s) => format!("{}/{}/{}: depth {}{} f{} bias {} slope {:.2} blend {:?}", k[0], k[1], k[2], u8::from(s.depth_enable), if s.depth_write { "w" } else { "" }, s.depth_func, s.depth_bias, f32::from_bits(s.slope_bias), s.blend),
+            Some(s) => format!("{}/{}/{}: depth {}{} f{} bias {} slope {:.2} cull {}{} blend {:?}", k[0], k[1], k[2], u8::from(s.depth_enable), if s.depth_write { "w" } else { "" }, s.depth_func, s.depth_bias, f32::from_bits(s.slope_bias), s.cull, if s.front_ccw { " ccw" } else { "" }, s.blend),
             None => format!("{}/{}/{}: unread", k[0], k[1], k[2]),
         }).collect();
         xnw_core::info!("world render: frame {frame}: {} render states decoded: {}; stage at TLS+0x950 differs from the pass begin in {} draws", states.known.len(), decoded.join("; "), c.draws.iter().filter(|d| d.stage_tls != 0 && d.stage_tls != d.pass.1).count());
@@ -4297,10 +4455,11 @@ fn render_frame(c: Capture, cache: &mut xnw_world::GeometryCache<()>, dump: Opti
         let faults = faults_text();
         let ms = |v: u64| v as f64 / 1e6;
         xnw_core::info!(
-            "world render: hook parts (frame {frame}, sampled 1 in {PART_SAMPLE}): {}, other {:.2} ms; total {:.2} ms; {faults}",
+            "world render: hook parts (frame {frame}, sampled 1 in {PART_SAMPLE}): {}, other {:.2} ms; total {:.2} ms; {faults}{}",
             (0..6).map(|k| format!("{} {:.2} ms", PART_NAMES[k], ms(p[k]))).collect::<Vec<_>>().join(", "),
             ms(p[6].saturating_sub(known)),
-            hook_ms
+            hook_ms,
+            thin::line()
         );
         let top: Vec<String> = census.iter().take(10).map(|((s, k), n)| format!("{s}/{}/{}/{} {n}", k[0], k[1], k[2])).collect();
         xnw_core::info!("world render: frame {frame}: state census (stage/blend/depth-stencil/raster draws): {}; sun {:?}", top.join(", "), list_sun);
@@ -4633,7 +4792,7 @@ impl StateTables {
 fn decode_state(dss: &[u8], ras: &[u8], blend: &[u8]) -> xnw_world::RenderState {
     let mut b = [0u8; 8];
     b.copy_from_slice(&blend[4..12]);
-    xnw_world::RenderState { depth_enable: dss[0] != 0, depth_write: dss[1] != 0, depth_func: dss[2], depth_bias: i32::from(ras[3] as i8), bias_clamp: le32(ras, 4), slope_bias: le32(ras, 8), blend: b }
+    xnw_world::RenderState { depth_enable: dss[0] != 0, depth_write: dss[1] != 0, depth_func: dss[2], depth_bias: i32::from(ras[3] as i8), bias_clamp: le32(ras, 4), slope_bias: le32(ras, 8), blend: b, cull: ras[1], front_ccw: ras[2] != 0 }
 }
 
 /// Skinlog (an earlier title's layout): the model's u16 bone-tag map candidate
@@ -5003,6 +5162,26 @@ pub unsafe fn start(base: usize) {
             xnw_core::warn!("world probe: pack=2 writes seq frames only (add seq=...); pack off");
         }
     }
+    // HAIR6 `hair=on`: the writer's live hair mode (a capture's `pack=2` wins: hair stays the replay's).
+    if hairlive::on() && cfg.render {
+        if pack::on() {
+            xnw_core::warn!("world render: hair=on: the frame pack writer records a capture (pack=2): live hair off (the replay draws hair from the capture)");
+        } else {
+            pack::set_arena(real(base, ARENA_BASE));
+            pack::enable_hair();
+        }
+    }
+    // UI1 `ui=on`: the writer's live UI mode (a capture's `pack=2` wins: the replay draws the UI then).
+    if uilive::on() && cfg.render {
+        if pack::on() && !pack::live() {
+            xnw_core::warn!("world render: ui=on: the frame pack writer records a capture (pack=2): live UI off (the replay draws it from the capture)");
+        } else {
+            match uilive::names() {
+                Ok(n) => pack::enable_ui(n),
+                Err(e) => xnw_core::warn!("world render: ui=on: off: {e}"),
+            }
+        }
+    }
     install_sinks(cfg.render);
     // The imposter reads need the arena and the type table (the pack sets
     // them too; they are addresses only).
@@ -5013,7 +5192,13 @@ pub unsafe fn start(base: usize) {
     }
     let (tx, rx) = mpsc::channel::<Capture>();
     let dir = cfg.dir.clone();
-    let state = State { cfg, title: base, tls_index: index, g: Globals::of(base), base: AtomicU64::new(u64::MAX), wait_world, done: AtomicBool::new(false), pending: AtomicU64::new(u64::MAX), slots: Mutex::new(Vec::new()), sent: AtomicU64::new(u64::MAX), late: [AtomicU64::new(0), AtomicU64::new(0)], tx: Mutex::new(tx) };
+    // The thin hook leaves reads to after the draw: not with the pack, whose
+    // hook records take the draw's decoded views at the hook.
+    let thin = thin::wanted() && cfg.render && !cfg.pack;
+    if thin::wanted() {
+        xnw_core::info!("world probe: thin hook {}", if thin { format!("on: the hook copies what the title may change before the frame ends; {} threads decode the rest at the cut", thin::threads()) } else { "asked for, off (screen mode without pack=2 only)".to_string() });
+    }
+    let state = State { cfg, title: base, tls_index: index, g: Globals::of(base), base: AtomicU64::new(u64::MAX), wait_world, done: AtomicBool::new(false), pending: AtomicU64::new(u64::MAX), slots: Mutex::new(Vec::new()), sent: AtomicU64::new(u64::MAX), late: [AtomicU64::new(0), AtomicU64::new(0)], tx: Mutex::new(tx), thin };
     if STATE.set(state).is_err() {
         return;
     }
@@ -5137,8 +5322,12 @@ pub unsafe fn start(base: usize) {
         let s = STATE.get().unwrap();
         let mut cache = xnw_world::GeometryCache::<()>::default();
         let mut panics = 0u32;
-        for c in rx {
+        for mut c in rx {
             let frame = c.frame;
+            // The thin hook's draws decoded before the list is built.
+            if s.thin {
+                thin::decode(&mut c);
+            }
             // A panic in one frame's writing once cost every later frame.
             // Each frame is now written under catch_unwind: a failing frame is
             // logged and skipped, the writer goes on.
@@ -5481,7 +5670,7 @@ mod tests {
         let geom = GeomKey { mesh_at: 0x1234, mesh_len: 64, vb_at: 0x5678, vb_len: 128, ib: 0, hash: 0xABC };
         let list = FrameList {
             frame: 7,
-            draws: vec![DrawRecord { geom, world, viewport: 0x99, effect: 0x42, albedo: Albedo::Flat([1.0; 3]), palette: 0, stage: 65, inst_first: 2, inst_count: 3, bone_first: 7, bone_count: 9, material: xnw_world::Material { albedo_desc: 0x2_4000_0040, alpha_clip: true, ..Default::default() }, state: Some(xnw_world::RenderState { depth_enable: true, depth_write: false, depth_func: 7, depth_bias: -3, bias_clamp: 0x3f80_0000, slope_bias: 0x4000_0000, blend: [1, 5, 6, 1, 2, 1, 1, 15] }), remap: xnw_world::NO_REMAP, ped: false }],
+            draws: vec![DrawRecord { geom, world, viewport: 0x99, effect: 0x42, albedo: Albedo::Flat([1.0; 3]), palette: 0, stage: 65, inst_first: 2, inst_count: 3, bone_first: 7, bone_count: 9, material: xnw_world::Material { albedo_desc: 0x2_4000_0040, alpha_clip: true, ..Default::default() }, state: Some(xnw_world::RenderState { depth_enable: true, depth_write: false, depth_func: 7, depth_bias: -3, bias_clamp: 0x3f80_0000, slope_bias: 0x4000_0000, blend: [1, 5, 6, 1, 2, 1, 1, 15], cull: 0, front_ccw: false }), remap: xnw_world::NO_REMAP, ped: false }],
             cameras: vec![C { viewport: 0x99, view: world, proj: world }],
             palettes: vec![vec![1.0; 24]],
             instances: vec![0.25; 60],
@@ -5501,7 +5690,7 @@ mod tests {
     }
     /// The timed and the heavy tests run one at a time (timings measured
     /// while another test allocates or writes failed on the remote box).
-    fn heavy() -> std::sync::MutexGuard<'static, ()> {
+    pub(super) fn heavy() -> std::sync::MutexGuard<'static, ()> {
         static HEAVY: Mutex<()> = Mutex::new(());
         HEAVY.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -5726,9 +5915,9 @@ mod tests {
             for (k, b) in batches.iter().enumerate() {
                 let lod = Some((&t, k % 3));
                 let (n, d, _) = if batch_first {
-                    prefilter_batch(b, b.len(), lod, None, cam, &mut out, None, &planes, &mut counts)
+                    prefilter_batch(b, b.len(), lod, Masks::default(), cam, &mut out, None, &planes, &mut counts)
                 } else {
-                    prefilter_why(b, lod, None, cam, &mut out, None, Some(&planes), &mut counts)
+                    prefilter_why(b, lod, Masks::default(), cam, &mut out, None, Some(&planes), &mut counts)
                 };
                 tested += n;
                 drawn += d;
@@ -5782,7 +5971,7 @@ mod tests {
     fn test_state(dir: &std::path::Path, seq: bool) -> State {
         let (tx, _rx) = mpsc::channel::<Capture>();
         let cfg = Config { dir: dir.to_path_buf(), frames: 3, max: 100_000, at: Vec::new(), raw: 1, render: false, seq, skinlog: 0, census: false, auto: None, auto_veh: 0, cut_present: false, pack: false, scan_exit: false, hookin: false };
-        State { cfg, title: 0, tls_index: 0, g: Globals::default(), base: AtomicU64::new(0), wait_world: false, done: AtomicBool::new(false), pending: AtomicU64::new(u64::MAX), slots: Mutex::new(Vec::new()), sent: AtomicU64::new(u64::MAX), late: [AtomicU64::new(0), AtomicU64::new(0)], tx: Mutex::new(tx) }
+        State { cfg, title: 0, tls_index: 0, g: Globals::default(), base: AtomicU64::new(0), wait_world: false, done: AtomicBool::new(false), pending: AtomicU64::new(u64::MAX), slots: Mutex::new(Vec::new()), sent: AtomicU64::new(u64::MAX), late: [AtomicU64::new(0), AtomicU64::new(0)], tx: Mutex::new(tx), thin: false }
     }
 
     /// An instanced call's handler fields as 0x1435A4D50 / 0x144E54970
@@ -6561,6 +6750,11 @@ mod tests {
         let s = decode_state(&dss, &ras, &blend);
         assert!(s.depth_enable && !s.depth_write);
         assert_eq!((s.depth_func, s.depth_bias, f32::from_bits(s.slope_bias), s.blend), (7, -8, 1.5, [1, 2, 2, 1, 2, 2, 1, 0xF]));
+        // Cull NONE (1), front clockwise; then BACK (3) with front counter-clockwise.
+        assert_eq!((s.cull, s.front_ccw), (1, false));
+        ras[1..3].copy_from_slice(&[3, 1]);
+        let s = decode_state(&dss, &ras, &blend);
+        assert_eq!((s.cull, s.front_ccw), (3, true));
     }
 
     #[test]

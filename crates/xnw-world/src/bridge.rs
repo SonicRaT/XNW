@@ -16,7 +16,8 @@
 //!   version, optional features from `SFI0`), and why an adapter cannot run it.
 //! - [`run`]: the dispatch and the draw on a device. The title's translated
 //!   programs run on the software adapter; the hardware adapter only with
-//!   `XNW_BRIDGE_HW=1`.
+//!   `XNW_BRIDGE_HW=1` and the per-submission GPU watchdog running
+//!   ([`title_programs_here`]).
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -152,14 +153,30 @@ pub fn bind_at<'a>(ms: &HostShader, ps: &HostShader, d: &Draw<'a>, base: u32) ->
         Slot::Texture(_) | Slot::Handle(_) => View { kind: Kind::Raw, bytes: &[] },
     };
     let mut dispatch = preskin::Dispatch { groups: [d.groups, 1, 1], tables: Vec::new(), heap: d.heap.iter().map(|(k, s)| (*k, lay(s))).collect(), constants: Vec::new(), texels: Vec::new() };
+    // victory-fork (5a55384): a typed buffer view either program moves
+    // 16-bit halves through as unsigned integers (`HostShader::half_views`)
+    // is shown in the unsigned format of its layout. shortcut: the table is
+    // shared by both stages, so a stage that reads such a slot as floats
+    // would see the integer view (none of the 77 programs that name half
+    // views is drawn beside one that does, I).
+    let half: Vec<(u8, u32)> = ms.half_views.iter().chain(&ps.half_views).copied().collect();
     for &r in &tables {
         let Some(Root::Table(views)) = d.roots.get(usize::from(r)) else {
             return Err(format!("the record has no table at root {r}"));
         };
-        dispatch.tables.push((u32::from(r), views.iter().map(|(k, s)| (*k, lay(s))).collect()));
+        let twin = |k: u32, mut v: View<'a>| {
+            if half.iter().any(|&(root, dword)| root == r && dword / 8 == k)
+                && let Kind::Typed { format, .. } = &mut v.kind
+                && let Some(f) = crate::compute::half_format(*format)
+            {
+                *format = f;
+            }
+            v
+        };
+        dispatch.tables.push((u32::from(r), views.iter().map(|(k, s)| (*k, twin(*k, lay(s)))).collect()));
     }
     let user_data = tables.iter().map(|&r| emit::UserData { index: u32::from(r), slot: r, root: RootType::Table, dword: 0 }).collect();
-    let layout = HostShader { stage: HwStage::Cs, dxil: Vec::new(), user_data, samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: Vec::new(), root_srvs: Vec::new(), root_uavs: Vec::new(), address_map: false, descriptor_words: false };
+    let layout = HostShader { stage: HwStage::Cs, dxil: Vec::new(), user_data, samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: Vec::new(), root_srvs: Vec::new(), root_uavs: Vec::new(), half_views: Vec::new(), address_map: false, descriptor_words: false };
     let mut views = preskin::bind(&layout, &dispatch)?;
     if base > 0 {
         for &r in &tables {
@@ -442,7 +459,7 @@ pub const INTO_COLOUR: DXGI_FORMAT = DXGI_FORMAT_R8G8B8A8_UNORM;
 /// Target 0's clear value: no program writes a negative albedo.
 pub const CLEAR: [f32; 4] = [-1.0; 4];
 
-fn barrier(r: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_BARRIER {
+pub(crate) fn barrier(r: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -481,10 +498,58 @@ pub(crate) fn layer_errors(dev: &ID3D12Device) -> String {
     out
 }
 
+/// Whether the title's translated programs may run on `host`: the software
+/// adapter always; the hardware adapter only as a scheduled card sample
+/// (`XNW_BRIDGE_HW=1`) with the per-submission GPU watchdog running
+/// (`xnw_gpu::gpuwatch`: `--adapter hw` in the replay, the lab and
+/// `xnw-lab head` starts it), so one submission past its budget ends the
+/// process before the driver's 2 s timeout ("Card
+/// safety"). Every offline submitter of title programs asks this: the
+/// draw bridge, bridgeps, bridgems and the compute runner.
+pub fn title_programs_here(host: &xnw_gpu::host::Host) -> Result<(), String> {
+    if host.caps.software {
+        return Ok(());
+    }
+    if std::env::var("XNW_BRIDGE_HW").ok().as_deref() != Some("1") {
+        return Err(format!("the title's translated programs run on the software adapter; {} needs XNW_BRIDGE_HW=1 (a scheduled card sample)", host.caps.adapter));
+    }
+    if xnw_gpu::gpuwatch::budget().is_none() {
+        return Err(format!("the title's translated programs on {} need the per-submission GPU watchdog running (--adapter hw starts it)", host.caps.adapter));
+    }
+    Ok(())
+}
+
+/// Pixel programs (first 32 bits of the container hash) the bridge does not
+/// run on the hardware adapter, each with why and the evidence: their rows
+/// stay our own pass's there. The software adapter runs them. An entry
+/// leaves the list when its cause is fixed and a card sample the user
+/// scheduled has shown it.
+pub const DENY_HW: &[(u32, &str)] = &[(
+    0x3811_0e02,
+    "it hung the RX 5700 XT drawn alone in production form (the device hung 0x887a0006 after the pass wait; clean on WARP with GPU-based validation)",
+)];
+
+/// Why the bridge leaves the pixel program of container hash `ps` to our
+/// own pass: it is in [`DENY_HW`] and the adapter is the hardware one
+/// (`software` false). None: it may run. `XNW_BRIDGE_ALLOW=<hash>+<hash>`
+/// (first 32 bits, hex) lets a listed program through for one card sample
+/// the user has scheduled; nothing else sets it.
+pub fn denied(ps: u128, software: bool) -> Option<String> {
+    denied_with((ps >> 96) as u32, software, &std::env::var("XNW_BRIDGE_ALLOW").unwrap_or_default())
+}
+
+fn denied_with(ps: u32, software: bool, allow: &str) -> Option<String> {
+    if software || allow.split('+').filter_map(|h| u32::from_str_radix(h.trim().trim_start_matches("0x"), 16).ok()).any(|h| h == ps) {
+        return None;
+    }
+    let why = DENY_HW.iter().find(|d| d.0 == ps)?.1;
+    Some(format!("pixel program {ps:08x} is not run on the hardware adapter: {why}"))
+}
+
 /// Dispatches the mesh program over `b.groups` groups and draws its records
 /// with the pixel program into float targets and a depth target; returns
 /// target 0. Refuses an adapter [`gap`] names, and the hardware adapter
-/// unless `XNW_BRIDGE_HW=1`.
+/// unless [`title_programs_here`] allows it.
 pub fn run(host: &xnw_gpu::host::Host, p: &Programs, b: &Binding, t: &Target) -> Result<Frame, String> {
     run_into(host, p, b, t, None)
 }
@@ -528,7 +593,7 @@ impl Pipes {
                 Some((croot, cpso))
             }
         };
-        let passthrough = HostShader { stage: HwStage::Vs, dxil: p.vs.clone(), user_data: Vec::new(), samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: Vec::new(), root_srvs: Vec::new(), root_uavs: Vec::new(), address_map: false, descriptor_words: false };
+        let passthrough = HostShader { stage: HwStage::Vs, dxil: p.vs.clone(), user_data: Vec::new(), samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: Vec::new(), root_srvs: Vec::new(), root_uavs: Vec::new(), half_views: Vec::new(), address_map: false, descriptor_words: false };
         let vs = if p.vertex.is_some() { &p.ms } else { &passthrough };
         let gstages: Vec<(&HostShader, D3D12_SHADER_VISIBILITY)> = if pixel { vec![(vs, D3D12_SHADER_VISIBILITY_VERTEX), (&p.ps, D3D12_SHADER_VISIBILITY_PIXEL)] } else { vec![(vs, D3D12_SHADER_VISIBILITY_VERTEX)] };
         let groot = eh.root_signature_records(&gstages, &[(false, RECORD_REGISTER)])?;
@@ -560,6 +625,79 @@ impl Pipes {
             dev.CreateGraphicsPipelineState::<ID3D12PipelineState>(&gdesc).map_err(|x| format!("graphics pipeline: {}", e(x)))?
         };
         Ok(Pipes { compute, cp, groot, gpso, gp, pixel, vertex: p.vertex })
+    }
+}
+
+impl Pipes {
+    /// UI1: a vertex-program draw (`p.vertex` set: `p.ms` is the title's
+    /// vertex program) with the title's input layout `inputs`, its pixel
+    /// program, one colour target of `format` blended with `blend`, cull
+    /// `cull` and no depth (the UI layer).
+    pub fn new_ia(dev: &ID3D12Device, p: &Programs, format: DXGI_FORMAT, blend: D3D12_RENDER_TARGET_BLEND_DESC, cull: D3D12_CULL_MODE, inputs: &[D3D12_INPUT_ELEMENT_DESC]) -> Result<Pipes, String> {
+        let e = |e: windows::core::Error| e.message().to_string();
+        let eh = emit::host::Host::from_device(dev.clone());
+        use emit::mesh::RECORD_REGISTER;
+        let gstages: Vec<(&HostShader, D3D12_SHADER_VISIBILITY)> = vec![(&p.ms, D3D12_SHADER_VISIBILITY_VERTEX), (&p.ps, D3D12_SHADER_VISIBILITY_PIXEL)];
+        let groot = eh.root_signature_records(&gstages, &[(false, RECORD_REGISTER)])?;
+        let (cp, gp) = (params(&[&p.ms], 3), params(&gstages.iter().map(|s| s.0).collect::<Vec<_>>(), 1));
+        // SAFETY: a description that outlives the call.
+        let gpso = unsafe {
+            let mut gdesc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&groot),
+                VS: D3D12_SHADER_BYTECODE { pShaderBytecode: p.ms.dxil.as_ptr().cast(), BytecodeLength: p.ms.dxil.len() },
+                PS: D3D12_SHADER_BYTECODE { pShaderBytecode: p.ps.dxil.as_ptr().cast(), BytecodeLength: p.ps.dxil.len() },
+                SampleMask: u32::MAX,
+                RasterizerState: D3D12_RASTERIZER_DESC { FillMode: D3D12_FILL_MODE_SOLID, CullMode: cull, DepthClipEnable: true.into(), ..Default::default() },
+                InputLayout: D3D12_INPUT_LAYOUT_DESC { pInputElementDescs: inputs.as_ptr(), NumElements: inputs.len() as u32 },
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            gdesc.BlendState.RenderTarget[0] = blend;
+            gdesc.RTVFormats[0] = format;
+            dev.CreateGraphicsPipelineState::<ID3D12PipelineState>(&gdesc).map_err(|x| format!("graphics pipeline: {}", e(x)))?
+        };
+        Ok(Pipes { compute: None, cp, groot, gpso, gp, pixel: true, vertex: p.vertex })
+    }
+}
+
+/// UI1: records an IA draw of the uploaded binding `u` with the pipes of
+/// [`Pipes::new_ia`]: vertex buffers, an index buffer (DrawIndexed) or
+/// none (Draw: `count` vertices from `first`), `instances`, `base` vertex.
+/// Targets, viewport and scissor are the caller's.
+#[allow(clippy::too_many_arguments)]
+pub fn record_ia_draw(list: &ID3D12GraphicsCommandList, pipes: &Pipes, u: &Uploaded, records: u64, vbs: &[D3D12_VERTEX_BUFFER_VIEW], ibv: Option<&D3D12_INDEX_BUFFER_VIEW>, (count, instances, first, base): (u32, u32, u32, i32), strip: bool) {
+    let (gp, g) = (&pipes.gp, &u.bounds);
+    // SAFETY: as in record_dispatch.
+    unsafe {
+        list.SetDescriptorHeaps(&[Some(u.views.clone()), Some(u.samplers.clone())]);
+        list.SetPipelineState(&pipes.gpso);
+        list.SetGraphicsRootSignature(&pipes.groot);
+        list.SetGraphicsRoot32BitConstants(0, u.mesh_constants.len() as u32, u.mesh_constants.as_ptr().cast(), 0);
+        list.SetGraphicsRoot32BitConstants(1, u.pixel_constants.len() as u32, u.pixel_constants.as_ptr().cast(), 0);
+        for &(param, is_srv, va) in &u.pixel_views {
+            if is_srv { list.SetGraphicsRootShaderResourceView(u32::from(param), va) } else { list.SetGraphicsRootConstantBufferView(u32::from(param), va) }
+        }
+        if let Some(param) = gp.stride {
+            list.SetGraphicsRootShaderResourceView(param, u.stride_table.GetGPUVirtualAddress());
+        }
+        list.SetGraphicsRootShaderResourceView(gp.records, records);
+        if let Some(param) = gp.bounds {
+            list.SetGraphicsRoot32BitConstants(param, 8, g.as_ptr().cast(), 0);
+        }
+        use windows::Win32::Graphics::Direct3D::{D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP};
+        list.IASetPrimitiveTopology(if strip { D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP } else { D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST });
+        if !vbs.is_empty() {
+            list.IASetVertexBuffers(0, Some(vbs));
+        }
+        match ibv {
+            Some(ibv) => {
+                list.IASetIndexBuffer(Some(ibv));
+                list.DrawIndexedInstanced(count, instances.max(1), 0, base, 0);
+            }
+            None => list.DrawInstanced(count, instances.max(1), first, 0),
+        }
     }
 }
 
@@ -978,7 +1116,7 @@ fn content(bytes: &[u8]) -> u64 {
     h.finish()
 }
 
-fn committed(dev: &ID3D12Device, desc: &D3D12_RESOURCE_DESC, heap: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES, clear: Option<*const D3D12_CLEAR_VALUE>) -> Result<ID3D12Resource, String> {
+pub(crate) fn committed(dev: &ID3D12Device, desc: &D3D12_RESOURCE_DESC, heap: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES, clear: Option<*const D3D12_CLEAR_VALUE>) -> Result<ID3D12Resource, String> {
     let mut r: Option<ID3D12Resource> = None;
     // SAFETY: descriptions that outlive the call.
     unsafe { dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() }, D3D12_HEAP_FLAG_NONE, desc, state, clear, &mut r) }.map_err(|e| e.message().to_string())?;
@@ -990,7 +1128,7 @@ pub fn buffer(dev: &ID3D12Device, size: u64, heap: D3D12_HEAP_TYPE, flags: D3D12
     committed(dev, &D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: size.max(256), Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, Flags: flags, ..Default::default() }, heap, state, None)
 }
 
-fn upload_bytes(dev: &ID3D12Device, bytes: &[u8], size: u64) -> Result<ID3D12Resource, String> {
+pub(crate) fn upload_bytes(dev: &ID3D12Device, bytes: &[u8], size: u64) -> Result<ID3D12Resource, String> {
     let r = buffer(dev, size, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ)?;
     let mut at = std::ptr::null_mut();
     // SAFETY: an upload buffer of at least max(size, 256) bytes, mapped here.
@@ -1135,65 +1273,27 @@ pub fn upload(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, b: &Binding,
         }
         // Textures: one mip each, copied from an upload buffer.
         let shader_read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-        // A 1D or 3D texture (the compute runner's outputs) gets its own
-        // view dimension; the shared key keeps the dimension apart.
-        let view_of = |tx: &Provided| {
-            let mut d = tex2d(DXGI_FORMAT(tx.format as i32));
-            match tx.dim {
-                crate::textures::TEX_1D => {
-                    d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
-                    d.Anonymous.Texture1D = D3D12_TEX1D_SRV { MipLevels: 1, ..Default::default() };
-                }
-                crate::textures::TEX_3D => {
-                    d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
-                    d.Anonymous.Texture3D = D3D12_TEX3D_SRV { MipLevels: 1, ..Default::default() };
-                }
-                crate::textures::TEX_2D_ARRAY => {
-                    d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
-                    d.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV { MipLevels: 1, ArraySize: tx.depth.max(1), ..Default::default() };
-                }
-                _ => {}
-            }
-            d
-        };
+        // A texture takes the resource and the view of its shape (1D, 3D,
+        // a 2D array, a cube; `textures::provided_shape`); the shared key
+        // keeps the shapes apart.
+        let view_of = |tx: &Provided| crate::textures::provided_shape(tx).2;
         for &(s, tx) in &b.textures {
-            let key = (content(&tx.rows), tx.width, tx.height * tx.depth.max(1), tx.format | u32::from(tx.dim) << 24);
+            let key = (content(&tx.rows), tx.width, tx.height * tx.depth.max(1), tx.format | u32::from(tx.dim) << 24 | (tx.mips.clamp(1, 15) - 1) << 28);
             if let Some(r) = shared.texs.get(&key) {
                 shared.saved += tx.rows.len() as u64;
                 dev.CreateShaderResourceView(r, Some(&view_of(tx)), at(s));
                 continue;
             }
-            let (dimension, height, depth) = match tx.dim {
-                crate::textures::TEX_1D => (D3D12_RESOURCE_DIMENSION_TEXTURE1D, 1, 1),
-                crate::textures::TEX_3D | crate::textures::TEX_2D_ARRAY => (if tx.dim == crate::textures::TEX_3D { D3D12_RESOURCE_DIMENSION_TEXTURE3D } else { D3D12_RESOURCE_DIMENSION_TEXTURE2D }, tx.height, tx.depth.clamp(1, u32::from(u16::MAX)) as u16),
-                _ => (D3D12_RESOURCE_DIMENSION_TEXTURE2D, tx.height, 1),
-            };
-            let desc = D3D12_RESOURCE_DESC { Dimension: dimension, Width: u64::from(tx.width), Height: height, DepthOrArraySize: depth, MipLevels: 1, Format: DXGI_FORMAT(tx.format as i32), SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() };
+            let (desc, subs, _) = crate::textures::provided_shape(tx);
             let r = committed(dev, &desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST, None)?;
-            // One subresource, or one per slice of a 2D array (LIT5).
-            let subs = if tx.dim == crate::textures::TEX_2D_ARRAY { u32::from(depth) } else { 1 };
-            let mut fps = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); subs as usize];
-            let (mut rows, mut row_size, mut total) = (vec![0u32; subs as usize], vec![0u64; subs as usize], 0u64);
-            dev.GetCopyableFootprints(&desc, 0, subs, 0, Some(fps.as_mut_ptr()), Some(rows.as_mut_ptr()), Some(row_size.as_mut_ptr()), Some(&mut total));
+            // One subresource a slice and mip (a 3D texture: one a mip).
+            let (fps, rows, row_size, total) = crate::textures::footprints(dev, &desc, subs);
             let up = buffer(dev, total, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ)?;
             bytes += total;
             shared.new[2] += total;
             let mut to = std::ptr::null_mut();
             up.Map(0, None, Some(&mut to)).map_err(e)?;
-            // 3D: `depth` slices of `rows` rows each, slice after slice; an
-            // array's slices follow one another in `rows` the same way.
-            let mut first = 0usize;
-            for (i, fp) in fps.iter().enumerate() {
-                let n = (row_size[i] as usize).min(tx.row_bytes as usize);
-                let slices = fp.Footprint.Depth as usize;
-                for y in 0..(rows[i] as usize * slices).min((tx.row_count as usize).saturating_sub(first)) {
-                    let at_row = (first + y) * tx.row_bytes as usize;
-                    if let Some(row) = tx.rows.get(at_row..at_row + n) {
-                        std::ptr::copy_nonoverlapping(row.as_ptr(), to.cast::<u8>().add(fp.Offset as usize + y * fp.Footprint.RowPitch as usize), n);
-                    }
-                }
-                first += rows[i] as usize * slices;
-            }
+            crate::textures::provided_fill(tx, &fps, &rows, &row_size, to.cast());
             up.Unmap(0, None);
             for (i, fp) in fps.iter().enumerate() {
                 let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: i as u32 } };
@@ -1315,9 +1415,7 @@ pub fn record_draw(list: &ID3D12GraphicsCommandList, pipes: &Pipes, u: &Uploaded
 }
 
 fn submit(host: &xnw_gpu::host::Host, p: &Programs, b: &Binding, t: &Target, into: Option<&Into>) -> Result<Frame, String> {
-    if !host.caps.software && std::env::var("XNW_BRIDGE_HW").ok().as_deref() != Some("1") {
-        return Err("the title's translated programs run on the software adapter; the hardware adapter needs XNW_BRIDGE_HW=1 (a scheduled run)".into());
-    }
+    title_programs_here(host)?;
     if let Some(gap) = gap(&host.caps, &p.needs()) {
         return Err(gap);
     }
@@ -1441,6 +1539,7 @@ fn submit(host: &xnw_gpu::host::Host, p: &Programs, b: &Binding, t: &Target, int
         while fence.GetCompletedValue() < 1 {
             dev.GetDeviceRemovedReason().map_err(|x| format!("during the submission: {}", e(x)))?;
             if t0.elapsed().as_secs_f64() > t.limit {
+                xnw_gpu::gpuwatch::abandon("bridge", t.limit, xnw_gpu::gpuwatch::GRACE);
                 return Err(format!("the submission took over {} s", t.limit));
             }
             std::thread::yield_now();
@@ -1519,6 +1618,9 @@ pub fn read_colour(host: &xnw_gpu::host::Host, colour: &ID3D12Resource, w: u32, 
         queue.Signal(&fence, 1).map_err(e)?;
         while fence.GetCompletedValue() < 1 {
             dev.GetDeviceRemovedReason().map_err(|x| format!("reading the colour target back: {}", e(x)))?;
+            if xnw_gpu::gpuwatch::overdue("bridge readback", sent) {
+                return Err("reading the colour target back: the submission was given up".into());
+            }
             std::thread::yield_now();
         }
         xnw_gpu::gpuwatch::end("bridge readback", sent, None);
@@ -1652,6 +1754,11 @@ impl Kept {
         self.frame += 1;
         self.frame_bytes = 0;
         let f = self.frame;
+        // The sweep on every 8th frame (it walked every held input
+        // each frame); an input goes up to 7 frames past its rule.
+        if !f.is_multiple_of(8) {
+            return;
+        }
         let kept: std::collections::HashSet<usize> = self.at.keys().map(|k| k.0).collect();
         self.held.retain(|p, e| f.saturating_sub(e.1) <= if kept.contains(p) { KEPT_FRAMES } else { SEEN_FRAMES });
         let held = &self.held;
@@ -1745,7 +1852,7 @@ mod tests {
     use super::*;
 
     fn shader(stage: HwStage, user: &[(u32, u8, RootType, u32)], srvs: &[u8]) -> HostShader {
-        HostShader { stage, dxil: Vec::new(), user_data: user.iter().map(|&(index, slot, root, dword)| emit::UserData { index, slot, root, dword }).collect(), samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: Vec::new(), root_srvs: srvs.to_vec(), root_uavs: Vec::new(), address_map: false, descriptor_words: false }
+        HostShader { stage, dxil: Vec::new(), user_data: user.iter().map(|&(index, slot, root, dword)| emit::UserData { index, slot, root, dword }).collect(), samplers: Vec::new(), static_samplers: Vec::new(), root_cbvs: Vec::new(), root_srvs: srvs.to_vec(), root_uavs: Vec::new(), half_views: Vec::new(), address_map: false, descriptor_words: false }
     }
 
     /// Spans (ZC3): overlapping ranges share one whose start suits every
@@ -1781,7 +1888,7 @@ mod tests {
     fn binding_of_a_made_up_draw() {
         use RootType::{Constants, Table};
         let (cb, words, rec, lets, mat, vb) = ([1u8; 48], [2u8; 64], [3u8; 128], [4u8; 32], [5u8; 256], [6u8; 100]);
-        let tex = Provided { width: 4, height: 4, format: 28, rows: vec![7; 64], row_bytes: 16, row_count: 4, dim: crate::textures::TEX_2D, depth: 1 };
+        let tex = Provided { width: 4, height: 4, format: 28, rows: vec![7; 64], row_bytes: 16, row_count: 4, dim: crate::textures::TEX_2D, depth: 1, mips: 1 };
         let v = |kind, bytes| Slot::Buffer(View { kind, bytes });
         let d = Draw {
             roots: vec![
@@ -1890,6 +1997,23 @@ mod tests {
         assert_eq!(parse_switch("screen,bridgeps=on"), BRIDGE_PS_DEFAULT.to_vec());
         assert_eq!(parse_switch("screen,bridgeps=3ed68103+0x38110e02"), vec![0x3ed6_8103, 0x3811_0e02]);
         assert!(parse_switch("bridgeps=on,bridgeps=off").is_empty());
+    }
+
+    /// The program that hung the card is left to our pass on the hardware
+    /// adapter only, whether `bridgeps=on` or its own hash named it; the
+    /// others run; the allow switch names single programs.
+    #[test]
+    fn the_program_that_hung_the_card_stays_ours_on_the_hardware_adapter() {
+        assert!(BRIDGE_PS_DEFAULT.contains(&0x3811_0e02));
+        let why = denied_with(0x3811_0e02, false, "").expect("denied on the card");
+        assert!(why.contains("38110e02") && why.contains("0x887a0006"), "{why}");
+        assert_eq!(denied_with(0x3811_0e02, true, ""), None, "the software adapter runs it");
+        for &p in BRIDGE_PS_DEFAULT.iter().filter(|&&p| p != 0x3811_0e02) {
+            assert_eq!(denied_with(p, false, ""), None, "{p:08x}");
+        }
+        assert_eq!(denied_with(0x3811_0e02, false, "07b19da9+0x38110e02"), None);
+        assert!(denied_with(0x3811_0e02, false, "07b19da9").is_some());
+        assert!(denied(0x3811_0e02_u128 << 96 | 5, true).is_none());
     }
 
     #[test]

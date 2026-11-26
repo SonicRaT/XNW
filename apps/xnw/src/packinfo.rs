@@ -509,6 +509,34 @@ fn pk8_lines(dir: &Path, names: &HashMap<u128, Option<String>>) {
     for (w, n) in &words {
         println!("strandv    {n} x {w}");
     }
+    // v2.10: the root 0 tables of the strand dispatch sinks by family
+    // (smh_pose, smh_gen, smh_sim): sinks per table address, sinks without
+    // one; the sim sinks' slot 33 (the sim state they write) views.
+    let mut fam: BTreeMap<&str, (BTreeMap<u64, u32>, u32)> = BTreeMap::new();
+    let mut state: BTreeMap<(u64, u64, u32), u32> = BTreeMap::new();
+    for s in pack.data.sinks.iter().filter(|s| s.op == fp::op::DISPATCH) {
+        let Some(n) = compute_name(s.pipeline) else { continue };
+        let Some(f) = ["smh_pose", "smh_gen", "smh_sim"].into_iter().find(|f| n.starts_with(f)) else { continue };
+        let e = fam.entry(f).or_default();
+        match pack.data.refs_of(s.index).find(|r| r.kind == kind::TABLE && r.slot == 0 && reason::has_bytes(r.reason)) {
+            Some(r) => {
+                *e.0.entry(r.addr).or_default() += 1;
+                if f == "smh_sim"
+                    && let Some(v) = pack.blob(r.hash).and_then(|b| fp::decode_slots(&b).into_iter().find(|v| v.slot == 33))
+                {
+                    *state.entry((v.addr, v.bytes, u32::from(v.layout == view::UNORDERED))).or_default() += 1;
+                }
+            }
+            None => e.1 += 1,
+        }
+    }
+    for (f, (at, none)) in &fam {
+        let t: Vec<String> = at.iter().map(|(a, n)| format!("{a:#x} x{n}")).collect();
+        println!("strandt    {f} sinks' root 0 tables: {}; without a table: {none}", if t.is_empty() { "none".into() } else { t.join(", ") });
+    }
+    for ((a, n, uav), k) in &state {
+        println!("strandt    smh_sim slot 33 at {a:#x}, {n} B, {} x{k}", if *uav == 1 { "unordered" } else { "not unordered" });
+    }
     // The hair input sinks' root 0 slot 29 (width profile) texture.
     let mut seen = std::collections::HashSet::new();
     for r in refs.iter().filter(|r| r.kind == kind::TABLE && r.slot == 0 && reason::has_bytes(r.reason)) {

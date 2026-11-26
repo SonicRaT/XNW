@@ -228,7 +228,9 @@ fn kept_read(frame: u64, addr: u64, len: u64) -> Option<Arc<Vec<u8>>> {
 }
 
 fn src_view(v: &TapView) -> SrcView {
-    SrcView { kind: v.kind, addr: v.addr, bytes: v.bytes, format: v.format, width: v.width }
+    // A placed view's words: its resource description (14), then its view
+    // description, whose second word is the view's dimension.
+    SrcView { kind: v.kind, addr: v.addr, bytes: v.bytes, format: v.format, width: v.width, dim: bridged::title_dim(v.kind, &v.words) }
 }
 
 /// A draw at its list sink as the bridged rows' source.

@@ -21,6 +21,8 @@
 //!   Subrender threads onto processors 8-11, two physical cores). Every
 //!   distinct (thread, mask) is logged once with what was applied and the
 //!   result.
+//! - `SetThreadPriority`: as asked, or with `XNW_TITLE_PRIORITIES=lift`
+//!   idle and lowest raised to below normal (VIctory-7900XTX 0d065d3).
 //! - `GetLogicalProcessorInformation`: `XNW_CPUS=<n>` reports only the
 //!   first n logical processors (default: the host's, as before); `console`
 //!   is not offered, since 14 is more than this host has and masks naming
@@ -76,7 +78,45 @@ impl Drop for KeepError {
 
 /// The switches, read at start-up (`read_shim_switches`).
 pub(crate) fn read_switches() {
-    let _ = (affinity_mode(), cpus());
+    let _ = (affinity_mode(), cpus(), lift_priorities());
+}
+
+/// `XNW_TITLE_PRIORITIES=lift`: the title's idle and lowest threads run
+/// below normal; off (default): as the title sets them.
+fn lift_priorities() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let on = std::env::var("XNW_TITLE_PRIORITIES").is_ok_and(|v| v.trim() == "lift");
+        if on {
+            xnw_core::info!("threads: the title's idle and lowest threads run below normal (XNW_TITLE_PRIORITIES=lift)");
+        }
+        on
+    });
+    *ON
+}
+
+/// The priority a title thread gets for `asked`: with
+/// `XNW_TITLE_PRIORITIES=lift`, idle (-15) up to lowest (-2) become below
+/// normal (-1); everything else as asked. The title puts several threads at
+/// idle (the record: 16 of 71 calls negative), the streaming pager's among
+/// them; on the console they have what the rest leaves of their cores, here
+/// they compete with our own workers (DirectStorage's 12, pipelines) and other
+/// programs, and loading waits on them (VIctory-7900XTX 0d065d3, run
+/// stream-3: loads seen done 1.1 s late on average, 4.8 s at worst).
+pub(crate) fn title_priority(asked: i32, lift: bool) -> i32 {
+    const IDLE: i32 = -15;
+    const LOWEST: i32 = -2;
+    const BELOW_NORMAL: i32 = -1;
+    match asked {
+        IDLE..=LOWEST if lift => BELOW_NORMAL,
+        other => other,
+    }
+}
+
+/// After VIctory-7900XTX `crates/victory-hle/src/modules/kernel.rs`
+/// `SetThreadPriority` at 0d065d3 (GPL-3.0-or-later); off by default here.
+pub extern "system" fn SetThreadPriority(thread: H, priority: i32) -> i32 {
+    let priority = title_priority(priority, lift_priorities());
+    host!("kernel32.dll", "SetThreadPriority": extern "system" fn(H, i32) -> i32)(thread, priority)
 }
 
 pub extern "system" fn CreateThread(attributes: H, stack: usize, start: usize, param: H, flags: u32, id: *mut u32) -> H {
@@ -244,6 +284,15 @@ pub extern "system" fn GetLogicalProcessorInformation(info: *mut u8, len: *mut u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// With the switch, idle and lowest become below normal; the others,
+    /// and everything without it, as asked.
+    #[test]
+    fn idle_title_threads_are_lifted_only_when_asked() {
+        let given = |lift| [-15, -2, -1, 0, 1, 2, 15].map(|p| title_priority(p, lift));
+        assert_eq!(given(true), [-1, -1, -1, 0, 1, 2, 15]);
+        assert_eq!(given(false), [-15, -2, -1, 0, 1, 2, 15]);
+    }
 
     /// Each shim, called as the title calls it, returns what
     /// the host returns and leaves the thread's last error as the host left
