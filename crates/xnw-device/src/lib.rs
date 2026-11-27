@@ -276,6 +276,10 @@ impl Host {
                     if let Ok(dred) = factory.GetConfigurationInterface::<ID3D12DeviceRemovedExtendedDataSettings>(&CLSID_D3D12DeviceRemovedExtendedData) {
                         dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
                         dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                        // CLOTH3: marker strings kept per breadcrumb (the bridged rows name their programs).
+                        if let Ok(d1) = windows::core::Interface::cast::<ID3D12DeviceRemovedExtendedDataSettings1>(&dred) {
+                            d1.SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                        }
                         xnw_core::info!("host GPU: device-removal breadcrumbs on (XNW_GPU_DEBUG=dred)");
                     }
                 }

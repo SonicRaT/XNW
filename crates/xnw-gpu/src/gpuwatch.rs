@@ -41,6 +41,14 @@ static WATCH: OnceLock<(Instant, Duration)> = OnceLock::new();
 static SENT: AtomicU64 = AtomicU64::new(0);
 static LABEL: Mutex<&'static str> = Mutex::new("");
 static LOG: Mutex<Vec<Sub>> = Mutex::new(Vec::new());
+/// The fence and value of the submission in flight, when its
+/// submitter does not wait for it at once ([`fence`]), with its `SENT`.
+static FENCE: Mutex<Option<(Fence, u64, u64)>> = Mutex::new(None);
+
+/// A fence the watchdog thread reads (D3D12 objects are free-threaded).
+struct Fence(windows::Win32::Graphics::Direct3D12::ID3D12Fence);
+// SAFETY: ID3D12Fence is free-threaded; only GetCompletedValue is called on it.
+unsafe impl Send for Fence {}
 
 /// Starts the exit: a submission whose fence wait passes `budget` ends the
 /// process with code 3. Once per process; later calls keep the first budget.
@@ -53,6 +61,17 @@ pub fn start(budget: Duration) {
         loop {
             std::thread::sleep(Duration::from_millis(10));
             let s = SENT.load(Ordering::Acquire);
+            // A submission not waited for at once ([`fence`]) ends at its fence.
+            if s != 0
+                && let Ok(g) = FENCE.lock()
+                && let Some((f, v, at)) = g.as_ref()
+                && *at == s
+                // SAFETY: a plain query on a live fence.
+                && unsafe { f.0.GetCompletedValue() } >= *v
+            {
+                let _ = SENT.compare_exchange(s, 0, Ordering::AcqRel, Ordering::Acquire);
+                continue;
+            }
             if s != 0 && t0.elapsed().as_micros() as u64 + 1 > s + budget.as_micros() as u64 {
                 let label = LABEL.lock().map_or("?", |g| *g);
                 eprintln!("xnw: gpu watchdog: one submission ({label}) has run over {} ms on the GPU (its fence not reached): exiting before the driver's 2 s timeout", budget.as_millis());
@@ -141,6 +160,20 @@ pub fn begin(label: &'static str) -> Instant {
         SENT.store(now.duration_since(*t0).as_micros() as u64 + 1, Ordering::Release);
     }
     now
+}
+
+/// The submission just sent ([`begin`]) signals `value` on `fence`
+/// and its submitter waits for it later (the world pass's `XNW_PASS_LAG`:
+/// at the next frame's start, after the title's own frame, which at a
+/// load can take over the budget alone: a test run exited at world entry). The
+/// watchdog takes it as ended once the fence has reached `value`, so only
+/// the card's own time counts against the budget.
+pub fn fence(fence: &windows::Win32::Graphics::Direct3D12::ID3D12Fence, value: u64) {
+    if WATCH.get().is_some()
+        && let Ok(mut g) = FENCE.lock()
+    {
+        *g = Some((Fence(fence.clone()), value, SENT.load(Ordering::Acquire)));
+    }
 }
 
 /// Its fence was reached: logs the wait (and the timestamps' ms if any).
@@ -248,6 +281,47 @@ mod tests {
         };
         assert_eq!(code, Some(3));
         assert!(t.elapsed() >= Duration::from_millis(300), "not before the grace: {:?}", t.elapsed());
+    }
+
+    /// A submission sent and waited for later ([`fence`]) does not end
+    /// the process once its fence is reached (the child: budget 100 ms, a
+    /// fence the CPU signals, 400 ms with no wait); one whose fence is not
+    /// reached does (exit 3). The child is this test with `XNW_GPUWATCH_FENCE`
+    /// set to the value it waits on (1: reached, 2: not); no device: skipped.
+    #[test]
+    fn a_reached_fence_ends_the_watch() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Direct3D12::{D3D12_FENCE_FLAG_NONE, D3D12CreateDevice, ID3D12Device, ID3D12Fence};
+        if let Some(v) = std::env::var_os("XNW_GPUWATCH_FENCE") {
+            let mut dev: Option<ID3D12Device> = None;
+            // SAFETY: plain creation calls; the objects live to the exit.
+            let f: ID3D12Fence = unsafe {
+                if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                    std::process::exit(0);
+                }
+                let Some(dev) = dev else { std::process::exit(0) };
+                let f: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+                f.Signal(1).expect("signal");
+                f
+            };
+            start(Duration::from_millis(100));
+            let _t = begin("t");
+            fence(&f, v.to_str().and_then(|x| x.parse().ok()).unwrap_or(2));
+            std::thread::sleep(Duration::from_millis(400));
+            std::process::exit(0);
+        }
+        let run = |v: &str| {
+            let st = std::process::Command::new(std::env::current_exe().expect("exe"))
+                .args(["gpuwatch::tests::a_reached_fence_ends_the_watch", "--exact", "--test-threads=1"])
+                .env("XNW_GPUWATCH_FENCE", v)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("child");
+            st.code()
+        };
+        assert_eq!(run("1"), Some(0), "the fence was reached: no exit");
+        assert_eq!(run("2"), Some(3), "the fence was not reached: the watchdog's exit");
     }
 
     #[test]

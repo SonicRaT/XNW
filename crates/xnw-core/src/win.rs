@@ -696,3 +696,22 @@ unsafe extern "system" {
     pub fn BCryptFinishHash(hash: HANDLE, output: *mut u8, output_len: u32, flags: u32) -> i32;
     pub fn BCryptDestroyHash(hash: HANDLE) -> i32;
 }
+
+/// PERF5: whether our helper threads run below normal priority
+/// (`XNW_HELPER_PRIO=normal`: at normal, as before; read once).
+pub fn helper_below() -> bool {
+    static NORMAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    !*NORMAL.get_or_init(|| matches!(std::env::var("XNW_HELPER_PRIO").as_deref().map(str::trim), Ok("normal" | "off" | "0")))
+}
+
+/// PERF5: the calling thread, one of our helpers (bridged prep and its
+/// copy threads, the list recorder, the texture and geometry readers),
+/// below the title's workers (`THREAD_PRIORITY_BELOW_NORMAL`) so that
+/// it takes no core a title worker could run on; `XNW_HELPER_PRIO=normal`
+/// leaves it at normal. The title's threads and our pass thread are not changed.
+pub fn helper_thread() {
+    if helper_below() {
+        // SAFETY: a plain call on the calling thread's pseudo-handle.
+        unsafe { SetThreadPriority(GetCurrentThread(), -1) };
+    }
+}

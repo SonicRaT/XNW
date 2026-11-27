@@ -321,7 +321,11 @@ struct Views {
     kinds: Vec<u32>,
 }
 
-static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
+/// PERF4: a reader-writer lock: the list sinks of the title's five
+/// Subrender workers look views up 20-30 times a bridged row (`view`), the
+/// title's descriptor writes (`record`) and releases (`forget`) change them;
+/// the lookups no longer wait for each other (a Mutex serialised them).
+static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     list: Vec::new(),
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
@@ -356,7 +360,7 @@ fn record(handle: u64, view: View) {
         Some(raw) => (kind | IN_PLACE, raw),
         None => (kind, [u32::MAX; 3]),
     };
-    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
     let i = match views.index.get(&view) {
         Some(&i) => i,
         None => {
@@ -490,7 +494,7 @@ fn sampler_index(views: &mut Views, i: u32) -> u32 {
 
 /// The title released `resource`: the views naming it go stale.
 pub fn forget(resource: usize) {
-    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
@@ -557,22 +561,32 @@ pub(crate) fn released_since(from: u64) -> Option<(Option<Vec<(u32, u32, u32)>>,
 
 /// Each view entry's generation and record kind word, one look.
 pub(crate) fn generations() -> Vec<(u32, u32)> {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
     views.list.iter().enumerate().map(|(i, (_, g))| (*g, views.kinds.get(i).copied().unwrap_or(0))).collect()
 }
 
 /// `XNW_GPU_CHECK`: the view entry `i` holds now, its generation and
 /// kind word.
 pub fn entry(i: u32) -> Option<(View, u32, u32)> {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
     let (view, g) = views.list.get(i as usize)?;
     Some((view.clone(), *g, views.kinds.get(i as usize).copied().unwrap_or(0)))
+}
+
+/// Of `ids` (view entry, generation), whether each is still its entry's
+/// generation, into `out` in order: one look at the views for all, as
+/// [`stale_views`] (the texture table's per-frame check, which took
+/// the views' lock and cloned the view per slot through [`entry`]).
+pub fn current(ids: &[(u32, u32)], out: &mut Vec<bool>) {
+    out.clear();
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+    out.extend(ids.iter().map(|(i, generation)| views.list.get(*i as usize).is_some_and(|(_, g)| g == generation)));
 }
 
 /// Of `entries` (slot, (view entry, generation)), those whose view went
 /// stale: one look at the views for all.
 fn stale_views(entries: &[(u32, (u32, u32))]) -> Vec<(u32, (u32, u32))> {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
     entries
         .iter()
         .filter(|(_, (i, generation))| views.list.get(*i as usize).is_none_or(|(_, current)| current != generation))
@@ -582,7 +596,7 @@ fn stale_views(entries: &[(u32, (u32, u32))]) -> Vec<(u32, (u32, u32))> {
 
 /// The view of entry `i` if `generation` is still its own.
 fn view_at(i: u32, generation: u32) -> Option<View> {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
     let (view, current) = views.list.get(i as usize)?;
     (*current == generation).then(|| view.clone())
 }
@@ -594,7 +608,7 @@ pub(crate) fn view(handle: u64) -> Option<View> {
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
     let (i, generation) = unsafe { record_id(handle) }?;
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
     let (view, current) = views.list.get(i as usize)?;
     (*current == generation).then(|| view.clone())
 }

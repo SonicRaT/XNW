@@ -124,8 +124,11 @@ pub struct TexOptions {
     /// Uploads per frame at most, and their bytes (the first always goes).
     pub uploads: u32,
     pub upload_bytes: u64,
-    /// Reads (pack, pages, title memory) on the pass's reader thread,
-    /// never in the frame (screen mode; `texasync=off`). Off: in the frame.
+    /// Reads (pack, pages, title memory; a provider's texels) on a reader
+    /// thread, never in the frame: a slot whose texels are not read yet is
+    /// flat (`waiting`) and takes its texture on the frame after the read
+    /// lands; no time cap. The screen pass's default; `texasync=off`: in the
+    /// frame, under `frame_ms`.
     pub async_reads: bool,
     /// New reads in a frame stop after this many ms of its table (the
     /// first always goes; 0: no time cap). `texms=<ms>`; a fast camera cut
@@ -241,6 +244,24 @@ struct Known {
     /// The frame a partly streamed copy (pending, texels shown, no
     /// upload) was last looked at: looked at again [`recheck_frames`] later.
     partial_at: Option<u64>,
+    /// Its view is a placed one (else a shader view): the resolve's kind
+    /// counters when [`batch_on`] skips [`classify`].
+    placed: bool,
+    /// A read of its copy is with the reader thread (`async_reads`): looked
+    /// up again every frame until its upload has been handed over.
+    flying: bool,
+}
+
+/// Whether a known slot is answered from what the table knows, with no
+/// lookup in the layer (pure; the hand-over's rule). Not while a read of
+/// its copy is `flying`: the copy's own state changes when the reader has
+/// READ, before the pass has the texels. `pending`: the copy still waits for
+/// pages; `partial_fresh`: the slot shows a partly streamed copy
+/// (`partial_at`) looked at too recently to look again. A partial view whose
+/// copy became complete meanwhile (another slot's or resource's read) is
+/// looked up once more: its view starts at the mip that was whole then.
+pub(crate) fn known_stands(ready: bool, flying: bool, pending: bool, partial: bool, partial_fresh: bool) -> bool {
+    ready && !flying && if pending { partial && partial_fresh } else { !partial }
 }
 
 /// Frames between looks at a partly streamed copy that showed no new
@@ -250,6 +271,69 @@ struct Known {
 fn recheck_frames() -> u64 {
     static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *N.get_or_init(|| std::env::var("XNW_TEX_RECHECK").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4).max(1))
+}
+
+fn switch_on(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| matches!(v.trim(), "on" | "1"))
+}
+
+/// `XNW_TEX_BATCH=on` (default off): the live table reads every
+/// distinct slot's record and checks its generation once a frame for all
+/// slots (one look at the traps, guarded copies in place, one look at the
+/// views: [`host::copy_records`], [`descriptor::current`]); a known slot
+/// whose record is unchanged skips [`classify`], which took the pair, guard
+/// and views locks and a `ReadProcessMemory` per slot (6.6 us a `flat
+/// known` resolve in run-br12e).
+pub fn batch_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| switch_on("XNW_TEX_BATCH"))
+}
+
+/// `XNW_TEX_ARRIVALS=on` (default off): a partly streamed copy is
+/// looked at again when pages of its texture arrived
+/// ([`xnw_formats::origin::arrived_since`], once a frame), else by a slow
+/// sweep: each slot once every 4 x [`recheck_frames`] frames, slots spread
+/// over the frames by address. Off: every `XNW_TEX_RECHECK` frames (about
+/// 4,000 looks a second in the street, nearly all `partial no new pages`).
+/// A copy without a texture origin (title-memory uploads) and the title's
+/// own writes to texture memory wait for the sweep.
+pub fn arrivals_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| switch_on("XNW_TEX_ARRIVALS"))
+}
+
+/// The arrivals a live table saw this frame ([`arrivals_on`]).
+#[derive(Default)]
+struct Arrivals {
+    /// The registry's arrival count last read (None: never).
+    seen: Option<u64>,
+    /// This frame: textures with new pages, and "look at every one" (the
+    /// first frame, or arrivals cut before they were read).
+    textures: std::collections::HashSet<(u32, u32)>,
+    all: bool,
+    buf: Vec<(u32, u32)>,
+}
+
+impl Arrivals {
+    /// Reads the arrivals since the last frame's.
+    fn take(&mut self) {
+        let (upto, lost) = xnw_formats::origin::arrived_since(self.seen, &mut self.buf);
+        self.seen = Some(upto);
+        self.all = lost;
+        self.textures.clear();
+        self.textures.extend(self.buf.iter().copied());
+    }
+}
+
+/// Whether a partly streamed copy last looked at in frame `at` is looked
+/// at again in `frame`: `XNW_TEX_RECHECK` frames later, or with arrivals
+/// ([`arrivals_on`]) when pages of its texture arrived or the slot's turn
+/// of the sweep came.
+fn partial_due(slot: u64, at: u64, frame: u64, origin: Option<(u32, u32)>, arrivals: Option<(&std::collections::HashSet<(u32, u32)>, bool)>) -> bool {
+    match arrivals {
+        None => frame >= at + recheck_frames(),
+        Some((arrived, all)) => all || origin.is_some_and(|o| arrived.contains(&o)) || (slot >> 5).wrapping_add(frame).is_multiple_of(4 * recheck_frames()),
+    }
 }
 
 /// Why a drawn draw is flat (the `TEX-REASONS:` names, in order).
@@ -525,7 +609,7 @@ pub struct TexTable {
     /// The provider, its content keys, and its textures by key (texture,
     /// upload until copied, format, frame last used); this provider's
     /// slot -> key.
-    provider: Option<Provider>,
+    provider: Option<SharedProvider>,
     keys: Option<Keys>,
     provided: HashMap<u64, ProvidedTex>,
     slot_key: HashMap<u64, Option<u64>>,
@@ -537,6 +621,111 @@ pub struct TexTable {
     /// This frame's entries: their texture and view (the title's own
     /// programs in our pass make their own views of them, `bridged`).
     views: HashMap<u32, (ID3D12Resource, D3D12_SHADER_RESOURCE_VIEW_DESC)>,
+    /// [`batch_on`]: this frame's slots whose record names a current view
+    /// entry, and that entry and generation.
+    current: HashMap<u64, (u32, u32)>,
+    /// [`arrivals_on`]: this frame's texture arrivals.
+    arrivals: Arrivals,
+    /// `async_reads` in [`TexMode::Provided`]: the provider's reads on the
+    /// table's own thread.
+    reads: ProvidedReads,
+    /// The provided slots asked this frame are read before it is drawn
+    /// (the reader is waited for; in the frame without `async_reads`, with
+    /// no time cap): a replay's last frame, so that the two paths' pictures
+    /// of it can be compared with every read landed.
+    pub settle: bool,
+}
+
+/// A provided texture made off the frame: the texture, its filled upload
+/// buffer, the footprints to copy, its view, "not plain 2D", its bytes.
+type Made = (ID3D12Resource, ID3D12Resource, Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>, D3D12_SHADER_RESOURCE_VIEW_DESC, bool, u64);
+
+/// The provider shared with the table's reader thread.
+type SharedProvider = Arc<std::sync::Mutex<Provider>>;
+
+/// A read for the reader thread: provider epoch, key, slot, the provider.
+struct ReadAsk {
+    epoch: u64,
+    key: u64,
+    slot: u64,
+    provider: SharedProvider,
+    device: ID3D12Device,
+}
+// SAFETY: D3D12 objects are free-threaded; the provider is `Send` behind its lock.
+unsafe impl Send for ReadAsk {}
+
+/// A read the thread finished: epoch, key, the texture (None: no texels).
+struct ReadLanded(u64, u64, Option<Made>);
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for ReadLanded {}
+
+/// The provided reads off the frame (`async_reads`): one thread, made
+/// on the first ask, gone with the table (its channel closes).
+#[derive(Default)]
+struct ProvidedReads {
+    to: Option<std::sync::mpsc::Sender<ReadAsk>>,
+    from: Option<std::sync::mpsc::Receiver<ReadLanded>>,
+    /// Keys asked and not landed (of this epoch).
+    flying: std::collections::HashSet<u64>,
+    /// Bumped when the provider's textures start over (results of an
+    /// older epoch are dropped).
+    epoch: u64,
+}
+
+impl ProvidedReads {
+    /// Queues the read of `key` (once); false: no thread.
+    fn ask(&mut self, key: u64, slot: u64, provider: &SharedProvider, device: &ID3D12Device) -> bool {
+        if self.flying.contains(&key) {
+            return true;
+        }
+        if self.to.is_none() {
+            let (to, asks) = std::sync::mpsc::channel::<ReadAsk>();
+            let (landed, from) = std::sync::mpsc::channel::<ReadLanded>();
+            let spawned = std::thread::Builder::new().name("xnw provided texture reads".into()).spawn(move || {
+                xnw_core::win::helper_thread();
+                for a in asks {
+                    let p = (a.provider.lock().unwrap_or_else(|e| e.into_inner()))(a.slot);
+                    let made = p.and_then(|p| make_provided(&a.device, &p).map(|(t, up, f, srv)| (t, up, f, srv, p.dim != TEX_2D, p.rows.len() as u64)));
+                    if landed.send(ReadLanded(a.epoch, a.key, made)).is_err() {
+                        break;
+                    }
+                }
+            });
+            if spawned.is_err() {
+                return false;
+            }
+            (self.to, self.from) = (Some(to), Some(from));
+        }
+        let sent = self.to.as_ref().is_some_and(|t| t.send(ReadAsk { epoch: self.epoch, key, slot, provider: provider.clone(), device: device.clone() }).is_ok());
+        if sent {
+            self.flying.insert(key);
+        }
+        sent
+    }
+
+    /// The reads landed since the last call (`wait`: blocks for one when
+    /// any is flying); those of an older epoch are dropped.
+    fn take(&mut self, wait: bool) -> Vec<(u64, Option<Made>)> {
+        let mut out = Vec::new();
+        let Some(from) = self.from.as_ref() else { return out };
+        let mut wait = wait && !self.flying.is_empty();
+        loop {
+            let r = if wait { from.recv().ok() } else { from.try_recv().ok() };
+            let Some(ReadLanded(epoch, key, made)) = r else { break };
+            if epoch == self.epoch {
+                self.flying.remove(&key);
+                out.push((key, made));
+                wait = false;
+            }
+        }
+        out
+    }
+
+    /// The provider's textures start over: what is flying is not waited for.
+    fn restart(&mut self) {
+        self.epoch += 1;
+        self.flying.clear();
+    }
 }
 
 /// A provided texture by its key: the upload is kept until its copy ran.
@@ -580,6 +769,72 @@ impl TexTable {
             stats: TexStats::default(),
             last_log: std::time::Instant::now(),
             views: HashMap::new(),
+            current: HashMap::new(),
+            arrivals: Arrivals::default(),
+            reads: ProvidedReads::default(),
+            settle: false,
+        }
+    }
+
+    /// [`batch_on`]: reads the records of `slots` (repeats allowed) and
+    /// checks their generations, one look at the traps and one at the views
+    /// for all, into [`Self::current`].
+    fn read_records(&mut self, slots: &mut dyn Iterator<Item = u64>) {
+        self.current.clear();
+        let mut list: Vec<u64> = slots.filter(|s| (0x1_0000..0x8000_0000_0000).contains(s)).collect();
+        list.sort_unstable();
+        list.dedup();
+        self.current.reserve(list.len());
+        let mut records = Vec::with_capacity(list.len());
+        host::copy_records(&list, &mut records);
+        let (mut at, mut ids) = (Vec::with_capacity(list.len()), Vec::with_capacity(list.len()));
+        for (&slot, (rec, ok)) in list.iter().zip(&records) {
+            // SAFETY: our own 32-byte copy of the record.
+            if let Some(id) = ok.then(|| unsafe { descriptor::record_id(rec.as_ptr() as u64) }).flatten() {
+                at.push(slot);
+                ids.push(id);
+            }
+        }
+        let mut now = Vec::with_capacity(ids.len());
+        descriptor::current(&ids, &mut now);
+        self.current.extend(at.into_iter().zip(ids).zip(now).filter(|(_, c)| *c).map(|(s, _)| s));
+    }
+
+    /// The slot's view as [`classify`] gives it, counted; `Err`: flat, why
+    /// (its known state goes).
+    #[allow(clippy::type_complexity)]
+    fn classified(&mut self, slot: u64) -> Result<((u32, u32), View, Option<[u32; 10]>), Flat> {
+        match classify(slot) {
+            Slot::Placed(id, view) => {
+                self.stats.placed += 1;
+                let words = match &view {
+                    View::Placed(_, _, d) => d[..10].try_into().ok(),
+                    _ => None,
+                };
+                Ok((id, view, words))
+            }
+            Slot::Shader(id, r, d) => {
+                self.stats.shader += 1;
+                Ok((id, View::Shader(r, d), d))
+            }
+            k => {
+                let why = match k {
+                    Slot::Stale => {
+                        self.stats.stale += 1;
+                        Flat::Stale
+                    }
+                    Slot::NoRecord => {
+                        self.stats.no_record += 1;
+                        Flat::Stale
+                    }
+                    _ => {
+                        self.stats.other += 1;
+                        Flat::Not2d
+                    }
+                };
+                self.known.remove(&slot);
+                Err(why)
+            }
         }
     }
 
@@ -666,7 +921,22 @@ impl TexTable {
             self.entries = fresh;
         }
         self.entries.begin(self.frame_no, !stable_on() || self.opts.mode == TexMode::Off);
-        let mut budget = Budget::timed(self.opts.frame_ms);
+        // The frame's records in one batch, and the arrivals since the last frame.
+        let live = self.opts.mode == TexMode::Live;
+        let (lv, sv): (Vec<u64>, Vec<u64>) = if live && batch_on() { (layers.collect(), slots.collect()) } else { (Vec::new(), Vec::new()) };
+        let (mut li, mut si) = (lv.iter().copied(), sv.iter().copied());
+        let (layers, slots): (&mut dyn Iterator<Item = u64>, &mut dyn Iterator<Item = u64>) = if live && batch_on() {
+            self.read_records(&mut lv.iter().chain(&sv).copied());
+            (&mut li, &mut si)
+        } else {
+            self.current.clear();
+            (layers, slots)
+        };
+        if live && arrivals_on() {
+            self.arrivals.take();
+        }
+        // Reads off the frame cost the frame no time: no time cap.
+        let mut budget = Budget::timed(if self.opts.async_reads || self.settle { 0.0 } else { self.opts.frame_ms });
         let mut waiting = 0u64;
         let mut demand = 0u64;
         let mut placed = 0u64;
@@ -674,6 +944,20 @@ impl TexTable {
         let mut checker_copies: Vec<(ID3D12Resource, ID3D12Resource)> = Vec::new();
         let mut provided_copies: Vec<(ID3D12Resource, ID3D12Resource, Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>)> = Vec::new();
         let mut made = HashMap::new();
+        // The hand-over (`async_reads`): every read the reader finished is
+        // recorded on this frame's list, asked for this frame or not; the
+        // slots that waited for them resolve below as ready.
+        if live && self.opts.async_reads {
+            for (copy, up, source) in texture::pass_finished() {
+                self.stats.uploads += 1;
+                self.stats.sources[source.min(4)] += 1;
+                self.uploads.push((copy, up));
+            }
+        }
+        if self.opts.mode == TexMode::Provided && self.opts.async_reads {
+            let landed = self.reads.take(false);
+            self.land(landed, &mut provided_copies);
+        }
         if self.opts.mode != TexMode::Off {
             let base = self.base;
             let mut get = |t: &mut Self, slot: u64| {
@@ -684,7 +968,11 @@ impl TexTable {
                     TexMode::Checker if !t.checkers.contains_key(&slot) && !checker_copies.is_empty() && budget.late() => Err(Flat::Waiting),
                     TexMode::Checker => t.checker(device, slot, &mut checker_copies).map(|(r, v, s)| ((r, v), s)).ok_or(Flat::Other),
                     TexMode::Provided if provided_new && !provided_copies.is_empty() && budget.late() => Err(Flat::Waiting),
-                    TexMode::Provided => t.provide(device, slot, &mut provided_copies).map(|(r, v, s)| ((r, v), s)),
+                    TexMode::Provided => {
+                        let r = t.provide(device, slot, &mut provided_copies).map(|(r, v, s)| ((r, v), s));
+                        waiting += u64::from(r.as_ref().is_err_and(|w| *w == Flat::Waiting));
+                        r
+                    }
                     _ => {
                         let (t0, n) = (std::time::Instant::now(), t.stats.paths);
                         let r = t.resolve(slot, &mut budget, &mut waiting, &mut copies).map(|(r, v, s)| ((r, v), s));
@@ -847,38 +1135,30 @@ impl TexTable {
     /// new, re-generated or pending), the SRV and sRGB flag; `Err` = flat, why.
     fn resolve(&mut self, slot: u64, budget: &mut Budget, waiting: &mut u64, copies: &mut Vec<Arc<resource::HostTexture>>) -> Result<(ID3D12Resource, D3D12_SHADER_RESOURCE_VIEW_DESC, bool), Flat> {
         let frame = self.frame_no;
-        let (id, view, words) = match classify(slot) {
-            Slot::Placed(id, view) => {
-                self.stats.placed += 1;
-                let words = match &view {
-                    View::Placed(_, _, d) => d[..10].try_into().ok(),
-                    _ => None,
-                };
-                (id, view, words)
-            }
-            Slot::Shader(id, r, d) => {
-                self.stats.shader += 1;
-                (id, View::Shader(r, d), d)
-            }
-            k => {
-                let why = match k {
-                    Slot::Stale => {
-                        self.stats.stale += 1;
-                        Flat::Stale
-                    }
-                    Slot::NoRecord => {
-                        self.stats.no_record += 1;
-                        Flat::Stale
-                    }
-                    _ => {
-                        self.stats.other += 1;
-                        Flat::Not2d
-                    }
-                };
-                self.known.remove(&slot);
-                return Err(why);
+        // `XNW_TEX_BATCH`: a known slot whose record names its entry still
+        // (read for all slots at the frame's start) skips `classify`.
+        let fast = self.current.get(&slot).copied().filter(|id| self.known.get(&slot).is_some_and(|k| k.id == *id));
+        let mut got = None;
+        let id = match fast {
+            Some(id) => id,
+            None => {
+                let g = self.classified(slot)?;
+                let id = g.0;
+                got = Some(g);
+                id
             }
         };
+        // The kind counters `classified` keeps, for a fast resolve that ends here.
+        let kind = |stats: &mut TexStats, placed: bool| {
+            if fast.is_some() {
+                if placed {
+                    stats.placed += 1;
+                } else {
+                    stats.shader += 1;
+                }
+            }
+        };
+        let arrivals = arrivals_on().then_some((&self.arrivals.textures, self.arrivals.all));
         // Known, same generation, contents complete: no refresh (no hashing
         // of title memory every frame).: flat for good, or partly
         // streamed and looked at less than `recheck_frames` ago: as it was.
@@ -887,6 +1167,7 @@ impl TexTable {
         {
             if let Some(why) = k.flat {
                 k.used = frame;
+                kind(&mut self.stats, k.placed);
                 self.stats.paths[1] += 1;
                 if why == Flat::Not2d {
                     self.stats.not_2d += 1;
@@ -894,10 +1175,10 @@ impl TexTable {
                 return Err(why);
             }
             if let Some(copy) = &k.copy
-                && k.ready
-                && (!copy.pending.load(std::sync::atomic::Ordering::Relaxed) || k.partial_at.is_some_and(|at| frame < at + recheck_frames()))
+                && known_stands(k.ready, k.flying, copy.pending.load(std::sync::atomic::Ordering::Relaxed), k.partial_at.is_some(), k.partial_at.is_some_and(|at| !partial_due(slot, at, frame, copy.origin.get().map(|o| o.file_texture()), arrivals)))
             {
                 k.used = frame;
+                kind(&mut self.stats, k.placed);
                 self.stats.paths[if k.partial_at.is_some() { 2 } else { 0 }] += 1;
                 let (copy, srv, srgb, wide) = (copy.clone(), k.srv, k.srgb, k.wide);
                 let t = copy.texture.clone();
@@ -910,6 +1191,11 @@ impl TexTable {
                 return Ok((t, srv, srgb));
             }
         }
+        // A fast slot that is due: its view as `classify` gives it now.
+        let (id, view, words) = match got {
+            Some(g) => g,
+            None => self.classified(slot)?,
+        };
         // The frame's read time spent, a slot with no texels yet waits
         // without the layer's lookups (each would be refused by the budget).
         if budget.late() && !self.known.get(&slot).is_some_and(|k| k.id == id && k.ready) {
@@ -918,8 +1204,9 @@ impl TexTable {
             return Err(Flat::Waiting);
         }
         self.stats.paths[3] += 1;
+        let placed = matches!(view, View::Placed(..));
         let flat = |t: &mut Self, why: Flat| {
-            t.known.insert(slot, Known { id, copy: None, srv: D3D12_SHADER_RESOURCE_VIEW_DESC::default(), srgb: false, ready: false, ours: false, used: frame, wide: false, flat: Some(why), partial_at: None });
+            t.known.insert(slot, Known { id, copy: None, srv: D3D12_SHADER_RESOURCE_VIEW_DESC::default(), srgb: false, ready: false, ours: false, used: frame, wide: false, flat: Some(why), partial_at: None, placed, flying: false });
             Err(why)
         };
         // Ask our layer: the resource (held for the call) and its copy.
@@ -950,7 +1237,9 @@ impl TexTable {
         // SAFETY: a live resource.
         let d = unsafe { pt.copy.texture.GetDesc() };
         let srv = srv_desc(&d, words, pt.first_mip, pt.copy.dropped);
-        let uploading = pt.upload.is_some();
+        // `landed`: its upload was taken at the frame's start ([`texture::pass_finished`]).
+        let uploading = pt.upload.is_some() || pt.landed;
+        self.stats.again += u64::from(pt.landed && ours_before);
         if let Some(up) = pt.upload {
             // Recorded even when we cannot sample it: the copy now counts
             // as uploaded for everyone.
@@ -979,7 +1268,7 @@ impl TexTable {
         // `pt.ready` alone: an upload none of whose mips is whole is recorded, not sampled.
         let ready = pt.ready;
         let partial_at = (ready && !uploading && pt.copy.pending.load(std::sync::atomic::Ordering::Relaxed)).then_some(frame);
-        self.known.insert(slot, Known { id, copy: Some(pt.copy.clone()), srv, srgb, ready, ours: uploading || ours_before, used: frame, wide, flat: None, partial_at });
+        self.known.insert(slot, Known { id, copy: Some(pt.copy.clone()), srv, srgb, ready, ours: uploading || ours_before, used: frame, wide, flat: None, partial_at, placed, flying: pt.flying });
         if wide {
             if ready {
                 self.keep_wide(slot, pt.copy.texture.clone(), srv);
@@ -1032,8 +1321,9 @@ impl TexTable {
         if keys.is_none() || self.keys.is_none() {
             self.provided.clear();
             self.provided_none.clear();
+            self.reads.restart();
         }
-        self.provider = p;
+        self.provider = p.map(|p| Arc::new(std::sync::Mutex::new(p)));
         self.keys = keys;
         self.slot_key.clear();
     }
@@ -1049,25 +1339,60 @@ impl TexTable {
         self.key_of(slot).is_some_and(|k| self.provided.contains_key(&k))
     }
 
+    /// Reads the reader thread finished: each texture is kept by its key
+    /// and its copy queued on this frame's list (`uploads`); a key without
+    /// texels is remembered as such.
+    fn land(&mut self, landed: Vec<(u64, Option<Made>)>, uploads: &mut Vec<(ID3D12Resource, ID3D12Resource, Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>)>) {
+        for (key, made) in landed {
+            let Some((t, up, f, srv, shaped, bytes)) = made else {
+                self.provided_none.insert(key);
+                continue;
+            };
+            uploads.push((t.clone(), up.clone(), f));
+            self.provided.insert(key, ProvidedTex { texture: t, upload: Some(up), srv, shaped, used: self.frame_no });
+            self.stats.uploads += 1;
+            self.stats.upload_bytes += bytes;
+        }
+    }
+
     /// A provided slot's texture, made and its upload queued on first use
-    /// of its key. A cube, an array or a 3D texture goes to
+    /// of its key (`async_reads`: made by the reader thread, the slot
+    /// `Waiting` until it lands). A cube, an array or a 3D texture goes to
     /// [`Self::wide`] and is `Not2d` here.
     fn provide(&mut self, device: &ID3D12Device, slot: u64, uploads: &mut Vec<(ID3D12Resource, ID3D12Resource, Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>)>) -> Result<(ID3D12Resource, D3D12_SHADER_RESOURCE_VIEW_DESC, bool), Flat> {
         let key = self.key_of(slot).ok_or(Flat::Other)?;
         let frame = self.frame_no;
+        let mut fresh = false;
+        if self.opts.async_reads && !self.provided.contains_key(&key) && !self.provided_none.contains(&key) {
+            let provider = self.provider.clone().ok_or(Flat::Other)?;
+            if self.reads.ask(key, slot, &provider, device) {
+                if !self.settle {
+                    return Err(Flat::Waiting);
+                }
+                while self.reads.flying.contains(&key) {
+                    let landed = self.reads.take(true);
+                    if landed.is_empty() {
+                        break; // the thread is gone
+                    }
+                    self.land(landed, uploads);
+                }
+                fresh = true;
+            }
+        }
         let (texture, srv, shaped) = if let Some(p) = self.provided.get_mut(&key) {
             // The upload buffer is kept one frame past its copy (it ran: the last frame's fence).
             if p.used != frame {
                 p.upload = None;
             }
             p.used = frame;
-            self.stats.provided_kept += 1;
+            self.stats.provided_kept += u64::from(!fresh);
             (p.texture.clone(), p.srv, p.shaped)
         } else {
-            if self.keys.is_some() && self.provided_none.contains(&key) {
+            if (self.keys.is_some() || self.opts.async_reads) && self.provided_none.contains(&key) {
                 return Err(Flat::Other);
             }
-            let Some(p) = self.provider.as_mut().ok_or(Flat::Other)?(slot) else {
+            let provider = self.provider.clone().ok_or(Flat::Other)?;
+            let Some(p) = (provider.lock().unwrap_or_else(|e| e.into_inner()))(slot) else {
                 self.provided_none.insert(key);
                 return Err(Flat::Other);
             };
@@ -1141,10 +1466,32 @@ pub(crate) fn null_table(device: &ID3D12Device, cpu: &dyn Fn(u32) -> D3D12_CPU_D
     }
 }
 
+/// POL4: the title view's component mapping (its words[2], the D3D12 view
+/// description's `Shader4ComponentMapping`) when it is a valid one (the
+/// always-set bit 12, nothing above it), else the default. The title's
+/// programs read a texture through its view's swizzle (a one- or
+/// two-channel mask read as r and b, a greyscale read as rrr); our layer's
+/// own view of it keeps it (xnw-gpu descriptor/host.rs `srv_desc` takes the
+/// title's ten words whole). `XNW_TEX_MAPPING=off`: the default mapping,
+/// the rule before.
+fn view_mapping(words: Option<[u32; 10]>) -> u32 {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| !matches!(std::env::var("XNW_TEX_MAPPING").as_deref().map(str::trim), Ok("off" | "0")));
+    mapping_of(words, on)
+}
+
+fn mapping_of(words: Option<[u32; 10]>, on: bool) -> u32 {
+    match words.map(|w| w[2]) {
+        Some(m) if on && m & 0x1000 != 0 && m >> 13 == 0 => m,
+        _ => D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+    }
+}
+
 /// Our SRV of a host copy: 2D, one slice, one sample; the view's format
 /// when the copy is typeless (else the copy's own), mips from the finest
 /// with contents (and the title's MostDetailedMip, moved by the mips the
-/// copy dropped). `None` for anything but a plain 2D texture.
+/// copy dropped), the view's component mapping ([`view_mapping`]). `None`
+/// for anything but a plain 2D texture.
 fn srv_desc(d: &D3D12_RESOURCE_DESC, words: Option<[u32; 10]>, first_mip: u32, dropped: u32) -> Option<(D3D12_SHADER_RESOURCE_VIEW_DESC, bool)> {
     const TEXTURE2D_VIEW: u32 = 4;
     if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.DepthOrArraySize != 1 || d.SampleDesc.Count > 1 || d.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) {
@@ -1167,7 +1514,7 @@ fn srv_desc(d: &D3D12_RESOURCE_DESC, words: Option<[u32; 10]>, first_mip: u32, d
         D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT(format as i32),
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
-            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Shader4ComponentMapping: view_mapping(words),
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: most, MipLevels: mips - most, PlaneSlice: 0, ResourceMinLODClamp: 0.0 } },
         },
         is_srgb(format),
@@ -1203,7 +1550,7 @@ fn wide_srv(d: &D3D12_RESOURCE_DESC, words: Option<[u32; 10]>, first_mip: u32, d
     let mips = u32::from(d.MipLevels).max(1);
     let most = first_mip.max(words.map_or(0, |w| w[4]).saturating_sub(dropped)).min(mips - 1);
     let slices = u32::from(d.DepthOrArraySize).max(1);
-    let mut v = D3D12_SHADER_RESOURCE_VIEW_DESC { Format: DXGI_FORMAT(format as i32), Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, ..Default::default() };
+    let mut v = D3D12_SHADER_RESOURCE_VIEW_DESC { Format: DXGI_FORMAT(format as i32), Shader4ComponentMapping: view_mapping(words), ..Default::default() };
     match (kind, d.Dimension) {
         (ARRAY, D3D12_RESOURCE_DIMENSION_TEXTURE2D) => {
             v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
@@ -1435,6 +1782,43 @@ mod tests {
         assert_eq!(classify(u64::MAX - 64), Slot::NoRecord, "past the space");
     }
 
+    /// PERF2, the pending -> ready hand-over of a slot whose read is off
+    /// the frame: looked up every frame while the read is with the reader
+    /// (whatever the copy's own state says: the reader sets it when it has
+    /// read, before the pass has the texels), answered from the table once
+    /// it is not; a partial view whose copy completed is looked up once more.
+    #[test]
+    fn a_flying_slot_is_looked_up_until_its_read_is_handed_over() {
+        // (ready, flying, pending, partial, partial fresh)
+        assert!(!known_stands(false, true, true, false, false), "queued, no texels: flat, asked again");
+        assert!(!known_stands(false, true, false, false, false), "read (copy says complete), not handed over: asked again");
+        assert!(!known_stands(true, true, false, false, false), "old contents shown while read again: asked again");
+        assert!(known_stands(true, false, false, false, false), "handed over, complete: the table's answer");
+        assert!(!known_stands(false, false, false, false, false), "never ready: asked");
+        assert!(known_stands(true, false, true, true, true), "partly streamed, looked at lately: kept");
+        assert!(!known_stands(true, false, true, true, false), "partly streamed, due");
+        assert!(!known_stands(true, false, true, false, false), "pending without texels shown");
+        assert!(!known_stands(true, false, false, true, true), "a partial view of a copy complete since: once more");
+    }
+
+    /// PERF2: the provided reads' bookkeeping without a device: a key is
+    /// asked once, results of an older provider epoch are dropped.
+    #[test]
+    fn provided_reads_drop_what_an_older_provider_asked() {
+        let mut r = ProvidedReads::default();
+        let (landed, from) = std::sync::mpsc::channel::<ReadLanded>();
+        r.from = Some(from);
+        r.flying.insert(7);
+        r.restart();
+        assert!(r.flying.is_empty());
+        r.flying.insert(9);
+        landed.send(ReadLanded(0, 7, None)).unwrap();
+        landed.send(ReadLanded(1, 9, None)).unwrap();
+        let got = r.take(true);
+        assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), [9]);
+        assert!(r.flying.is_empty() && r.take(true).is_empty(), "nothing flying: no wait");
+    }
+
     /// A slot on a page with nothing mapped reads as no record (guarded copy).
     #[test]
     fn unmapped_slot_reads_nothing() {
@@ -1445,6 +1829,151 @@ mod tests {
         assert_eq!(classify(p as u64 + 64), Slot::NoRecord);
         // SAFETY: the reservation made above.
         unsafe { xnw_core::win::VirtualFree(p, 0, xnw_core::win::MEM_RELEASE) };
+    }
+
+    /// batch: the frame's records read for all slots name the same
+    /// entries `classify` finds, and only current ones (released, zeros,
+    /// unmapped and out-of-space slots are not there: they take the full path).
+    #[test]
+    fn batched_records_match_classify() {
+        let null = std::ptr::null();
+        let slots = [0u64; 4 * 6];
+        let at = |i: usize| slots.as_ptr() as u64 + 32 * i as u64;
+        let r = 0x7a12_0000usize as xnw_gpu::d3d12x::object::This;
+        create_srv(null, r, std::ptr::null(), at(0));
+        let mut resource = [0u32; 14];
+        resource[0] = 3;
+        let mut desc = [0u32; 16];
+        desc[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        (desc[10], desc[11]) = (0x5000_0000, 0);
+        create_placed_srv(null, &resource, &desc, at(1));
+        // SAFETY: a plain reservation, released at the end.
+        let p = unsafe { xnw_core::win::VirtualAlloc(std::ptr::null(), 1 << 16, xnw_core::win::MEM_RESERVE, xnw_core::win::PAGE_READWRITE) };
+        let mut t = TexTable::new(TexOptions::default(), 0);
+        let ask = [at(0), at(1), at(0), at(5), p as u64 + 64, 0x10, 0];
+        t.read_records(&mut ask.iter().copied());
+        let id = |s| match classify(s) {
+            Slot::Shader(id, ..) | Slot::Placed(id, _) => id,
+            k => panic!("{k:?}"),
+        };
+        assert_eq!(t.current.len(), 2, "{:?}", t.current);
+        assert_eq!(t.current.get(&at(0)), Some(&id(at(0))));
+        assert_eq!(t.current.get(&at(1)), Some(&id(at(1))));
+        forget(0x7a12_0000);
+        t.read_records(&mut ask.iter().copied());
+        assert_eq!(t.current.keys().copied().collect::<Vec<_>>(), vec![at(1)], "released: stale");
+        // SAFETY: the reservation made above.
+        unsafe { xnw_core::win::VirtualFree(p, 0, xnw_core::win::MEM_RELEASE) };
+    }
+
+    /// arrivals: a partly streamed copy is due when its texture's
+    /// pages arrived, when told to look at all, or on its turn of the sweep
+    /// (once every 4 x `XNW_TEX_RECHECK` frames, spread by address); off,
+    /// `XNW_TEX_RECHECK` frames after its last look.
+    #[test]
+    fn partial_copies_due_by_arrival_or_sweep() {
+        let n = recheck_frames();
+        assert!(!partial_due(0x1000, 10, 10 + n - 1, None, None));
+        assert!(partial_due(0x1000, 10, 10 + n, None, None));
+        let mut arrived = std::collections::HashSet::new();
+        arrived.insert((2, 7));
+        let on = Some((&arrived, false));
+        assert!(partial_due(0x1000, 10, 11, Some((2, 7)), on), "its pages arrived");
+        assert!(partial_due(0x1000, 10, 11, None, Some((&arrived, true))), "look at all");
+        // Over one sweep period a slot is due once; on every frame some address is.
+        let p = 4 * n;
+        let due = |slot: u64| (0..p).filter(|&f| partial_due(slot, 0, 100 + f, Some((2, 8)), on)).count();
+        assert_eq!(due(0x1000), 1);
+        assert_eq!(due(0x1020), 1);
+        assert!((0..p).all(|f| (0..p).any(|s| partial_due(s << 5, 0, f, None, on))), "spread");
+    }
+
+    /// bench (`cargo test -p xnw-world --lib -- --ignored resolve_cost --nocapture`):
+    /// 1,240 slots, `classify` each against the batch (records and
+    /// generations for all, then a map look per slot), alone and with a
+    /// thread writing descriptors (the views' lock) and one reading title
+    /// memory (the guards' lock) meanwhile. Prints us per slot.
+    #[test]
+    #[ignore]
+    fn resolve_cost() {
+        const N: usize = 1240;
+        let null = std::ptr::null();
+        let slots = vec![0u64; 4 * N];
+        let at = |i: usize| slots.as_ptr() as u64 + 32 * i as u64;
+        for i in 0..N {
+            create_srv(null, (0x7b00_0000 + 0x100 * i) as xnw_gpu::d3d12x::object::This, std::ptr::null(), at(i));
+        }
+        let ask: Vec<u64> = (0..N).map(at).collect();
+        let mut t = TexTable::new(TexOptions::default(), 0);
+        let run = |t: &mut TexTable, label: &str| {
+            let frames = 200;
+            let t0 = std::time::Instant::now();
+            for _ in 0..frames {
+                for &s in &ask {
+                    std::hint::black_box(classify(s));
+                }
+            }
+            let per = t0.elapsed().as_secs_f64() * 1e6 / (frames * N) as f64;
+            let t0 = std::time::Instant::now();
+            for _ in 0..frames {
+                t.read_records(&mut ask.iter().copied());
+                for &s in &ask {
+                    std::hint::black_box(t.current.get(&s));
+                }
+            }
+            let batch = t0.elapsed().as_secs_f64() * 1e6 / (frames * N) as f64;
+            // Its parts: the records' copies, the generations' look.
+            let mut recs = Vec::new();
+            let t0 = std::time::Instant::now();
+            for _ in 0..frames {
+                host::copy_records(&ask, &mut recs);
+            }
+            let copies = t0.elapsed().as_secs_f64() * 1e6 / (frames * N) as f64;
+            // SAFETY: our own copies of the records.
+            let ids: Vec<(u32, u32)> = recs.iter().filter_map(|(r, _)| unsafe { descriptor::record_id(r.as_ptr() as u64) }).collect();
+            let mut now = Vec::new();
+            let t0 = std::time::Instant::now();
+            for _ in 0..frames {
+                descriptor::current(&ids, &mut now);
+            }
+            let gens = t0.elapsed().as_secs_f64() * 1e6 / (frames * N) as f64;
+            println!(
+                "resolve_cost {label}: classify {per:.3} us a slot ({:.2} ms a frame), batch {batch:.3} us a slot ({:.2} ms a frame; copies {copies:.3}, generations {gens:.3})",
+                per * N as f64 / 1e3,
+                batch * N as f64 / 1e3
+            );
+            assert_eq!(t.current.len(), N);
+        };
+        run(&mut t, "alone");
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let other = vec![0u64; 4 * 64];
+        let other_at = other.as_ptr() as u64;
+        let mut busy = Vec::new();
+        {
+            let stop = stop.clone();
+            busy.push(std::thread::spawn(move || {
+                let mut i = 0usize;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    create_srv(std::ptr::null(), (0x7c00_0000 + 0x100 * (i % 64)) as xnw_gpu::d3d12x::object::This, std::ptr::null(), other_at + 32 * (i % 64) as u64);
+                    i += 1;
+                }
+            }));
+        }
+        {
+            let stop = stop.clone();
+            busy.push(std::thread::spawn(move || {
+                let mut b = [0u8; 64];
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    host::copy_mapped(b.as_mut_ptr(), other_at as *const u8, 64, false);
+                }
+            }));
+        }
+        run(&mut t, "with a descriptor writer and a title-memory reader");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for b in busy {
+            b.join().unwrap();
+        }
+        drop(other);
     }
 
     #[test]
@@ -1489,6 +2018,19 @@ mod tests {
         assert!(srv_desc(&d(28, 1, 6), None, 0, 0).is_none(), "arrays/cubes: flat");
         w[1] = 9; // a cube view
         assert!(srv_desc(&d(70, 6, 1), Some(w), 0, 0).is_none());
+        // POL4: the title view's component mapping (words[2]) is ours: a BC5 mask read as (r, 0, g, 1)
+        // = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(0, 4, 1, 5); invalid words (no bit 12, bits past it) or
+        // no words: the default; off: the default.
+        let rgb = 0 | 4 << 3 | 1 << 6 | 5 << 9 | 0x1000;
+        w[1] = 4;
+        w[2] = rgb;
+        assert_eq!(srv_desc(&d(83, 6, 1), Some(w), 0, 0).unwrap().0.Shader4ComponentMapping, rgb);
+        assert_eq!(wide_srv(&d(83, 6, 6), Some([w[0], 5, rgb, 0, 0, 6, 0, 6, 0, 0]), 0, 0).unwrap().Shader4ComponentMapping, rgb);
+        for bad in [rgb & !0x1000, rgb | 0x2000, 0] {
+            assert_eq!(mapping_of(Some([0, 4, bad, 0, 0, 0, 0, 0, 0, 0]), true), D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+        }
+        assert_eq!((mapping_of(None, true), mapping_of(Some(w), false)), (D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING));
+        assert_eq!(D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, 0x1688, "the default is (0, 1, 2, 3) with bit 12");
     }
 
     /// A provided cube and a provided array on the device (WARP): made,

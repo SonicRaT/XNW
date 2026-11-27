@@ -15,6 +15,17 @@
 //!   pass draws those pixels in hair brown under its depth test
 //!   (`xnw_world::hair::HairPass`).
 //!
+//! HAIR7: the title's thread reads only small records: a hair sink's buffer
+//! and root views of 64 KiB or more are left in place (address only,
+//! `pack.rs` IN_PLACE); the list thread binds them in title memory
+//! (`XNW_ZEROCOPY`, the runner's `in_place`) or reads them there. The pool
+//! stays on the runner's device (`hair_chain::run_on_device`); every strand
+//! draw reads it there, all in one submission into one depth target
+//! (`hair::draw_strands_device`), and that depth stays on the device for our
+//! pass (`FrameList::hair_depth`): no pool copy, no readback.
+//! `XNW_HAIR_READBACK=on` reads it back too (pixels and depth hash, a check);
+//! `XNW_HAIR_DEVICE=off` is HAIR6's path (an A/B).
+//!
 //! On the hardware adapter the title's programs run only with
 //! `XNW_BRIDGE_HW=1` and the per-submission GPU watchdog (started here,
 //! `XNW_GPU_WATCH_MS`, default 500). A frame without a strand draw does no
@@ -89,7 +100,9 @@ fn live() -> Result<Live, String> {
         xnw_gpu::gpuwatch::start(std::time::Duration::from_millis(ms));
         xnw_core::info!("world render: hair on {}: GPU watchdog {ms} ms per submission", host.caps.adapter);
     }
-    let runner = xnw_world::compute::Runner::new(host)?;
+    let mut runner = xnw_world::compute::Runner::new(host)?;
+    // HAIR7: the views the pack left in place are bound in title memory (`XNW_ZEROCOPY`).
+    runner.in_place = true;
     let dir = names_dir();
     let names = hair_chain::names_in(&dir).ok_or_else(|| format!("no shader-names.tsv in {} (set XNW_SHADER_NAMES)", dir.display()))?;
     Ok(Live { runner, programs: HashMap::new(), vertex: HashMap::new(), names, dir: dir.join("hair-live").join("live") })
@@ -121,9 +134,15 @@ pub(super) fn frame(frame: u64, list: &mut FrameList, data: fp::FramePack, blobs
         }
     };
     let Some(host) = xnw_gpu::d3d12x::host::host_device() else { return };
-    let p = xnw_frame::pack::Pack::in_memory(&l.dir, data, blobs);
+    // HAIR7: views the title's thread left in place are read here (list thread) when not bound in place.
+    let p = xnw_frame::pack::Pack::in_memory(&l.dir, data, blobs).reading(|a, n| super::dcopy(a, n as usize));
     let t0 = Instant::now();
-    let chain = hair_chain::run_on(&p, &mut l.runner, &l.names, &mut l.programs, false);
+    // HAIR7: the pool stays on the device; the strand draws read it there.
+    // HAIR7 `XNW_HAIR_DEVICE=off` (an A/B): HAIR6's path, the pool read back and one submission a strand draw.
+    // Probes: `readpool` the pool also read back after the chain; `pixels` our pass draws the pixels read back.
+    let probe = std::env::var("XNW_HAIR_DEVICE").unwrap_or_default();
+    let old = probe == "off";
+    let chain = if old || probe == "readpool" { hair_chain::run_on(&p, &mut l.runner, &l.names, &mut l.programs, false) } else { hair_chain::run_on_device(&p, &mut l.runner, &l.names, &mut l.programs) };
     let chain_ms = t0.elapsed().as_secs_f64() * 1e3;
     st.chain_ms += chain_ms;
     let chain = match chain {
@@ -133,6 +152,12 @@ pub(super) fn frame(frame: u64, list: &mut FrameList, data: fp::FramePack, blobs
             return line(frame, st);
         }
     };
+    // A burst (LIVE1) prints the steps left out, as the replay does.
+    if super::burst::serving() {
+        for s in chain.steps.iter().filter(|s| s.error.is_some() || s.skipped.is_some()) {
+            println!("  chain sink {} {}: {}", s.sink, s.name, s.error.as_deref().or(s.skipped.as_deref()).unwrap_or(""));
+        }
+    }
     if chain.removed {
         let e = chain.steps.iter().find_map(|s| s.error.clone()).unwrap_or_default();
         xnw_core::warn!("world render: frame {frame}: hair: the device failed in the strand chain ({e}); hair off for the run");
@@ -146,22 +171,46 @@ pub(super) fn frame(frame: u64, list: &mut FrameList, data: fp::FramePack, blobs
     }
     st.whole += 1;
     let t1 = Instant::now();
-    let drawn = hair::draw_strands(&p, host, SIZE, Some(&chain), false, &mut l.vertex);
+    if super::burst::serving() {
+        println!("  hair frame {frame}: chain {chain_ms:.1} ms; the strand draws next");
+    }
+    let placed = (l.runner.placed, xnw_frame::compute::in_place_taken());
+    let pool = if old { Ok(None) } else { l.runner.resource(xnw_frame::compute::key(chain.pool_at)) };
+    // HAIR7 `XNW_HAIR_READBACK=on` (a check, default off): the strand depth is also read back (pixels, hash).
+    let read = std::env::var("XNW_HAIR_READBACK").is_ok_and(|v| v == "on");
+    let drawn = if old {
+        hair::draw_strands(&p, host, SIZE, Some(&chain), false, &mut l.vertex).map(|(u, lines, draws)| hair::Drawn { read: Some(u), device: None, lines, draws })
+    } else {
+        pool.and_then(|pool| hair::draw_strands_device(&p, host, SIZE, &chain, pool.as_ref(), &mut l.vertex, read))
+    };
     let draw_ms = t1.elapsed().as_secs_f64() * 1e3;
     st.draw_ms += draw_ms;
     st.worst_ms = st.worst_ms.max(chain_ms + draw_ms);
     match drawn {
-        Ok((strands, lines, n)) => {
-            let px = strands.pixels(SIZE.0);
+        Ok(d) => {
             st.drawn += 1;
-            st.pixels += px.len() as u64;
-            st.last = format!("{}; {n} strand draws, {} pixels; {}", chain.line(), px.len(), lines.first().cloned().unwrap_or_default());
-            list.hair = Some(Arc::new(px));
+            let seen = match &d.read {
+                Some(strands) => {
+                    let px = strands.pixels(SIZE.0);
+                    st.pixels += px.len() as u64;
+                    let text = format!("{} pixels, depth hash {:08x}", px.len(), strands.hash());
+                    // More than one strand program: their union, as pixels (HAIR6's path).
+                    if d.device.is_none() || !read || probe == "pixels" {
+                        list.hair = Some(Arc::new(px));
+                    }
+                    text
+                }
+                None => "depth on the device".to_string(),
+            };
+            if let Some(dev) = d.device.filter(|_| list.hair.is_none()) {
+                list.hair_depth = Some(Arc::new(dev));
+            }
+            st.last = format!("{}; {} strand draws, {seen}; chain views in place {} (left by the pack {}); {}", chain.line(), d.draws, placed.0, placed.1, d.lines.join("; "));
         }
         Err(e) => {
             // SAFETY: a plain query.
             if unsafe { host.device.GetDeviceRemovedReason() }.is_err() {
-                xnw_core::warn!("world render: frame {frame}: hair: the device failed in the strand draws ({e}); hair off for the run");
+                xnw_core::warn!("world render: frame {frame}: hair: the device failed in the strand draws ({e}{}); hair off for the run", xnw_world::bridge::layer_errors(&host.device));
                 OFF.store(true, std::sync::atomic::Ordering::Relaxed);
                 return;
             }
@@ -177,7 +226,8 @@ fn line(frame: u64, st: &mut Stats) {
     if st.drawn == 1 {
         FIRST.call_once(|| xnw_core::info!("world render: frame {frame}: hair: first frame drawn: {}", st.last));
     }
-    if st.frames < 60 {
+    // A burst (LIVE1) prints every frame.
+    if st.frames < 60 && !super::burst::serving() {
         return;
     }
     let per = |ms: f64| if st.whole > 0 { ms / f64::from(st.with_draws) } else { 0.0 };

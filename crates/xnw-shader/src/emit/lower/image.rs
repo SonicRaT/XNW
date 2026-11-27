@@ -245,6 +245,23 @@ impl<'a> Lower<'a> {
             return Err("an image access with tfe or lwe");
         }
         let name = inst.name();
+        // XNW (KILL1): `Stub::image`: a pixel program's read gives a constant.
+        if self.s.pixel && !name.starts_with("image_store") && !name.starts_with("image_atomic") {
+            let at = inst.machine.offset as u32;
+            crate::emit::stub_site("image", at);
+            let stub = crate::emit::STUB.with(std::cell::Cell::get);
+            if stub.images || stub.image == Some(at) {
+                let x = self.s.m.i32(match name {
+                    "image_get_lod" => 0,
+                    "image_get_resinfo" => 1,
+                    _ => 0.5f32.to_bits(),
+                });
+                for &(_, v) in &inst.writes {
+                    self.vals.insert(v, Val::I32(x));
+                }
+                return Ok(());
+            }
+        }
         // A load or sample with no channel enabled returns the first.
         let dmask = if *dmask == 0 { &1 } else { dmask };
         let site = (b, i);

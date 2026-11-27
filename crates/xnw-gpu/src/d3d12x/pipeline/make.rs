@@ -49,6 +49,12 @@ pub(crate) struct Pending {
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queued: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
+    /// Made before the null point, or (KEEP1) made after it for kept
+    /// UI work (only those draw kept UI work).
+    before_null: AtomicBool,
+    /// KEEP1: a kept draw of a named UI-class program asked for it in null
+    /// mode ([`make_kept`]): the one kind made after the null point.
+    kept_ui: AtomicBool,
     /// Per-pipeline wake pair so unrelated background compiles do not wake
     /// threads waiting on a different pipeline.
     wait_lock: Mutex<()>,
@@ -91,6 +97,8 @@ impl Pending {
             graphics,
             queued: AtomicBool::new(false),
             made: OnceLock::new(),
+            before_null: AtomicBool::new(false),
+            kept_ui: AtomicBool::new(false),
             wait_lock: Mutex::new(()),
             wait_done: Condvar::new(),
             used: AtomicBool::new(false),
@@ -115,6 +123,15 @@ impl Pending {
     }
 
     fn make(&self) {
+        // No host pipeline is begun once null mode began (any path),
+        // but (KEEP1) one a kept UI draw asked for.
+        let kept_ui = self.kept_ui.load(Ordering::Relaxed);
+        if super::super::frameskip::null_now() && self.made.get().is_none() && !kept_ui {
+            if STARTED_IN_NULL.fetch_add(1, Ordering::Relaxed) == 0 {
+                xnw_core::warn!("d3d12x: a host pipeline was asked to be made after the null point: refused ({})", label(&self.shaders));
+            }
+            return;
+        }
         self.made.get_or_init(|| {
             let started = Instant::now();
             // Watched while it runs (slow log, deadline, exit report).
@@ -124,8 +141,16 @@ impl Pending {
             ticket.done(&format!("DXIL {}; {}", sizes.join(", "), if made.is_some() { "made" } else { "refused" }));
             if let Some(p) = &made {
                 super::note_ready(p);
-                // None should be made once null mode began (uikeep.rs).
-                if super::super::frameskip::null_now() {
+                // In flight at the null point: made, never used (uikeep.rs).
+                if !super::super::frameskip::null_now() {
+                    self.before_null.store(true, Ordering::Relaxed);
+                } else if kept_ui {
+                    self.before_null.store(true, Ordering::Relaxed);
+                    let n = UI_MADE_IN_NULL.fetch_add(1, Ordering::Relaxed);
+                    if n < 200 {
+                        xnw_core::info!("null ui: host pipeline made for kept UI work: {} [{}]", label_of(self), sizes.join(", "));
+                    }
+                } else {
                     MADE_IN_NULL.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -318,6 +343,9 @@ pub(crate) fn waiting() -> u64 {
 /// queues it on first use.
 /// The host pipeline if it is made already; nothing started.
 pub(crate) fn made_now(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    if !p.before_null.load(Ordering::Relaxed) {
+        return None;
+    }
     p.made.get()?.as_ref()
 }
 
@@ -526,7 +554,7 @@ fn queue(p: Arc<Pending>) {
                         let Ok(p) = next else { return };
                         // Queued before null mode began: not made now
                         // (it may be asked for again if frames render).
-                        if super::super::frameskip::null_now() {
+                        if super::super::frameskip::null_now() && !p.kept_ui.load(Ordering::Relaxed) {
                             p.queued.store(false, Ordering::Relaxed);
                             NULL_DROPPED.fetch_add(1, Ordering::Relaxed);
                             WAITING.fetch_sub(1, Ordering::Relaxed);
@@ -560,6 +588,58 @@ fn queue(p: Arc<Pending>) {
 pub(crate) static NULL_DROPPED: AtomicU64 = AtomicU64::new(0);
 /// Host pipelines made after the null point (expected 0).
 pub(crate) static MADE_IN_NULL: AtomicU64 = AtomicU64::new(0);
+/// KEEP1: host pipelines made after the null point for kept UI work.
+pub(crate) static UI_MADE_IN_NULL: AtomicU64 = AtomicU64::new(0);
+
+/// KEEP1: `p` is asked for by a kept draw of a named UI-class program in
+/// null mode: queued once for the workers, never waited for (the draw is
+/// dropped until it is made). Not the too-slow or suspect ones.
+pub(crate) fn make_kept(p: &Arc<Pending>) {
+    p.kept_ui.store(true, Ordering::Relaxed);
+    if p.made.get().is_none() && !p.slow.load(Ordering::Relaxed) && !p.queued.swap(true, Ordering::Relaxed) {
+        static ASKED: AtomicU64 = AtomicU64::new(0);
+        if ASKED.fetch_add(1, Ordering::Relaxed) < 200 {
+            xnw_core::info!("null ui: host pipeline asked for kept UI work: {}", label_of(p));
+        }
+        enqueue(p);
+    }
+}
+
+/// KEEP1: the stage names and the pack name of the last program of `p`
+/// (the pixel or compute one), before anything is made.
+pub(crate) fn programs(p: &Pending) -> (Vec<&'static str>, Option<String>) {
+    (p.shaders.iter().map(|s| s.stage).collect(), p.shaders.last().and_then(|s| s.pack_name()))
+}
+
+/// The texture views `p`'s programs read through tables ([`super::texture_tables`]).
+pub(crate) fn texture_tables(p: &Pending) -> Option<Vec<(u8, u32)>> {
+    let mut v = Vec::new();
+    for s in &p.shaders {
+        let t = s.translated()?;
+        v.extend(t.used.iter().filter(|u| u.kind == xnw_shader::ResourceType::Srv && u.root == xnw_shader::RootType::Table && u.dwords == 8).map(|u| (u.slot, u.table_offset_dwords)));
+    }
+    Some(v)
+}
+
+/// The hash of `p`'s last program.
+pub(crate) fn last_hash(p: &Pending) -> Option<u128> {
+    p.shaders.last().map(|s| s.hash)
+}
+
+/// The programs of `p` by pack name (hash where the pack has none), for a
+/// log line.
+pub(crate) fn label_of(p: &Pending) -> String {
+    let v: Vec<String> = p.shaders.iter().map(|s| format!("{} {}", s.stage, s.pack_name().unwrap_or_else(|| format!("{:032x}", s.hash)))).collect();
+    v.join(" + ")
+}
+
+/// Whether this is the first note about `p` (one log line per pipeline).
+pub(crate) fn first_note(p: &Pending) -> bool {
+    !p.drop_logged.swap(true, Ordering::Relaxed)
+}
+
+/// Host pipeline makings asked for after the null point, refused.
+pub(crate) static STARTED_IN_NULL: AtomicU64 = AtomicU64::new(0);
 
 /// The most pipelines waiting at once since the workers last ran out.
 static PEAK: AtomicU64 = AtomicU64::new(0);

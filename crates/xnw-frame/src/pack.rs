@@ -20,7 +20,20 @@ pub struct Pack {
     /// HAIR6: a pack the live path made this frame: its blobs in memory
     /// (none on disk; `dir` only names where `shader-names.tsv` is looked for).
     mem: Option<std::sync::Arc<HashMap<u128, Vec<u8>>>>,
+    /// HAIR7: how a live pack's views left in place (reason IN_PLACE) are
+    /// read from title memory on the list thread, and those read (once a
+    /// frame per range, at most [`IN_PLACE_READ_MAX`] bytes each).
+    read: Option<TitleRead>,
+    title: std::sync::Mutex<HashMap<(u64, u64), Option<std::sync::Arc<Vec<u8>>>>>,
 }
+
+/// HAIR7: a title memory reader (address, length).
+pub type TitleRead = fn(u64, u64) -> Option<Vec<u8>>;
+
+/// HAIR7: a view left in place longer than this is not copied by
+/// [`Pack::bytes_of`] (as a capture's budget cut it: the strand pool, the
+/// palette; the GPU reads those in place or the chain writes them).
+pub const IN_PLACE_READ_MAX: u64 = 16 << 20;
 
 /// The v1 frame and its pack (None for a v1 capture).
 pub fn load_any(dir: &Path) -> Result<(LoadedFrame, Option<Pack>), String> {
@@ -30,13 +43,20 @@ pub fn load_any(dir: &Path) -> Result<(LoadedFrame, Option<Pack>), String> {
 impl Pack {
     pub fn open(dir: &Path) -> Result<Option<Pack>, String> {
         let Some(data) = FramePack::open(dir)? else { return Ok(None) };
+        // ALIAS1: the run's paired reservation, where the capture recorded it; the first one stays.
+        if let Some([cpu, gpu, len]) = data.manifest.pair
+            && !xnw_core::pair::publish(xnw_core::pair::Pair { cpu, gpu, len })
+        {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| eprintln!("{}: paired reservation {cpu:#x} <-> {gpu:#x} differs from {:x?} (another run's capture): the first stays", dir.display(), xnw_core::pair::live()));
+        }
         let mut sinks_of: HashMap<u32, Vec<u32>> = HashMap::new();
         for s in &data.sinks {
             if let Some(d) = s.hook_draw {
                 sinks_of.entry(d).or_default().push(s.index);
             }
         }
-        Ok(Some(Pack { dir: dir.to_path_buf(), data, sinks_of, mem: None }))
+        Ok(Some(Pack { dir: dir.to_path_buf(), data, sinks_of, mem: None, read: None, title: Default::default() }))
     }
 
     /// HAIR6: a pack made in memory (the live path's frame), its blobs by hash.
@@ -47,7 +67,35 @@ impl Pack {
                 sinks_of.entry(d).or_default().push(s.index);
             }
         }
-        Pack { dir: dir.to_path_buf(), data, sinks_of, mem: Some(blobs) }
+        Pack { dir: dir.to_path_buf(), data, sinks_of, mem: Some(blobs), read: None, title: Default::default() }
+    }
+
+    /// HAIR7: views left in place (reason IN_PLACE) are read with `read`.
+    pub fn reading(mut self, read: TitleRead) -> Pack {
+        self.read = Some(read);
+        self
+    }
+
+    /// HAIR7: whether `r` was left in place by a live sink.
+    pub fn in_place(r: &Ref) -> bool {
+        r.reason == reason::IN_PLACE
+    }
+
+    /// FACE1: [`Pack::title_bytes`] for a caller (the head graph reads a
+    /// large buffer's first bytes to know it is the same object as before).
+    pub fn title(&self, addr: u64, len: u64) -> Option<Vec<u8>> {
+        self.title_bytes(addr, len)
+    }
+
+    /// HAIR7: the title bytes of a view left in place (None: no reader, too
+    /// long, or unreadable), read once per range.
+    fn title_bytes(&self, addr: u64, len: u64) -> Option<Vec<u8>> {
+        let read = self.read?;
+        if len == 0 || len > IN_PLACE_READ_MAX {
+            return None;
+        }
+        let mut m = self.title.lock().unwrap_or_else(|e| e.into_inner());
+        m.entry((addr, len)).or_insert_with(|| read(addr, len).map(std::sync::Arc::new)).as_ref().map(|b| b.to_vec())
     }
 
     /// A blob's bytes (None: not stored or not found).
@@ -62,7 +110,70 @@ impl Pack {
     }
 
     pub(crate) fn bytes_of(&self, r: &Ref) -> Option<Vec<u8>> {
+        if r.reason == reason::IN_PLACE {
+            return self.title_bytes(r.addr, u64::from(r.len));
+        }
         reason::has_bytes(r.reason).then(|| self.blob(r.hash)).flatten()
+    }
+
+    /// LIGHT2: the frame's scene lights from the pack's copy of the title's
+    /// CPU array (kind 55: slot 1 = (buffer, count), slot 0 = the buffer's
+    /// records). None: not recorded (a pack before v2.7) or not plausible.
+    pub fn scene_lights(&self) -> Option<Vec<xnw_world::lamps::SceneLight>> {
+        let of = |slot: u16| self.data.refs.iter().find(|r| r.kind == fp::kind::LIGHTS && r.slot == slot).filter(|r| reason::has_bytes(r.reason)).and_then(|r| self.blob(r.hash));
+        let head = of(1).filter(|b| b.len() >= 8)?;
+        let count = u32::from_le_bytes([head[4], head[5], head[6], head[7]]);
+        if count > xnw_world::lamps::CAP {
+            return None;
+        }
+        Some(xnw_world::lamps::decode(&of(0)?, count))
+    }
+
+    /// POST1's probe: the title's post constants at each draw of its
+    /// composite (pixel program b4045fba, PS_CompositeNoise): block b6 (T9
+    /// slot 42, 1392 B) and b9 (slot 40), as the capture holds them. `tc`:
+    /// the frame's timecycle floats, for the EV and the curve sets it holds.
+    pub fn post_probe(&self, tc: &[f32]) -> Vec<String> {
+        let mut out = Vec::new();
+        let pipes: Vec<u64> = self.data.programs.iter().filter(|p| p.stage == "pixel" && (p.container >> 96) as u32 == 0xb404_5fba).map(|p| p.pipeline).collect();
+        for s in self.data.sinks.iter().filter(|s| pipes.contains(&s.pipeline)) {
+            let block = |slot: u32, least: usize| self.tables(s.index).into_iter().find_map(|(root, _, _)| self.slot_bytes(s.index, root, slot).ok().map(|x| x.1).filter(|b| b.len() >= least));
+            let Some(b6) = block(42, 0x528) else {
+                out.push(format!("world probe: post: sink {}: no b6 bytes (T9 slot 42)", s.index));
+                continue;
+            };
+            let f = |at: usize| f32::from_le_bytes([b6[at], b6[at + 1], b6[at + 2], b6[at + 3]]);
+            let on = |at: usize| u32::from(b6[at..at + 4] != [0; 4]);
+            let set = |at: usize| (0..7).map(|i| f(at + 4 * i).to_string()).collect::<Vec<_>>().join(" ");
+            let srgb = block(40, 0x3C).map_or("-".to_string(), |b9| {
+                let g = |at: usize| f32::from_le_bytes([b9[at], b9[at + 1], b9[at + 2], b9[at + 3]]);
+                format!("{:.4}/{:.4}/{:.3}/{:.3}", g(0x2C), g(0x30), g(0x34), g(0x38))
+            });
+            let t = |i: usize| tc.get(i).copied().unwrap_or(f32::NAN);
+            let same = |at: usize, first: usize| (0..7).all(|i| f(at + 4 * i) == t(first + i));
+            out.push(format!(
+                "world probe: post: sink {}: lut={}(b6+514) local={}(3c0) key={:.3} ev=[{:.1},{:.1}] bias={:.2} sh={:.2} hable0={} hable1={} t={:.2}*E+{:.2} bloom={:.3} srgb={srgb} tc_ev={:.2} in [{:.1},{:.1}]; timecycle 847..853 = b6+4A0: {}, 838..844 = b6+4C0: {}",
+                s.index,
+                on(0x514),
+                on(0x3C0),
+                f(0x400),
+                f(0x420),
+                f(0x424),
+                f(0x428),
+                f(0x42C),
+                set(0x4A0),
+                set(0x4C0),
+                f(0x4E0),
+                f(0x4E4),
+                f(0x40),
+                t(794) + t(795),
+                t(796),
+                t(797),
+                same(0x4A0, 847),
+                same(0x4C0, 838),
+            ));
+        }
+        out
     }
 
     fn hook_ref(&self, draw: u32, k: u16, slot: u16) -> Option<&Ref> {
@@ -411,7 +522,7 @@ fn game_file(name: &str) -> Option<PathBuf> {
     let files = FILES.get_or_init(|| {
         let mut out = HashMap::new();
         let root = std::env::var_os("XNW_GAME_DRIVE").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("game"));
-        let mut stack = vec![root];
+        let mut stack = vec![root.clone()];
         while let Some(d) = stack.pop() {
             for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
                 let p = e.path();
@@ -421,6 +532,11 @@ fn game_file(name: &str) -> Option<PathBuf> {
                     out.entry(e.file_name().to_string_lossy().to_ascii_lowercase()).or_insert(p);
                 }
             }
+        }
+        // REFFIX: without the package every texture with a pack origin goes grey
+        // (pk8a f1030, 07b19da9's rows: 95 of 256 slots); said once, not silently.
+        if out.is_empty() {
+            eprintln!("pack: no .ttpf file under {} (set XNW_GAME_DRIVE to the package): textures with a pack origin get no texels", root.display());
         }
         out
     });
@@ -576,6 +692,13 @@ fn from_texels(v: &SlotView, tiled: &[u8], shape: ViewShape) -> Option<xnw_world
     Some(xnw_world::textures::Provided { width, height, format: v.format, rows, row_bytes, row_count, dim: xnw_world::textures::TEX_2D, depth: 1, mips: 1 })
 }
 
+/// PAL1: a texture view's texels in its own shape ([`view_shape`]) from its
+/// bytes in console memory (the live title's, read at a list sink), as a
+/// pack's stored texels decode ([`from_texels`]).
+pub fn texels_of(v: &SlotView, tiled: &[u8]) -> Option<xnw_world::textures::Provided> {
+    from_texels(v, tiled, view_shape(v))
+}
+
 impl Pack {
     /// The texels of one texture view (a draw word's view) as a 2D
     /// texture: its pack origin, else its stored texels; Err says which is
@@ -597,6 +720,25 @@ impl Pack {
         }
         let tiled = self.blob(t.texels).ok_or("no texels")?;
         from_texels(v, &tiled, shape).ok_or("texels not decoded")
+    }
+
+    /// REFFIX: why [`Self::texel_provider`] gives `slot` texels or none,
+    /// one name a step it takes: `origin`, `texels` (given); `no view` (the
+    /// handle names no captured view), `no texture row` (no row at the
+    /// view's address and length), `origin unread` (an origin the game
+    /// files do not give), `no texels` (no origin and no stored bytes),
+    /// `texels not decoded`.
+    pub fn texel_why(&self, views: &HashMap<u64, SlotView>, slot: u64) -> &'static str {
+        let Some(v) = views.get(&slot) else { return "no view" };
+        let Some(t) = self.texture(v) else { return "no texture row" };
+        let shape = view_shape(v);
+        if t.origin.as_deref().and_then(|o| from_origin(o, shape)).is_some() {
+            return "origin";
+        }
+        let Some(tiled) = (t.texels != 0).then(|| self.blob(t.texels)).flatten() else {
+            return if t.origin.is_some() { "origin unread" } else { "no texels" };
+        };
+        if from_texels(v, &tiled, shape).is_some() { "texels" } else { "texels not decoded" }
     }
 
     /// The content keys of [`Self::texel_provider`]'s texels: a
@@ -686,6 +828,9 @@ mod tests {
         assert_eq!(pack.views_by_handle().get(&(0x10 + 32)).map(|v| v.addr), Some(0x5000));
         // v2.1: a handle a hook draw named resolves as itself.
         assert_eq!(pack.views_by_handle().get(&0x10).map(|v| v.addr), Some(0x9000));
+        // REFFIX: the provider's step per handle: a view without a texture row, no view.
+        let views = pack.views_by_handle();
+        assert_eq!((pack.texel_why(&views, 0x10), pack.texel_why(&views, 0x77)), ("no texture row", "no view"));
         // A linear 8x8 RGBA8 texture's texels come back as its rows.
         let texels: Vec<u8> = (0..256u32).map(|i| i as u8).collect();
         let v = SlotView { kind: view::PLACED, width: 8, height: 8, depth: 1, mips: 1, format: 28, layout: 1, ..SlotView::default() };

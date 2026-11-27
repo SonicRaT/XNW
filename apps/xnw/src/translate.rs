@@ -205,7 +205,7 @@ pub fn run(args: &[String]) -> Res<()> {
         validate: args.iter().any(|a| a == "--validate"),
         pipelines,
         // As the shader gate (`runtime_options`), a host with barycentrics.
-        opts: Options { fma, mesh, descriptors, probe: false, loop_counts: None, pagetable: false, barycentrics: true, nonuniform_heap: false, keep_uniform_heap: false, masked_lanes: false },
+        opts: Options { fma, mesh, descriptors, probe: false, loop_counts: None, pagetable: false, barycentrics: true, nonuniform_heap: false, keep_uniform_heap: false, masked_lanes: false, one_return: false, confine: false, loop_limit: None },
         jobs,
         dump: value(args, "--dump")?.map(PathBuf::from),
     };

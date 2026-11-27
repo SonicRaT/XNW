@@ -67,7 +67,19 @@ static CALLS: [AtomicU64; CALL_NAMES.len()] = [const { AtomicU64::new(0) }; CALL
 #[inline]
 pub(crate) fn call(kind: usize) -> CallTimer {
     CALLS[kind].fetch_add(1, Relaxed);
-    CallTimer(kind, enabled().then(std::time::Instant::now))
+    CallTimer(kind, (enabled() || wall_slot(kind).is_some()).then(std::time::Instant::now))
+}
+
+/// The frame wall slot of a draw or dispatch call (WALL1: timed in every
+/// run; the title's Subrender workers make them). Rectangle draws are
+/// counted again among direct and indexed: no slot.
+fn wall_slot(kind: usize) -> Option<usize> {
+    match kind {
+        DRAW_INDIRECT => Some(xnw_core::framewall::HOOK_INDIRECT),
+        DRAW_MESH => Some(xnw_core::framewall::HOOK_MESH),
+        DRAW | DRAW_INDEXED | DISPATCH => Some(xnw_core::framewall::HOOK_OTHER),
+        _ => None,
+    }
 }
 
 /// See [`call`].
@@ -75,7 +87,13 @@ pub(crate) struct CallTimer(usize, Option<std::time::Instant>);
 impl Drop for CallTimer {
     fn drop(&mut self) {
         if let Some(at) = self.1 {
-            CALL_US[self.0].fetch_add(at.elapsed().as_micros() as u64, Relaxed);
+            let ns = at.elapsed().as_nanos() as u64;
+            if enabled() {
+                CALL_US[self.0].fetch_add(ns / 1000, Relaxed);
+            }
+            if let Some(slot) = wall_slot(self.0) {
+                xnw_core::framewall::add(slot, ns);
+            }
         }
     }
 }

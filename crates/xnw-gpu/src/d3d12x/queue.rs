@@ -107,6 +107,8 @@ fn execute_token(_: This, count: u32, lists: *const This, token: u64) {
     // SAFETY: the title passes `count` lists.
     let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
     let host_lists: Vec<_> = lists.iter().filter_map(|&l| super::list::host_list(l)).collect();
+    // PASS1: a kept UI submission sent without a wait runs before this one's CPU work.
+    host.settle_title();
     // The lists' pad canaries (`XNW_OBJECT_GUARD`).
     if super::guard::mode() != 0 {
         lists.iter().for_each(|&l| super::list::guard_check(l));
@@ -148,6 +150,7 @@ fn execute_token(_: This, count: u32, lists: *const This, token: u64) {
         // (their dropped stretches hold state and barriers only); the
         // others do their CPU part.
         let keep_on = super::uikeep::on();
+        let mut kept_ns = 0;
         let mut kept = Vec::new();
         for list in &host_lists {
             if keep_on && list.kept.load(Ordering::Relaxed) {
@@ -161,17 +164,28 @@ fn execute_token(_: This, count: u32, lists: *const This, token: u64) {
             if !kept.is_empty() {
                 super::uikeep::EXECUTED.fetch_add(kept.len() as u64, Ordering::Relaxed);
                 super::resource::release_held();
-                super::uikeep::executing(|| host.execute(&kept));
+                let host_at = std::time::Instant::now();
+                // PASS1 (`uiwait=off`, the default): sent, finished at its fence.
+                if super::uikeep::ui_wait() {
+                    super::uikeep::executing(|| host.execute(&kept));
+                } else {
+                    super::uikeep::executing(|| host.execute_nowait(&kept, true));
+                }
+                kept_ns = host_at.elapsed().as_nanos() as u64;
             }
         }
         SUBMISSIONS.fetch_add(1, Ordering::Relaxed);
         super::frameskip::ours(at.elapsed().as_micros() as u64);
+        xnw_core::framewall::executed(at.elapsed().as_nanos() as u64, kept_ns);
         return;
     }
     // References put off by views made since, before any lock is taken.
     super::resource::release_held();
     frame_line();
+    let host_at = std::time::Instant::now();
     host.execute(&host_lists);
+    let ns = host_at.elapsed().as_nanos() as u64;
+    xnw_core::framewall::executed(ns, ns);
     SUBMISSIONS.fetch_add(1, Ordering::Relaxed);
     LISTS.fetch_add(host_lists.len() as u64, Ordering::Relaxed);
     super::counters::submitted(host_lists.len());
@@ -440,7 +454,14 @@ extern "system" fn signal(_: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
-    super::fence::signal(fence, value)
+    // PASS1: behind a kept UI submission sent without a wait, if one runs.
+    match super::host::host_if_made() {
+        Some(host) => {
+            host.signal_after(fence, value);
+            S_OK
+        }
+        None => super::fence::signal(fence, value),
+    }
 }
 /// Every earlier submission has completed, so a queue wait never blocks.
 extern "system" fn wait(_: This, fence: This, _value: u64) -> HRESULT {
@@ -635,6 +656,11 @@ impl Plane {
 /// line, then paces to the frame interval. Base queue.rs 248-343 (the
 /// base's diagnostics-build show, dump and blink modes are not taken).
 extern "system" fn present(_: This, planes: u32, plane_parameters: *const Plane, _parameters: *const u8) -> HRESULT {
+    // WALL1: the frame wall line of the last 60 presents; this present's wall.
+    if let Some(line) = xnw_core::framewall::present_tick() {
+        xnw_core::info!("{line}");
+    }
+    let _wall = xnw_core::framewall::scope(xnw_core::framewall::PRESENT);
     // The frame's decision (its token, as its submissions'), taken
     // before the frame count moves (untokened frames are keyed by it).
     let skipped = {
@@ -652,8 +678,10 @@ extern "system" fn present(_: This, planes: u32, plane_parameters: *const Plane,
     if skipped && super::uikeep::on() {
         super::uikeep::tick();
         if super::uikeep::frame_all_kept() {
+            super::uikeep::PRESENTS[1].fetch_add(1, Ordering::Relaxed);
             skipped = false;
         } else if planes == 1 {
+            super::uikeep::PRESENTS[2].fetch_add(1, Ordering::Relaxed);
             super::uikeep::single_plane();
             skipped = false;
         } else if planes >= 2
@@ -674,7 +702,14 @@ extern "system" fn present(_: This, planes: u32, plane_parameters: *const Plane,
                 let r = unsafe { *p.resources };
                 super::resource::host_resource(r).map(|t| (r, t))
             };
-            let ours = super::screen_source().and_then(|f| f());
+            super::uikeep::PRESENTS[0].fetch_add(1, Ordering::Relaxed);
+            super::uikeep::note_planes(texture(&slice[scene]).map_or(0, |(r, _)| r as usize), texture(&slice[ui]).map_or(0, |(r, _)| r as usize));
+            let ours = {
+                let _pass = xnw_core::framewall::scope(xnw_core::framewall::PASS);
+                super::screen_source().and_then(|f| f())
+            };
+            // PASS1: the pass thread may write the picture again once this present is done with it.
+            let _shown = ours.as_ref().map(|_| super::Shown);
             let mut shown: Vec<(This, u32)> = Vec::new();
             let mut sources = Vec::new();
             if let Some(o) = &ours {
@@ -694,6 +729,7 @@ extern "system" fn present(_: This, planes: u32, plane_parameters: *const Plane,
                 xnw_core::info!("PresentX frame {frame} ({planes} planes): null GPU, ui=keep: {} under the title's UI plane {ui}", if ours.is_some() { "our picture" } else { "the title's scene plane" });
             }
             if !sources.is_empty() {
+                let _show = xnw_core::framewall::scope(xnw_core::framewall::SHOW);
                 let _ = host.present(&sources, frame);
             }
             for (r, state) in shown {
@@ -711,9 +747,14 @@ extern "system" fn present(_: This, planes: u32, plane_parameters: *const Plane,
         // `XNW_WORLD_RENDER=screen`: our world pass's picture is shown
         // as the scene plane of this skipped (null-mode) frame.
         if let Some(f) = super::screen_source()
-            && let (Some(host), Some(ours)) = (super::host::host(), f())
+            && let (Some(host), Some(ours)) = (super::host::host(), {
+                let _pass = xnw_core::framewall::scope(xnw_core::framewall::PASS);
+                f()
+            })
         {
             const RENDER_TARGET: u32 = 0x4;
+            let _shown = super::Shown;
+            let _show = xnw_core::framewall::scope(xnw_core::framewall::SHOW);
             let _ = host.present(&[(&ours, RENDER_TARGET, super::present::FULL)], frame);
         }
         // The last picture stays; no pacing: a skipped frame runs at once.
@@ -770,6 +811,7 @@ extern "system" fn present(_: This, planes: u32, plane_parameters: *const Plane,
             let sources: Vec<(&_, u32, super::present::Placement)> = resources.iter().map(|(_, tex, state, place)| (*tex, *state, *place)).collect();
             let at = std::time::Instant::now();
             let shown = host.present(&sources, frame);
+            xnw_core::framewall::add(xnw_core::framewall::SHOW, at.elapsed().as_nanos() as u64);
             super::frame::PACING[super::frame::PACE_PRESENT].fetch_add(at.elapsed().as_micros() as u64, Ordering::Relaxed);
             for &(resource, _, state, _) in &resources {
                 super::resource::host_transition(resource, state);

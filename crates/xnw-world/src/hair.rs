@@ -236,6 +236,235 @@ pub fn sim_guide(rec: &[u8], asset: &[u8], remap: &[u8], palette: &[u8], g: u32)
     Some(if out.iter().all(|v| v.is_finite()) { out } else { [0.0; 3] })
 }
 
+/// HAIR10 `hairribbon=on` in an `XNW_WORLD_RENDER` value (default off): our
+/// own guide ribbons from the title's strand records (no strand chain, no
+/// title program on the GPU): every guide of each main-view strand draw's
+/// group posed on the CPU ([`pose_guide`]) and drawn by [`HairPass`] as a
+/// camera-facing ribbon under our depth.
+pub fn ribbon_switch_on(v: &str) -> bool {
+    v.split(',').map(str::trim).filter_map(|p| p.strip_prefix("hairribbon=")).last().is_some_and(|s| s != "off")
+}
+
+/// HAIR10: a strand asset's (guides, points a guide): asset+0x58 low half,
+/// asset+0x5c low byte (HAIR3, as [`sim_guide`]).
+pub fn guide_shape(asset: &[u8]) -> (u32, u32) {
+    (u32_at(asset, 0x58) & 0xffff, u32_at(asset, 0x5c) & 0xff)
+}
+
+fn rest_point(asset: &[u8], at: usize) -> [f32; 3] {
+    let half = |o: usize| f16(asset.get(o..o + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]])));
+    [half(at), half(at + 2), half(at + 4)]
+}
+
+/// HAIR10: guide `g` of `asset` posed, every rest point (f16 x, y, z at
+/// asset[+0x44] + 8 (P g + k)) by `CS_UpdatePosePosition`'s 8-weight rule
+/// (ed83ecd1, HAIR4: palette bone = remap[`remap_at` + b] & 0xfff past the
+/// record's base +0xe8; bones and weights per guide as [`sim_guide`]), then
+/// by the group's world rows `world` (3x4, camera-relative): positions
+/// relative to the camera into `out`. `palette`: the bones from the base on
+/// (the record's palette window, 48 B a bone, row-major 3x4). False (nothing
+/// pushed) past the guide count, a bone past the window or a point not finite.
+pub fn pose_guide(asset: &[u8], remap: &[u8], remap_at: u32, palette: &[u8], world: &[f32; 12], g: u32, out: &mut Vec<[f32; 3]>) -> bool {
+    let (guides, points) = guide_shape(asset);
+    if g >= guides || points == 0 {
+        return false;
+    }
+    let (bo, wo, ro) = (u32_at(asset, 0x10) as usize, u32_at(asset, 0x14) as usize, u32_at(asset, 0x44) as usize);
+    let byte = |o: usize| asset.get(o).copied().unwrap_or(0);
+    let g8 = 8 * g as usize;
+    let sum: f32 = (0..8).map(|j| f32::from(byte(wo + g8 + j))).sum();
+    let norm = 1.0 / (sum * (1.0 / 255.0) + 1e-6);
+    let mut m = [0f32; 12];
+    for j in 0..8 {
+        let wb = byte(wo + g8 + j);
+        if wb == 0 {
+            continue;
+        }
+        let w = f32::from(wb) * (1.0 / 255.0) * norm;
+        let e = 2 * (remap_at as usize + byte(bo + g8 + j) as usize);
+        let Some(r) = remap.get(e..e + 2) else { return false };
+        let bone = (u16::from_le_bytes([r[0], r[1]]) & 0xfff) as usize;
+        let Some(b) = palette.get(48 * bone..48 * bone + 48) else { return false };
+        for (k, mk) in m.iter_mut().enumerate() {
+            *mk += w * f32_at(b, 4 * k);
+        }
+    }
+    let row = |m: &[f32; 12], r: usize, p: [f32; 3]| m[4 * r] * p[0] + m[4 * r + 1] * p[1] + m[4 * r + 2] * p[2] + m[4 * r + 3];
+    let start = out.len();
+    for k in 0..points {
+        let p = rest_point(asset, ro + 8 * (g * points + k) as usize);
+        let q = [0, 1, 2].map(|r| row(&m, r, p));
+        let c = [0, 1, 2].map(|r| row(world, r, q));
+        if !c.iter().all(|v| v.is_finite()) {
+            out.truncate(start);
+            return false;
+        }
+        out.push(c);
+    }
+    true
+}
+
+/// HAIR10: the mean distance from each guide root to its nearest other root
+/// (rest space, metres; at most 512 roots looked at), the ribbon width: the
+/// guides then cover the scalp side by side. 0 for fewer than two guides.
+pub fn guide_spacing(asset: &[u8]) -> f32 {
+    let (guides, points) = guide_shape(asset);
+    let ro = u32_at(asset, 0x44) as usize;
+    let roots: Vec<[f32; 3]> = (0..guides.min(512)).map(|g| rest_point(asset, ro + 8 * (g * points) as usize)).collect();
+    if roots.len() < 2 {
+        return 0.0;
+    }
+    let d2 = |a: &[f32; 3], b: &[f32; 3]| (0..3).map(|k| (a[k] - b[k]) * (a[k] - b[k])).sum::<f32>();
+    let sum: f32 = roots.iter().enumerate().map(|(i, a)| roots.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, b)| d2(a, b)).fold(f32::INFINITY, f32::min).sqrt()).sum();
+    sum / roots.len() as f32
+}
+
+/// HAIR10: the ribbon points of a frame: per guide its points in order,
+/// camera-relative x, y, z and the half width in w, negative on a guide's
+/// last point (no segment from it to the next); per group its points and
+/// its world's origin (camera-relative: the ped's root, HAIR10b).
+#[derive(Clone, Debug, Default)]
+pub struct Ribbons {
+    pub points: Vec<[f32; 4]>,
+    pub groups: Vec<RibbonGroup>,
+}
+
+/// HAIR10b: one group's points `start..end` of [`Ribbons::points`] and its
+/// world origin (the translation of its world rows).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RibbonGroup {
+    pub start: u32,
+    pub end: u32,
+    pub origin: [f32; 3],
+}
+
+/// HAIR10b: how near a drawn ped row's world origin must lie to a group's
+/// (metres) for the group to be drawn (`XNW_HAIR_RIBBON_REACH` in cm; default 50).
+pub fn ribbon_reach() -> f32 {
+    static R: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| std::env::var("XNW_HAIR_RIBBON_REACH").ok().and_then(|v| v.trim().parse::<f32>().ok()).map_or(0.5, |cm| cm / 100.0));
+    *R
+}
+
+/// HAIR10b: the points of the groups of `r` whose ped our pass draws: a
+/// row of `peds` (the world origins of the ped rows drawn this frame) lies
+/// within `reach` of the group's origin. Into `out` (cleared); returns
+/// (groups kept, groups dropped) and each group's nearest row distance.
+pub fn ribbons_near(r: &Ribbons, peds: &[[f32; 3]], reach: f32, out: &mut Vec<[f32; 4]>) -> (usize, usize, Vec<f32>) {
+    out.clear();
+    let (mut kept, mut dropped, mut near) = (0, 0, Vec::with_capacity(r.groups.len()));
+    for g in &r.groups {
+        let d = peds.iter().map(|p| (0..3).map(|k| (p[k] - g.origin[k]) * (p[k] - g.origin[k])).sum::<f32>()).fold(f32::INFINITY, f32::min).sqrt();
+        near.push(d);
+        match r.points.get(g.start as usize..g.end as usize) {
+            Some(p) if d <= reach => {
+                out.extend_from_slice(p);
+                kept += 1;
+            }
+            _ => dropped += 1,
+        }
+    }
+    (kept, dropped, near)
+}
+
+/// HAIR11: a group record's (body hair, cut length). Body hair (arm, chest,
+/// legs): record +0x50 bit 9 clear (pk8a f1027/f1031: the three 0x479
+/// groups, asset +0x50 0x443, are the only ones of 36 with it clear;
+/// scalp 0x60x-0x76c, face 0x601-0x679) [V the split, I the meaning]. Cut
+/// length: +0x11c high f16, the most `CS_InterpolateStrands` lets a strand
+/// grow (length = min(guide length, lerp(lo, hi, cut map g)), cb2a35e9,
+/// HAIR3); body 3.1-3.8 cm, face 0.4-2.5 cm, scalp 6-47 cm on pk8a.
+pub fn group_kind(rec: &[u8]) -> (bool, f32) {
+    (u32_at(rec, 0x50) & 0x200 == 0, f16((u32_at(rec, 0x11c) >> 16) as u16))
+}
+
+/// HAIR11: cuts posed guide `g` (root first) at arc length `len` (the
+/// last point moved onto the cut); true if it was shorter for it. `len`
+/// not positive: unchanged.
+pub fn cut_guide(g: &mut Vec<[f32; 3]>, len: f32) -> bool {
+    if !(len > 0.0) {
+        return false;
+    }
+    let mut run = 0.0;
+    for k in 1..g.len() {
+        let (a, b) = (g[k - 1], g[k]);
+        let d = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2) + (b[2] - a[2]).powi(2)).sqrt();
+        if run + d > len {
+            let t = if d > 0.0 { (len - run) / d } else { 0.0 };
+            g[k] = std::array::from_fn(|i| a[i] + (b[i] - a[i]) * t);
+            g.truncate(k + 1);
+            return true;
+        }
+        run += d;
+    }
+    false
+}
+
+/// HAIR11: a guide's arc length.
+pub fn guide_length(g: &[[f32; 3]]) -> f32 {
+    g.windows(2).map(|w| ((w[1][0] - w[0][0]).powi(2) + (w[1][1] - w[0][1]).powi(2) + (w[1][2] - w[0][2]).powi(2)).sqrt()).sum()
+}
+
+/// HAIR11: moves each point of guide `g` by `tip` times the square of its
+/// share of the way from root to tip (the root stays, the tip moves by `tip`).
+pub fn sway_guide(g: &mut [[f32; 3]], tip: [f32; 3]) {
+    let n = g.len();
+    if n < 2 {
+        return;
+    }
+    for (k, p) in g.iter_mut().enumerate().skip(1) {
+        let s = k as f32 / (n - 1) as f32;
+        for i in 0..3 {
+            p[i] += tip[i] * s * s;
+        }
+    }
+}
+
+/// HAIR10: appends one posed guide (`points`, root first) to `out` with
+/// half width `half` at the root, tapering to a third of it at the tip.
+pub fn push_ribbon(out: &mut Vec<[f32; 4]>, points: &[[f32; 3]], half: f32) {
+    let n = points.len();
+    if n < 2 {
+        return;
+    }
+    for (k, p) in points.iter().enumerate() {
+        let t = k as f32 / (n - 1) as f32;
+        let w = (half * (1.0 - 0.67 * t)).max(1e-5);
+        out.push([p[0], p[1], p[2], if k + 1 == n { -w } else { w }]);
+    }
+}
+
+/// HAIR10: the ribbon program. Vertex v: segment v / 6 from point s to
+/// s + 1, two triangles, each end pushed sideways by its half width along
+/// cross(segment, eye to point) (camera-relative: the eye is the origin),
+/// so the ribbon faces the camera; a guide's last point starts no segment
+/// (outside the clip volume). A flat colour, depth tested GREATER_EQUAL
+/// against our pass's depth (reverse depth) without writing it.
+pub const RIBBON_SHADER: &str = r#"
+#define RS "RootConstants(num32BitConstants=20, b0), SRV(t0)"
+cbuffer K : register(b0) { row_major float4x4 vp; float4 colour; };
+StructuredBuffer<float4> pts : register(t0);
+[RootSignature(RS)]
+float4 vs(uint v : SV_VertexID) : SV_Position {
+    static const float2 corner[6] = { float2(0, -1), float2(0, 1), float2(1, 1), float2(0, -1), float2(1, 1), float2(1, -1) };
+    uint s = v / 6;
+    float4 a = pts[s];
+    if (a.w < 0) return float4(2, 2, 2, 1);
+    float4 b = pts[s + 1];
+    float3 d = b.xyz - a.xyz;
+    float3 ca = cross(d, a.xyz), cb = cross(d, b.xyz);
+    float la = dot(ca, ca), lb = dot(cb, cb);
+    if (la < 1e-20 || lb < 1e-20) return float4(2, 2, 2, 1);
+    float2 c = corner[v % 6];
+    float3 p = c.x == 0 ? a.xyz + ca * rsqrt(la) * a.w * c.y : b.xyz + cb * rsqrt(lb) * abs(b.w) * c.y;
+    return mul(float4(p, 1), vp);
+}
+[RootSignature(RS)]
+float4 ps() : SV_Target { return colour; }
+"#;
+
+/// HAIR10: the ribbons' colour (a dark hair brown; HAIR6's strand pixels are 96/64/40).
+pub const RIBBON_COLOUR: [f32; 4] = [58.0 / 255.0, 40.0 / 255.0, 28.0 / 255.0, 1.0];
+
 /// A frame's strand draws, for the census line.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Census {
@@ -286,6 +515,55 @@ float4 vs(uint v : SV_VertexID) : SV_Position {
 float4 ps() : SV_Target { return float4(96.0 / 255, 64.0 / 255, 40.0 / 255, 1); }
 "#;
 
+/// HAIR7: the strand draws' depth left on the device (no readback): the
+/// nearest strand per pixel (reverse depth, 0 where none drew) as `width` x
+/// `height` floats, rows `pitch` floats apart, in a default-heap buffer in
+/// the common state (the list thread's submission has ended). Our pass
+/// draws it with [`HAIR_DEPTH_SHADER`].
+pub struct StrandDepth {
+    pub buffer: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    pub width: u32,
+    pub height: u32,
+    pub pitch: u32,
+}
+
+// SAFETY: D3D12 objects are free-threaded; the buffer is only read after its writer's fence.
+unsafe impl Send for StrandDepth {}
+unsafe impl Sync for StrandDepth {}
+
+impl std::fmt::Debug for StrandDepth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "StrandDepth({}x{})", self.width, self.height)
+    }
+}
+
+/// HAIR7: [`StrandDepth`] over our picture: one full-screen triangle; a
+/// pixel a strand covers gets hair brown at the strand's depth, tested
+/// GREATER_EQUAL against our pass's depth without writing it, as
+/// [`HAIR_SHADER`]'s quads (the same pixels, the same test).
+pub const HAIR_DEPTH_SHADER: &str = r#"
+#define RS "RootConstants(num32BitConstants=4, b0), SRV(t0)"
+cbuffer Size : register(b0) { uint width; uint height; uint pitch; uint pad; };
+StructuredBuffer<float> depth : register(t0);
+[RootSignature(RS)]
+float4 vs(uint v : SV_VertexID) : SV_Position {
+    float2 uv = float2((v << 1) & 2, v & 2);
+    return float4(uv.x * 2 - 1, 1 - uv.y * 2, 0, 1);
+}
+struct Out { float4 c : SV_Target; float z : SV_Depth; };
+[RootSignature(RS)]
+Out ps(float4 p : SV_Position) {
+    uint2 q = uint2(p.xy);
+    if (q.x >= width || q.y >= height) discard;
+    float z = depth[q.y * pitch + q.x];
+    if (z == 0) discard;
+    Out o;
+    o.c = float4(96.0 / 255, 64.0 / 255, 40.0 / 255, 1);
+    o.z = z;
+    return o;
+}
+"#;
+
 /// Our strand pixel pipeline and the upload buffers of the frames in flight.
 pub struct HairPass {
     root: windows::Win32::Graphics::Direct3D12::ID3D12RootSignature,
@@ -294,6 +572,21 @@ pub struct HairPass {
     bufs: std::collections::VecDeque<windows::Win32::Graphics::Direct3D12::ID3D12Resource>,
     /// Pixels drawn by the last record.
     pub drawn: usize,
+    /// HAIR7: the depth composite ([`HAIR_DEPTH_SHADER`]) and the strand
+    /// depths of the frames in flight (the oldest goes when a fourth comes).
+    depth_root: windows::Win32::Graphics::Direct3D12::ID3D12RootSignature,
+    depth_pso: windows::Win32::Graphics::Direct3D12::ID3D12PipelineState,
+    depths: std::collections::VecDeque<std::sync::Arc<StrandDepth>>,
+    /// HAIR10: the ribbon pipeline ([`RIBBON_SHADER`]) and its upload
+    /// buffers of the last frames (with their bytes; the oldest is used
+    /// again when a fourth comes and it is long enough).
+    ribbon_root: windows::Win32::Graphics::Direct3D12::ID3D12RootSignature,
+    ribbon_pso: windows::Win32::Graphics::Direct3D12::ID3D12PipelineState,
+    ribbon_bufs: std::collections::VecDeque<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u64)>,
+    /// HAIR10: ribbon segments drawn by the last record.
+    pub ribbons: usize,
+    /// HAIR10b: the points of the groups whose ped is drawn (reused).
+    pub kept: Vec<[f32; 4]>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; used by its pass's owner.
@@ -309,8 +602,88 @@ impl HairPass {
             // Depth GREATER_EQUAL (7), no write.
             let state = super::RenderState { depth_enable: true, depth_write: false, depth_func: 7, ..Default::default() };
             let pso = super::pipeline_state_with(device, &root, &vs, &ps, &state, &[]).map_err(e)?;
-            Ok(HairPass { root, pso, bufs: std::collections::VecDeque::new(), drawn: 0 })
+            let (dvs, dps) = (super::compile_source(HAIR_DEPTH_SHADER, c"vs", c"vs_5_1")?, super::compile_source(HAIR_DEPTH_SHADER, c"ps", c"ps_5_1")?);
+            let depth_root: windows::Win32::Graphics::Direct3D12::ID3D12RootSignature = device.CreateRootSignature(0, super::blob_bytes(&dvs)).map_err(e)?;
+            let depth_pso = super::pipeline_state_with(device, &depth_root, &dvs, &dps, &state, &[]).map_err(e)?;
+            let (rvs, rps) = (super::compile_source(RIBBON_SHADER, c"vs", c"vs_5_1")?, super::compile_source(RIBBON_SHADER, c"ps", c"ps_5_1")?);
+            let ribbon_root: windows::Win32::Graphics::Direct3D12::ID3D12RootSignature = device.CreateRootSignature(0, super::blob_bytes(&rvs)).map_err(e)?;
+            let ribbon_pso = super::pipeline_state_with(device, &ribbon_root, &rvs, &rps, &state, &[]).map_err(e)?;
+            Ok(HairPass {
+                root,
+                pso,
+                bufs: std::collections::VecDeque::new(),
+                drawn: 0,
+                depth_root,
+                depth_pso,
+                depths: std::collections::VecDeque::new(),
+                ribbon_root,
+                ribbon_pso,
+                ribbon_bufs: std::collections::VecDeque::new(),
+                ribbons: 0,
+                kept: Vec::new(),
+            })
         }
+    }
+
+    /// HAIR7: records the strand depth `d` on `l` (open, our colour and depth
+    /// targets bound, of `d`'s size); nothing is read back.
+    pub fn record_depth(&mut self, l: &windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList, d: &std::sync::Arc<StrandDepth>) {
+        let k = [d.width, d.height, d.pitch, 0];
+        // SAFETY: an open list and live objects; `d` is kept for the frames in flight.
+        unsafe {
+            l.SetGraphicsRootSignature(&self.depth_root);
+            l.SetPipelineState(&self.depth_pso);
+            l.SetGraphicsRoot32BitConstants(0, 4, k.as_ptr().cast(), 0);
+            l.SetGraphicsRootShaderResourceView(1, d.buffer.GetGPUVirtualAddress());
+            l.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            l.DrawInstanced(3, 1, 0, 0);
+        }
+        self.depths.push_back(d.clone());
+        while self.depths.len() > 3 {
+            self.depths.pop_front();
+        }
+        self.drawn = 1;
+    }
+
+    /// HAIR10: records the guide ribbons `points` ([`Ribbons`]) on `l` (open,
+    /// our colour and depth targets bound), camera-relative positions times
+    /// `vp` (our camera's camera-relative view-projection, row vectors).
+    pub fn record_ribbons(&mut self, device: &windows::Win32::Graphics::Direct3D12::ID3D12Device, l: &windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList, points: &[[f32; 4]], vp: &[f32; 16]) -> Result<(), String> {
+        use windows::Win32::Graphics::Direct3D12::*;
+        self.ribbons = 0;
+        if points.len() < 2 {
+            return Ok(());
+        }
+        let bytes = (points.len() * 16) as u64;
+        let reuse = if self.ribbon_bufs.len() >= 3 { self.ribbon_bufs.pop_front().filter(|b| b.1 >= bytes) } else { None };
+        let (buf, cap) = match reuse {
+            Some(b) => b,
+            None => {
+                let cap = bytes.next_power_of_two().max(64 << 10);
+                (super::bridge::buffer(device, cap, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ)?, cap)
+            }
+        };
+        let mut k = [0u32; 20];
+        for (i, v) in vp.iter().chain(RIBBON_COLOUR.iter()).enumerate() {
+            k[i] = v.to_bits();
+        }
+        // SAFETY: a mapped upload buffer of at least `bytes`; an open list and our live objects.
+        unsafe {
+            let mut to = std::ptr::null_mut();
+            buf.Map(0, None, Some(&mut to)).map_err(|e| e.to_string())?;
+            std::ptr::copy_nonoverlapping(points.as_ptr().cast::<u8>(), to.cast::<u8>(), bytes as usize);
+            buf.Unmap(0, None);
+            l.SetGraphicsRootSignature(&self.ribbon_root);
+            l.SetPipelineState(&self.ribbon_pso);
+            l.SetGraphicsRoot32BitConstants(0, 20, k.as_ptr().cast(), 0);
+            l.SetGraphicsRootShaderResourceView(1, buf.GetGPUVirtualAddress());
+            l.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            // The last point starts no segment: points - 1 segments of 6 vertices.
+            l.DrawInstanced(6 * (points.len() as u32 - 1), 1, 0, 0);
+        }
+        self.ribbon_bufs.push_back((buf, cap));
+        self.ribbons = points.iter().filter(|p| p[3] > 0.0).count();
+        Ok(())
     }
 
     /// Records `pixels` on `l` (open, our colour and depth targets bound).
@@ -491,6 +864,54 @@ mod tests {
         assert!(outs[0][0x4c..].iter().all(|b| *b == 0), "one guide only");
     }
 
+    /// HAIR10: [`pose_guide`] on [`guide_case`]: the root is M p (the "now"
+    /// half of the hand sum above), the second point (rest 0, 0, 0) the
+    /// weighted translations 0.75 (10, 0, 0); then the world rows.
+    #[test]
+    fn pose_guide_made_up_case() {
+        let (_, asset, remap, palette) = guide_case();
+        let id = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let window = &palette[48 * 10..];
+        let mut out = Vec::new();
+        assert!(pose_guide(&asset, &remap, 1, window, &id, 0, &mut out));
+        assert_eq!(out.len(), 2);
+        assert!(near3(out[0], [8.75, 2.5, 0.625]) && near3(out[1], [7.5, 0.0, 0.0]), "{out:?}");
+        let moved = [1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, -2.0];
+        out.clear();
+        assert!(pose_guide(&asset, &remap, 1, window, &moved, 0, &mut out));
+        assert!(near3(out[0], [9.75, 2.5, -1.375]), "{out:?}");
+        assert!(!pose_guide(&asset, &remap, 1, window, &id, 1, &mut out), "past the guide count");
+        assert!(!pose_guide(&asset, &remap, 1, &window[..48 * 6], &id, 0, &mut out), "bone 6 past a window of 6");
+        assert_eq!(out.len(), 2, "nothing pushed on a refusal");
+        assert_eq!(guide_spacing(&asset), 0.0, "one guide");
+    }
+
+    #[test]
+    fn ribbon_points_taper_and_end() {
+        let mut r = Vec::new();
+        push_ribbon(&mut r, &[[0.0; 3], [0.0, 0.0, 1.0], [0.0, 0.0, 2.0]], 0.01);
+        push_ribbon(&mut r, &[[1.0; 3]], 0.01);
+        assert_eq!(r.len(), 3, "a one-point guide adds nothing");
+        assert!((r[0][3] - 0.01).abs() < 1e-7 && r[1][3] > 0.0 && r[2][3] < 0.0 && (r[2][3] + 0.0033).abs() < 1e-4, "{r:?}");
+        assert!(ribbon_switch_on("gpucull=on,hairribbon=on") && !ribbon_switch_on("hair=on") && !ribbon_switch_on("hairribbon=off"));
+    }
+
+    /// HAIR10b: a group is kept only near a drawn ped row.
+    #[test]
+    fn ribbons_only_near_drawn_peds() {
+        let r = Ribbons {
+            points: vec![[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, -1.0], [5.0, 0.0, 0.0, 1.0], [5.0, 0.0, 1.0, -1.0]],
+            groups: vec![RibbonGroup { start: 0, end: 2, origin: [0.0; 3] }, RibbonGroup { start: 2, end: 4, origin: [5.0, 0.0, 0.0] }],
+        };
+        let mut out = Vec::new();
+        let (k, d, near) = ribbons_near(&r, &[[5.1, 0.0, 0.0]], 0.5, &mut out);
+        assert_eq!((k, d), (1, 1));
+        assert_eq!(out, r.points[2..4].to_vec());
+        assert!((near[1] - 0.1).abs() < 1e-5 && (near[0] - 5.1).abs() < 1e-5);
+        assert_eq!(ribbons_near(&r, &[], 0.5, &mut out).0, 0, "no ped drawn: no hair");
+        assert!(out.is_empty());
+    }
+
     #[test]
     fn hair_switch_default_off() {
         assert!(!switch_on(""));
@@ -498,6 +919,26 @@ mod tests {
         assert!(switch_on("gpucull=on, hair=on"));
         assert!(!switch_on("hair=on,hair=off"));
         assert!(!switch_on("hairx=on"));
+    }
+
+    #[test]
+    fn guides_cut_sway_and_kind() {
+        let mut g = vec![[0.0, 0.0, 0.0], [0.0, 0.0, 0.02], [0.0, 0.0, 0.04], [0.0, 0.0, 0.06]];
+        assert!(!cut_guide(&mut g.clone(), 0.1), "shorter than the cut");
+        assert!(!cut_guide(&mut g.clone(), 0.0), "no cut");
+        assert!(cut_guide(&mut g, 0.03));
+        assert_eq!(g.len(), 3);
+        assert!((g[2][2] - 0.03).abs() < 1e-6 && (guide_length(&g) - 0.03).abs() < 1e-6);
+        sway_guide(&mut g, [0.01, 0.0, 0.0]);
+        assert_eq!(g[0], [0.0, 0.0, 0.0]);
+        assert!((g[1][0] - 0.0025).abs() < 1e-7 && (g[2][0] - 0.01).abs() < 1e-7);
+        let mut rec = vec![0u8; GROUP_BYTES];
+        rec[0x50..0x54].copy_from_slice(&0x479u32.to_le_bytes());
+        rec[0x11c..0x120].copy_from_slice(&0x2860_0000u32.to_le_bytes());
+        let (body, cut) = group_kind(&rec);
+        assert!(body && (cut - 0.0342).abs() < 1e-3, "{cut}");
+        rec[0x50..0x54].copy_from_slice(&0x709u32.to_le_bytes());
+        assert!(!group_kind(&rec).0, "scalp");
     }
 
     #[test]

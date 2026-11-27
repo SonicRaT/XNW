@@ -580,6 +580,37 @@ pub fn reading(at: usize, len: usize) {
     }
 }
 
+/// As [`reading`] for many small ranges `(at, len)`: one look at the pair
+/// and the guards for all (the texture table's descriptor records,
+/// about 1,240 a frame, took both locks per record).
+pub fn reading_all(ranges: &[(usize, usize)]) {
+    if ranges.is_empty() {
+        return;
+    }
+    let pair = *PAIR.lock().unwrap_or_else(|e| e.into_inner());
+    let mut tags: Vec<(usize, u32)> = {
+        let g = guards();
+        if g.trapped.is_empty() {
+            return;
+        }
+        let mut tags = Vec::new();
+        for &(at, len) in ranges {
+            let end = at.saturating_add(len);
+            let d = match pair {
+                Some((cpu, gpu, n)) if at >= gpu && end <= gpu + n => gpu - cpu,
+                _ => 0,
+            };
+            tags.extend(g.trapped.range((at - d) / BLOCK..(end - d).div_ceil(BLOCK)).map(|(&b, &t)| (b, t)));
+        }
+        tags
+    };
+    tags.sort_unstable();
+    tags.dedup();
+    for (block, tag) in tags {
+        settle(block, tag, false, false);
+    }
+}
+
 /// Reads and writes the traps of `tag` caught, and their sites (title rvas,
 /// or addresses outside the title).
 pub fn read_trap_stats(tag: u32) -> (u64, u64, Vec<u64>) {

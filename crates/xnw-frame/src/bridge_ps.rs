@@ -373,11 +373,24 @@ impl Source for PackSource<'_> {
             return Some(Arc::new(b));
         }
         // The capture cut it: the list's copy of the row's vertex buffer.
-        self.vb.as_ref().filter(|(at, _)| addr == *at || addr == *at + 0x4_0000_0000).map(|v| v.1.clone())
+        self.vb.as_ref().filter(|(at, _)| addr == *at || addr == xnw_core::pair::pair().to_gpu(*at)).map(|v| v.1.clone())
     }
 
     fn words(&self) -> Option<[u32; WORDS]> {
         self.pack.draw_words(self.sink)?.words.ok()
+    }
+
+    /// LAMP1: the sink's ARENA record (the mask words at arena base +
+    /// rec+0x74; the arena base is slot 86's view: pk7d f1067 0x19540000).
+    fn title_words(&self, at: u64, len: usize) -> Option<Vec<u8>> {
+        use xnw_formats::framepack::kind;
+        let base = self.table(0, bridged::WORDS_SLOT)?.addr;
+        let r = self.pack.data.refs_of(self.sink).find(|r| r.kind == kind::ARENA && r.addr == base + at)?;
+        let mut b = self.pack.blob(r.hash)?;
+        (b.len() >= len).then(|| {
+            b.truncate(len);
+            b
+        })
     }
 
     fn heap(&self, index: u32) -> Option<(u64, SrcView)> {
@@ -398,6 +411,18 @@ impl Source for PackSource<'_> {
 /// on its list ([`xnw_world::bridged::record`]), textures from our texture
 /// table by handle. Prints both timings; `--out` writes the sheet (our
 /// pass alone above, with the title's rows below).
+///
+/// REFDIFF: `--bridgeps-alone`: the list keeps only the taken rows (as
+/// upstream's `VICTORY_ONLY_PIPELINES` reference frames draw only them),
+/// and the bridged frame is drawn over nothing of ours (`LAB_VIEW 8`: our
+/// rows write no colour and no depth). `--bridgeps-dump <dir>`: the
+/// targets as raw files (`w h format pitch`, four u32, then the rows, as
+/// upstream's `ref5.rs save_raw`): `ours-base.raw` (our pass, albedo view),
+/// `ours-gbuf-albedo.raw` / `ours-gbuf-normal.raw` (with `gbuf=on`),
+/// `ours-id.raw` (row index + 1 in RGB, the lab's pick), `theirs-t<N>.raw`
+/// (the title's target N, `XNW_BRIDGE_TARGET`), and `rows.tsv`; with
+/// `ourlight=metal` `ours-lit-material.raw` (the metal target), with
+/// `ournormals=title` `ours-lit-normal.raw` (the normals the lighting pass reads).
 pub fn bridgeps_cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, pass: &mut Pass, wanted: &[u32]) -> Result<(), String> {
     xnw_world::bridge::title_programs_here(host).map_err(|e| format!("bridgeps: {e}"))?;
     let (mut list, geoms) = load_list(dir)?;
@@ -438,7 +463,7 @@ pub fn bridgeps_cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, pas
         let key = (ms, ps);
         if !bridged::cache().asked(key) {
             let (Some(msc), Some(psc)) = (pack.blob(ms), pack.blob(ps)) else { continue };
-            bridged::cache().ask(key, msc, psc, &host.device, &host.caps, true);
+            bridged::cache().ask(key, msc, psc, &[], &host.device, &host.caps, true);
         }
         let Some(built) = bridged::cache().get(key) else { continue };
         // `--bridgeps-inputs`: which root views each program reads (a root
@@ -451,9 +476,30 @@ pub fn bridgeps_cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, pas
         let vb = geoms.get(&row.geom).map(|g| (row.geom.vb_at, vbs.entry(row.geom).or_insert_with(|| Arc::new(g.0.clone())).clone()));
         let mut o = bridged::take(&PackSource::new(&pack, sink, vb, &shared), key, &built.used);
         o.set_groups(row.geom.mesh_at);
+        // The row's identity as the live list gives it (steady inputs, held bindings on `--bridgeps-repeat`).
+        o.ident = bridged::ident(&row.geom, row.stage);
         taken.push((k as u32, o));
     }
     let t_take = t1.elapsed().as_secs_f64();
+    let dump = args.iter().position(|a| a == "--bridgeps-dump").and_then(|i| args.get(i + 1)).map(std::path::PathBuf::from);
+    if args.iter().any(|a| a == "--bridgeps-alone") {
+        let keep: Vec<String> = taken.iter().map(|(k, _)| k.to_string()).collect();
+        let at: HashMap<u32, u32> = taken.iter().enumerate().map(|(i, (k, _))| (*k, i as u32)).collect();
+        crate::replay::list_options(&["--only".to_string(), keep.join(",")], &mut list);
+        for (k, _) in &mut taken {
+            *k = at[&*k];
+        }
+        println!("bridgeps: alone: {} rows kept of the list", list.draws.len());
+    }
+    if let Some(d) = &dump {
+        std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+        let mut lines = vec!["row\tstage\teffect\tgeometry\tmesh\tpixel".to_string()];
+        for (k, o) in &taken {
+            let r = &list.draws[*k as usize];
+            lines.push(format!("{k}\t{}\t{:#x}\t{:#x}\t{:08x}\t{:08x}", r.stage, r.effect, r.geom.hash, o.key.0 >> 96, o.key.1 >> 96));
+        }
+        std::fs::write(d.join("rows.tsv"), lines.join("\n") + "\n").map_err(|e| e.to_string())?;
+    }
     // `--bridgeps-inputs`: the rows' buffer inputs by (root, slot): rows, the
     // largest, distinct bytes as the capture holds them per sink (before
     // the frame shares them by address) and as the rows get them.
@@ -507,6 +553,33 @@ pub fn bridgeps_cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, pas
             println!("bridgeps words: word {k}: texture {}, other view {}, no view {} [{}]", n[0], n[1], n[2], top.join(", "));
         }
     }
+    // REFFIX: each texture handle of the taken rows, by why the provider gives it texels or none.
+    {
+        let views = pack.views_by_handle();
+        let mut why: std::collections::BTreeMap<String, (u32, Vec<u64>)> = Default::default();
+        for (_, o) in &taken {
+            for h in o.handles() {
+                let step = pack.texel_why(&views, h);
+                // Without texels: the capture's reason for the row (framepack `reason`).
+                let step = match views.get(&h).and_then(|v| pack.texture(v)) {
+                    Some(t) if step == "no texels" => format!("{step} (row reason {})", t.reason),
+                    _ => step.to_string(),
+                };
+                let e = why.entry(step).or_default();
+                e.0 += 1;
+                if e.1.len() < 4 {
+                    e.1.push(h);
+                }
+            }
+        }
+        let show = |h: &u64| match views.get(h) {
+            Some(v) => format!("{h:#x} {}x{} f{} at {:#x}+{:#x}", v.width, v.height, v.format, v.addr, v.bytes),
+            None => format!("{h:#x}"),
+        };
+        let w: Vec<String> = why.iter().map(|(k, (n, hs))| format!("{k} {n} (e.g. {})", hs.iter().map(show).collect::<Vec<_>>().join(", "))).collect();
+        let hint = if why.contains_key("origin unread") { " (origin unread: XNW_GAME_DRIVE unset or not the package)" } else { "" };
+        println!("bridgeps: texture slots by provider step: {}{hint}", w.join("; "));
+    }
     let n = taken.len();
     list.bridged = Some(Arc::new(bridged::Frame::new(taken)));
     // Our pass alone first, the rows' textures read in the same frame.
@@ -520,6 +593,25 @@ pub fn bridgeps_cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, pas
     let (st, ours) = r?;
     let t_ours = t0.elapsed().as_secs_f64();
     pass.bridge_warm = false;
+    if let Some(d) = &dump {
+        save_raw(&d.join("ours-base.raw"), pass.width, pass.height, 28, &ours)?;
+        if let Some(g) = pass.read_gbuf() {
+            let g = g?;
+            save_raw(&d.join("ours-gbuf-albedo.raw"), g.width, g.height, 29, &g.albedo)?;
+            save_raw(&d.join("ours-gbuf-normal.raw"), g.width, g.height, 28, &g.normal)?;
+        }
+        // The lab's pick, every pixel: an ID frame (each row writes its index + 1).
+        let sky = pass.sky;
+        (pass.sky, pass.id_mode) = (false, true);
+        let frame = list.frame;
+        list.frame = 1_000_001;
+        let r = pass.draw(&list, &mut decode, true).and_then(|_| pass.read_rgba());
+        (pass.sky, pass.id_mode, list.frame) = (sky, false, frame);
+        save_raw(&d.join("ours-id.raw"), pass.width, pass.height, 28, &r?)?;
+    }
+    if args.iter().any(|a| a == "--bridgeps-alone") {
+        pass.set_raw_shader(&format!("#define LAB_VIEW 8\n{RAW_SHADER}"))?;
+    }
     pass.bridge_on = true;
     // `--warm`: the bridged frame once first (bindings, kept inputs), its picture thrown away.
     if args.iter().any(|a| a == "--warm") {
@@ -541,6 +633,25 @@ pub fn bridgeps_cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, pas
     println!("  {}", crate::replay::watch_line("bridgeps bridged"));
     let theirs = r?;
     let t_with = t2.elapsed().as_secs_f64();
+    if let Some(d) = &dump {
+        save_raw(&d.join(format!("theirs-t{}.raw", bridged::shown_target())), pass.width, pass.height, 28, &theirs)?;
+        // NORM1, `ourlight=metal`: the metal target (the rows' target 2 RGB, alpha 0 where one wrote);
+        // `ournormals=title`: the normals the lighting pass reads (the rows' target 1 there, our RT1 elsewhere).
+        if let Some(r) = pass.read_lit() {
+            let (metal, normal) = r?;
+            save_raw(&d.join("ours-lit-material.raw"), pass.width, pass.height, 28, &metal)?;
+            if let (Some(tn), Some(g)) = (normal, pass.read_gbuf()) {
+                let mut n = g?.normal;
+                for ((o, t), m) in n.chunks_exact_mut(4).zip(tn.chunks_exact(4)).zip(metal.chunks_exact(4)) {
+                    if m[3] < 128 && t[1..].iter().any(|&b| b != 0) {
+                        o.copy_from_slice(t);
+                    }
+                }
+                save_raw(&d.join("ours-lit-normal.raw"), pass.width, pass.height, 28, &n)?;
+            }
+        }
+        println!("bridgeps: targets -> {}", d.display());
+    }
     // `--bridgeps-repeat N`: the same frame N more times (the inputs again
     // as the same bytes, as the live tap gives kept views): each frame's
     // record cost, and whether its picture is the first one's.
@@ -553,7 +664,7 @@ pub fn bridgeps_cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, pas
             let again = r?;
             let differ = theirs.chunks_exact(4).zip(again.chunks_exact(4)).filter(|(a, b)| a[..3] != b[..3]).count();
             let s = &pass.bridge_stats;
-            println!("bridgeps repeat {k}: record {:.2} ms (bindings {:.2}, uploads {:.2}, views {:.2}, list {:.2}); uploaded {:.1} MiB, kept {:.1} MiB ({:.1} MiB new); {differ} pixels differ from the first; {}", s.ms, s.parts[0], s.parts[1], s.parts[2], s.parts[3], s.bytes as f64 / f64::from(1 << 20), s.kept as f64 / f64::from(1 << 20), s.kept_new as f64 / f64::from(1 << 20), bridged::blocks_text(s));
+            println!("bridgeps repeat {k}: record {:.2} ms (bindings {:.2} [bind {:.2}, place {:.2}: in place {:.2}, small {:.2}, kept {:.2}; held {:?}], uploads {:.2}, views {:.2}, list {:.2}); uploaded {:.1} MiB, kept {:.1} MiB ({:.1} MiB new); {differ} pixels differ from the first; views by part [{}]; {}", s.ms, s.parts[0], s.bind_ms[0], s.bind_ms[1], s.bind_ms[2], s.bind_ms[3], s.bind_ms[4], s.held, s.parts[1], s.parts[2], s.parts[3], s.bytes as f64 / f64::from(1 << 20), s.kept as f64 / f64::from(1 << 20), s.kept_new as f64 / f64::from(1 << 20), bridged::VIEW_PARTS.iter().zip(s.view_ms).map(|(w, n)| format!("{w} {n:.2}")).collect::<Vec<_>>().join(", "), bridged::blocks_text(s));
         }
     }
     let changed = ours.chunks_exact(4).zip(theirs.chunks_exact(4)).filter(|(a, b)| a[..3] != b[..3]).count();
@@ -571,6 +682,16 @@ pub fn bridgeps_cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, pas
         println!("bridgeps: sheet (ours above, with the title's rows below) -> {out}");
     }
     Ok(())
+}
+
+/// A target as upstream's `ref5.rs save_raw` writes it: `w h format pitch`, then the rows.
+fn save_raw(path: &Path, w: u32, h: u32, format: u32, rgba: &[u8]) -> Result<(), String> {
+    let mut out = Vec::with_capacity(16 + rgba.len());
+    for v in [w, h, format, 4 * w] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out.extend_from_slice(rgba);
+    std::fs::write(path, out).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Rows by verdict, by lacking kind, and by pixel program.

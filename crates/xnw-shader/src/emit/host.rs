@@ -265,6 +265,17 @@ impl Host {
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
         }
+        // XNW (BND1): the confinement words (`b1` in HEAP_BOUNDS_SPACE,
+        // `Options::confine`), after the bounds: eight more per draw.
+        if stages.iter().any(|(s, _)| s.reads_confine()) {
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 1, RegisterSpace: super::HEAP_BOUNDS_SPACE, Num32BitValues: 8 },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
+        }
         (params, bounds)
     }
 

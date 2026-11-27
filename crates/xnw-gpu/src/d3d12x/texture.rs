@@ -97,6 +97,9 @@ pub(crate) struct Staging {
     /// [`NOT_PARTIAL`] otherwise.
     plain_from: std::sync::atomic::AtomicU32,
     plain_at: [AtomicU64; 2],
+    /// MOV1: a plane the kept Bink draw samples ([`note_movie_planes`]):
+    /// uploaded at every refresh ([`movie_fresh`]).
+    movie: std::sync::atomic::AtomicBool,
 }
 
 const NOT_PARTIAL: u32 = u32::MAX;
@@ -249,6 +252,13 @@ pub struct PassTexture {
     /// refresh]: 0 pack (or preload), 1 cached pages (or made ahead), 2 title
     /// memory (origin pages not cached), 3 title memory hashed/watched, 4 ?.
     pub source: usize,
+    /// [`for_pass_async`]: a read of the copy is with the reader (queued,
+    /// running, or finished and not yet taken by [`pass_finished`]): ask
+    /// again every frame until it is not.
+    pub flying: bool,
+    /// [`for_pass_async`]: this ask is the first since the resource's read
+    /// was taken with an upload (recorded this frame by the pass).
+    pub landed: bool,
 }
 
 pub struct PassUpload {
@@ -276,7 +286,7 @@ pub fn for_pass(resource: This, refresh: bool, room: &mut dyn FnMut(u64) -> bool
 /// and when no page arrived since, it is not refreshed (nor `room` charged).
 fn for_pass_with(resource: This, refresh: bool, room: &mut dyn FnMut(u64) -> bool, partial: bool) -> Option<PassTexture> {
     let copy = super::resource::host_copy(resource)?;
-    let mut out = PassTexture { copy, upload: None, first_mip: 0, ready: false, waiting: false, source: 4 };
+    let mut out = PassTexture { copy, upload: None, first_mip: 0, ready: false, waiting: false, source: 4, flying: false, landed: false };
     if is_host_written(resource) {
         out.ready = true; // the host GPU wrote it (a target): nothing to upload
         return Some(out);
@@ -425,26 +435,63 @@ pub fn exits_text() -> String {
 }
 
 // ---- Our pass's texture reads off the frame path (a cold
-// pack read inside our record step took 154 ms) ----
+// pack read inside our record step took 154 ms; new reads on the record
+// thread were 14 ms of a 47 ms record in a test run) ----
+//
+// The hand-over (PERF2). A refresh marks the host copy as holding its new
+// contents (`uploaded`, `pending`, `copy_from`) when it READS, on the reader
+// thread; the texels are on the GPU only once the pass has recorded the
+// upload. So between the two the copy's own state must not be believed:
+//  - a copy with a read queued, running or finished and not yet taken is
+//    "in flight": every ask for it (any resource that shares the copy) is
+//    answered as the pass saw it when the read was queued;
+//  - finished uploads are taken all at once by the pass at the start of its
+//    frame ([`pass_finished`]) and recorded whether or not a slot asks for
+//    them that frame; only then the copy leaves the flight set.
+// Before, the upload waited in a map for the same resource to ask again:
+// an ask that came while the reader was at work, or through another
+// resource of the same copy, saw "complete" and sampled a texture nothing
+// had been copied into, and a slot that then took the known path never
+// fetched the upload at all (black regions, tree crowns cut away by an
+// alpha of zero); results past 1024 were dropped with their texels.
 
 struct ReadJob {
     staging: Arc<Staging>,
+    /// The host copy read for (held: its address is the flight key).
+    copy: Arc<super::resource::HostTexture>,
     /// Keeps the title resource alive while the worker reads (a placed or
     /// live hold, moved in by the caller).
     _hold: Box<dyn Send>,
 }
 
+/// A read the worker finished, until the pass takes it.
 struct ReadDone {
+    key: usize,
+    staging: Arc<Staging>,
+    copy: Arc<super::resource::HostTexture>,
     upload: Option<host::Upload>,
     source: usize,
     at: (u32, u64),
 }
 
+/// What the pass may believe of the copies the reader works on.
+#[derive(Default)]
+struct Flight {
+    /// Host copy -> (ready, first mip) as the pass saw it when its read was
+    /// queued; there until the pass has taken the read's result.
+    copies: std::collections::HashMap<usize, (bool, u32)>,
+    /// Reads finished and not yet taken.
+    finished: Vec<ReadDone>,
+    /// Staging -> (source, an upload was recorded) of a read taken, for the
+    /// resource's next ask (cleared when it grows large: an ask without one
+    /// reads again and finds nothing new).
+    answers: std::collections::HashMap<usize, (usize, bool)>,
+}
+
 #[derive(Default)]
 struct Reader {
-    queue: std::sync::Mutex<std::collections::VecDeque<(usize, ReadJob)>>,
-    busy: std::sync::Mutex<std::collections::HashSet<usize>>,
-    done: std::sync::Mutex<std::collections::HashMap<usize, ReadDone>>,
+    queue: std::sync::Mutex<std::collections::VecDeque<ReadJob>>,
+    flight: std::sync::Mutex<Flight>,
     cv: std::sync::Condvar,
     read_us: std::sync::atomic::AtomicU64,
     reads: std::sync::atomic::AtomicU64,
@@ -464,9 +511,10 @@ fn reader() -> &'static Reader {
 }
 
 fn read_worker() {
+    xnw_core::win::helper_thread();
     let r = reader();
     loop {
-        let (key, job) = {
+        let job = {
             let mut q = r.queue.lock().unwrap_or_else(|e| e.into_inner());
             loop {
                 if let Some(j) = q.pop_front() {
@@ -483,16 +531,12 @@ fn read_worker() {
         let at = (job.staging.copy_from.load(Relaxed), job.staging.upload_base.load(Relaxed));
         let after = snap();
         let source = (0..4).find(|&i| after[i] != before[i]).unwrap_or(4);
-        drop(job);
+        let ReadJob { staging, copy, _hold } = job;
+        drop(_hold);
         r.read_us.fetch_add(t.elapsed().as_micros() as u64, Relaxed);
         r.reads.fetch_add(1, Relaxed);
-        let mut done = r.done.lock().unwrap_or_else(|e| e.into_inner());
-        if done.len() >= 1024 {
-            done.clear(); // results nobody took (slots gone): their buffers go back
-        }
-        done.insert(key, ReadDone { upload, source, at });
-        drop(done);
-        r.busy.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+        let key = Arc::as_ptr(&staging) as usize;
+        r.flight.lock().unwrap_or_else(|e| e.into_inner()).finished.push(ReadDone { key, staging, copy, upload, source, at });
     }
 }
 
@@ -502,31 +546,68 @@ pub static PASS_COPY_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::
 /// (queued or reading, read and not yet taken, reads done, ms spent reading) of the pass's reader.
 pub fn pass_reader_counts() -> (usize, usize, u64, f64) {
     let r = reader();
-    let busy = r.busy.lock().map_or(0, |b| b.len());
-    let done = r.done.lock().map_or(0, |d| d.len());
-    (busy, done, r.reads.load(Relaxed), r.read_us.load(Relaxed) as f64 / 1e3)
+    let (flying, done) = r.flight.lock().map_or((0, 0), |f| (f.copies.len(), f.finished.len()));
+    (flying - done.min(flying), done, r.reads.load(Relaxed), r.read_us.load(Relaxed) as f64 / 1e3)
+}
+
+/// The reads the reader finished since the last call: each one's host copy,
+/// its upload and source ([`PassTexture::source`]). The pass calls this at the
+/// start of its frame, before any [`for_pass_async`], and records every
+/// upload on that frame's list ([`PassUpload::record`]) whether or not a slot
+/// asks for the texture: from here on the copy's state is the truth again.
+pub fn pass_finished() -> Vec<(Arc<super::resource::HostTexture>, PassUpload, usize)> {
+    let r = reader();
+    let mut f = r.flight.lock().unwrap_or_else(|e| e.into_inner());
+    let done = std::mem::take(&mut f.finished);
+    if f.answers.len() + done.len() > 4096 {
+        f.answers.clear();
+    }
+    let mut out = Vec::new();
+    for d in done {
+        f.copies.remove(&(Arc::as_ptr(&d.copy) as usize));
+        f.answers.insert(d.key, (d.source, d.upload.is_some()));
+        if let Some(upload) = d.upload {
+            d.staging.took.store(true, Relaxed);
+            out.push((d.copy, PassUpload { staging: d.staging, upload, at: Some(d.at) }, d.source));
+        }
+    }
+    out
 }
 
 /// [`for_pass`] with the read (pack, cached pages or title memory) on
 /// the pass's reader thread: a texture whose contents are due is queued (its
-/// budget charged now) and comes back with its upload at a later call; until
-/// then it is `waiting` (flat, or its older contents when it had some).
+/// budget charged now) and is `flying` until [`pass_finished`] has handed its
+/// upload to the pass; until then it is `waiting` (flat, or its older
+/// contents when it had some). The upload is never returned here.
 /// `hold` keeps the title resource alive while it is read.
 pub fn for_pass_async(resource: This, hold: Box<dyn Send>, room: &mut dyn FnMut(u64) -> bool) -> Option<PassTexture> {
     let copy = super::resource::host_copy(resource)?;
-    let mut out = PassTexture { copy, upload: None, first_mip: 0, ready: false, waiting: false, source: 4 };
+    let mut out = PassTexture { copy, upload: None, first_mip: 0, ready: false, waiting: false, source: 4, flying: false, landed: false };
     if is_host_written(resource) {
         out.ready = true;
         return Some(out);
     }
     let staging = staging(resource, &out.copy.texture)?;
     let key = Arc::as_ptr(&staging) as usize;
+    let flight_key = Arc::as_ptr(&out.copy) as usize;
     let r = reader();
     let partial = partial_ready();
     let holds = |s: &Staging, c: &super::resource::HostTexture| if partial { s.holds_from(c) } else { None };
-    let had = !out.copy.pending.load(Relaxed) && out.copy.uploaded.load(Relaxed) != 0;
-    if let Some(d) = r.done.lock().ok().and_then(|mut m| m.remove(&key)) {
-        out.source = d.source;
+    let answer = {
+        let mut f = r.flight.lock().unwrap_or_else(|e| e.into_inner());
+        // In flight (this resource's read or another's of the same copy):
+        // what the copy held before the read, whatever its state says now.
+        if let Some(&(ready, first_mip)) = f.copies.get(&flight_key) {
+            WAIT_EXITS[EX_ASYNC_BUSY].fetch_add(1, Relaxed);
+            (out.ready, out.first_mip, out.waiting, out.flying) = (ready, first_mip, true, true);
+            return Some(out);
+        }
+        f.answers.remove(&key)
+    };
+    if let Some((source, uploaded)) = answer {
+        // The read came back and its upload (if any) is on this frame's list.
+        out.source = source;
+        out.landed = uploaded;
         out.first_mip = staging.copy_from.load(Relaxed);
         let pending = out.copy.pending.load(Relaxed);
         let held = holds(&staging, &out.copy);
@@ -536,11 +617,13 @@ pub fn for_pass_async(resource: This, hold: Box<dyn Send>, room: &mut dyn FnMut(
         // As [`for_pass`]: an upload with no whole mip is not sampled.
         let withheld = staging.withheld(&out.copy);
         WITHHELD.fetch_add(u64::from(withheld), Relaxed);
-        out.ready = (d.upload.is_some() || !pending || held.is_some()) && !(withheld && held.is_none());
-        out.waiting = d.upload.is_none() && pending;
-        out.upload = d.upload.map(|upload| PassUpload { staging, upload, at: Some(d.at) });
+        out.ready = (uploaded || !pending || held.is_some()) && !(withheld && held.is_none());
+        out.waiting = !uploaded && pending;
         return Some(out);
     }
+    // Complete contents the pass recorded before (an origin copy's pages, or
+    // a title-memory upload this staging gave): sampled while it is read again.
+    let had = !out.copy.pending.load(Relaxed) && (out.copy.uploaded.load(Relaxed) != 0 || staging.took.load(Relaxed) && std::ptr::eq(staging.host.as_ptr(), Arc::as_ptr(&out.copy)));
     out.first_mip = staging.copy_from.load(Relaxed);
     let held = holds(&staging, &out.copy);
     if let Some(from) = held {
@@ -555,10 +638,6 @@ pub fn for_pass_async(resource: This, hold: Box<dyn Send>, room: &mut dyn FnMut(
     }
     out.waiting = true;
     out.ready = had || held.is_some();
-    if r.busy.lock().is_ok_and(|b| b.contains(&key)) {
-        WAIT_EXITS[EX_ASYNC_BUSY].fetch_add(1, Relaxed);
-        return Some(out);
-    }
     if !room(staging.bytes) {
         WAIT_EXITS[EX_BUDGET].fetch_add(1, Relaxed);
         WAIT_EXITS[EX_BUDGET_PENDING].fetch_add(u64::from(out.copy.pending.load(Relaxed)), Relaxed);
@@ -570,10 +649,11 @@ pub fn for_pass_async(resource: This, hold: Box<dyn Send>, room: &mut dyn FnMut(
         WAIT_EXITS[EX_ASYNC_BUSY].fetch_add(1, Relaxed);
         return Some(out);
     }
-    r.busy.lock().unwrap_or_else(|e| e.into_inner()).insert(key);
-    q.push_back((key, ReadJob { staging, _hold: hold }));
+    r.flight.lock().unwrap_or_else(|e| e.into_inner()).copies.insert(flight_key, (out.ready, out.first_mip));
+    q.push_back(ReadJob { staging, copy: out.copy.clone(), _hold: hold });
     drop(q);
     r.cv.notify_one();
+    out.flying = true;
     Some(out)
 }
 
@@ -601,7 +681,57 @@ pub(crate) fn pending(resource: This) -> bool {
 /// the frame statistics (`XNW_FRAME_STATS`).
 pub(crate) static DETILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// MOV1: Bink movie planes (the textures the kept Bink draw samples). Run
+/// 248 (80-87 s, 102-107 s): the presents alternate between the movie and
+/// its first frame (frames 3300 and 3450 saved), with the decoder's plane
+/// set (`flicker frame ... plane`): one set's host copy stopped taking the
+/// decoder's frames. Such planes are uploaded at every refresh; the exits
+/// that would have kept the old copy are counted ([`movie_exits`]).
+/// `XNW_MOVIE_FRESH=0`: as before (the exits still counted).
+pub(crate) fn movie_fresh() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("XNW_MOVIE_FRESH").map_or(true, |v| v.trim() != "0"));
+    *ON
+}
+
+/// The exits a movie plane's refresh passed (forced: gate, watch) or took
+/// (`XNW_MOVIE_FRESH=0`: all; hash and origin are not taken when forced):
+/// once-a-frame gate, write watch said unwritten, hash unchanged, origin
+/// copy kept; and uploads.
+const MOVIE_GATE: usize = 0;
+const MOVIE_WATCH: usize = 1;
+const MOVIE_HASH: usize = 2;
+const MOVIE_ORIGIN: usize = 3;
+const MOVIE_UPLOADS: usize = 4;
+static MOVIE_EXITS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// MOV1: the kept Bink draw samples `resources` (title textures): their
+/// staging (made at their first refresh) is marked a movie plane.
+pub(crate) fn note_movie_planes(resources: &[usize]) {
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(map) = map.as_ref() else { return };
+    for r in resources {
+        if let Some(s) = map.get(r) {
+            s.movie.store(true, Relaxed);
+        }
+    }
+}
+
+/// MOV1: since the last call, refreshes of movie planes at each exit
+/// ([`MOVIE_EXITS`]: gate, watch, hash, origin) and their uploads.
+pub(crate) fn movie_exits() -> [u64; 5] {
+    std::array::from_fn(|i| MOVIE_EXITS[i].swap(0, Relaxed))
+}
+
 impl Staging {
+    /// MOV1: a movie plane at exit `exit`: counted; whether it goes on (forced).
+    fn forced(&self, exit: usize) -> bool {
+        if !self.movie.load(Relaxed) {
+            return false;
+        }
+        MOVIE_EXITS[exit].fetch_add(1, Relaxed);
+        movie_fresh()
+    }
+
     /// Detiles the texture memory into a pooled upload buffer if it changed
     /// since the last time (and is mapped at all): the buffer, to be copied
     /// into the host texture, if it did.
@@ -624,8 +754,10 @@ impl Staging {
         let viewed = self.viewed.swap(false, Relaxed);
         let frame = super::queue::presented() + 1;
         if refresh_by_view() && !viewed && self.refreshed.load(Relaxed) == frame {
-            REFRESH_COUNTS[2].fetch_add(1, Relaxed);
-            return (0, None);
+            if !self.forced(MOVIE_GATE) {
+                REFRESH_COUNTS[2].fetch_add(1, Relaxed);
+                return (0, None);
+            }
         }
         self.refreshed.store(frame, Relaxed);
         let (read, upload) = self.refresh_contents();
@@ -662,10 +794,16 @@ impl Staging {
             last.asked = *now;
             wrote
         });
-        if let Some(copy) = self.host.upgrade()
+        // MOV1: a Bink plane takes the plain way at every refresh.
+        let movie = self.movie.load(Relaxed) && movie_fresh();
+        if !movie
+            && let Some(copy) = self.host.upgrade()
             && let Some(key) = copy.origin.get().copied().or_else(|| self.discover(&copy))
         {
             if let Some(done) = self.refresh_origin(&copy, key, written.map(|w| w && seen)) {
+                if self.movie.load(Relaxed) && done.1.is_none() {
+                    MOVIE_EXITS[MOVIE_ORIGIN].fetch_add(1, Relaxed);
+                }
                 last.hash = None;
                 return done;
             }
@@ -677,7 +815,7 @@ impl Staging {
             }
             ORIGIN_EVENTS[OR_FALLBACK].fetch_add(1, Relaxed);
         }
-        if written == Some(false) {
+        if written == Some(false) && !self.forced(MOVIE_WATCH) {
             return (0, None);
         }
         // Never read title memory a bypassed page left unwritten.
@@ -696,7 +834,11 @@ impl Staging {
             read.resize(full.max(read.len()), 0);
             host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
             host::stage(host::STAGE_READ, at);
-            if watched.is_none() && last.blind > 1 {
+            if movie {
+                // MOV1: uploaded unhashed (as the blind refreshes are).
+                last.hash = None;
+                last.blind = 0;
+            } else if watched.is_none() && last.blind > 1 {
                 last.blind -= 1;
                 last.hash = None;
                 ORIGIN_EVENTS[OR_HASH_AVOIDED].fetch_add(size as u64, Relaxed);
@@ -709,6 +851,9 @@ impl Staging {
                     last.blind = 0;
                 } else if last.hash == Some(hash) {
                     last.streak = 0;
+                    if self.movie.load(Relaxed) {
+                        MOVIE_EXITS[MOVIE_HASH].fetch_add(1, Relaxed);
+                    }
                     return (size, None);
                 } else if last.hash.is_some() {
                     last.streak += 1;
@@ -753,6 +898,9 @@ impl Staging {
                 }
             }
             self.detile(&read[..full], linear, upload.data);
+            if self.movie.load(Relaxed) {
+                MOVIE_EXITS[MOVIE_UPLOADS].fetch_add(1, Relaxed);
+            }
             ORIGIN_EVENTS[OR_PLAIN].fetch_add(1, Relaxed);
             ORIGIN_EVENTS[OR_BYTES_PLAIN].fetch_add(size as u64, Relaxed);
             (size, Some(upload))
@@ -1190,6 +1338,7 @@ impl Staging {
             took: false.into(),
             plain_from: NOT_PARTIAL.into(),
             plain_at: [0.into(), 0.into()],
+            movie: false.into(),
             footprints,
             rows,
             layout,
@@ -1268,6 +1417,11 @@ pub struct OriginKey {
 }
 
 impl OriginKey {
+    /// Its registry file and texture (what [`xnw_formats::origin::arrived_since`] names).
+    pub fn file_texture(&self) -> (u32, u32) {
+        (self.file, self.texture)
+    }
+
     fn holds(&self, o: &xnw_formats::origin::Origin) -> bool {
         (o.file, o.texture, o.at) == (self.file, self.texture, self.at)
     }
@@ -2329,6 +2483,36 @@ mod tests {
         assert_eq!(release(this), 0);
     }
 
+    /// MOV1: an unchanged texture is not uploaded again, but a movie plane
+    /// (marked by the kept Bink draw) is, and the exit it passed is counted.
+    #[test]
+    fn a_movie_plane_is_uploaded_at_every_refresh() {
+        if host::host().is_none() {
+            return; // no host GPU here
+        }
+        let _one = serial();
+        let desc = ResourceDesc { dimension: 3, width: 64, height: 4, depth_or_array_size: 1, mip_levels: 1, format: 28, sample_count: 1, layout: 1, ..Default::default() };
+        let this = create(&desc);
+        let (memory, _) = resource::texture_memory(this).unwrap();
+        let texture = resource::host_resource(this).unwrap().clone();
+        // SAFETY: the texture's memory holds at least its first 1 KiB.
+        unsafe { std::slice::from_raw_parts_mut(memory.cast_mut(), 1024) }.fill(7);
+        let s = staging(this, &texture).unwrap();
+        assert!(s.refresh().is_some(), "the first refresh uploads");
+        assert!(s.refresh().is_none(), "unchanged: no upload");
+        let _ = movie_exits();
+        note_movie_planes(&[this as usize]);
+        assert!(s.refresh().is_some(), "a movie plane uploads again");
+        let e = movie_exits();
+        // Unwatched test memory: forced, the hash is not taken (nor counted).
+        assert_eq!((e[MOVIE_UPLOADS], e[MOVIE_HASH]), (1, 0), "{e:?}");
+        type Release = extern "system" fn(This) -> u32;
+        // SAFETY: slot 2 of our resource is Release.
+        let release: Release = unsafe { super::super::object::slot(this, 0x10) };
+        drop(s);
+        assert_eq!(release(this), 0);
+    }
+
     /// Two textures over memory holding the same `.ttpf` page share one
     /// host copy, uploaded from the decoded page (title memory left zero),
     /// and the second needs no upload.
@@ -2378,6 +2562,123 @@ mod tests {
         let mut linear = vec![0u8; 1024];
         layout.detile(&page[skews[0]..][..layout.size as usize], 0, 0, &mut linear, 256, 1024).unwrap();
         assert!(read == linear, "{}", origin_text());
+        for this in [a, b] {
+            let (memory, _) = resource::texture_memory(this).unwrap();
+            r.unmap_va(memory as usize, 0x2000);
+            type Release = extern "system" fn(This) -> u32;
+            // SAFETY: slot 2 of our resource is Release.
+            let release: Release = unsafe { super::super::object::slot(this, 0x10) };
+            release(this);
+        }
+    }
+
+    /// Waits until the pass's reader has finished its read of `copy`.
+    fn read_finished(copy: &Arc<resource::HostTexture>) {
+        for _ in 0..5000 {
+            if reader().flight.lock().unwrap().finished.iter().any(|d| Arc::ptr_eq(&d.copy, copy)) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("the reader never finished");
+    }
+
+    /// PERF2, the hand-over of a read off the frame. The reader marks the
+    /// copy complete when it has READ; the pass has the texels only once
+    /// [`pass_finished`] gave it the upload. In between every ask says
+    /// "flying, not ready" (before: "complete", and the upload was never
+    /// fetched: a black texture). After: ready at once, and its contents
+    /// stand while a later ask reads it again.
+    #[test]
+    fn an_async_read_is_not_ready_before_the_pass_took_its_upload() {
+        if host::host().is_none() {
+            return; // no host GPU here
+        }
+        let _one = serial();
+        let desc = ResourceDesc { dimension: 3, width: 64, height: 4, depth_or_array_size: 1, mip_levels: 1, format: 28, sample_count: 1, layout: 1, ..Default::default() };
+        let this = create(&desc);
+        let (memory, _) = resource::texture_memory(this).unwrap();
+        let layout = resource::texture_layout(&desc).unwrap().planes[0].layout.clone();
+        // SAFETY: the texture's memory holds its layout's bytes.
+        unsafe { std::slice::from_raw_parts_mut(memory.cast_mut(), layout.size as usize) }.fill(0x5a);
+        super::super::queue::pass_frame();
+        let _ = pass_finished();
+        let ask = || for_pass_async(this, Box::new(()), &mut |_| true).unwrap();
+        let first = ask();
+        assert!(first.flying && first.waiting && !first.ready && first.upload.is_none(), "queued");
+        let copy = first.copy.clone();
+        read_finished(&copy);
+        // Read, not handed over: the copy's own state says complete.
+        assert!(!copy.pending.load(Relaxed));
+        let early = ask();
+        assert!(early.flying && early.waiting && !early.ready && !early.landed, "read but not taken: still flat");
+        let got: Vec<_> = pass_finished().into_iter().filter(|(c, _, _)| Arc::ptr_eq(c, &copy)).collect();
+        assert_eq!(got.len(), 1, "the upload goes to the pass at its frame's start, asked for or not");
+        let landed = ask();
+        assert!(landed.ready && landed.landed && !landed.flying && !landed.waiting && landed.upload.is_none(), "ready on the frame that records it");
+        // Asked again (a new slot of the texture): read again, its contents stand meanwhile.
+        let again = ask();
+        assert!(again.ready && again.flying && again.waiting, "the old contents while it is read again");
+        read_finished(&copy);
+        assert!(ask().flying, "in flight until taken");
+        assert!(!pass_finished().iter().any(|(c, _, _)| Arc::ptr_eq(c, &copy)), "unchanged memory: no second upload");
+        let same = ask();
+        assert!(same.ready && !same.landed && !same.flying && !same.waiting);
+        assert!(reader().flight.lock().unwrap().copies.is_empty());
+        drop((first, early, landed, again, same, got, copy));
+        super::super::queue::pass_frame();
+        type Release = extern "system" fn(This) -> u32;
+        // SAFETY: slot 2 of our resource is Release.
+        let release: Release = unsafe { super::super::object::slot(this, 0x10) };
+        release(this);
+    }
+
+    /// PERF2: two resources over one origin copy. While the first one's read
+    /// is with the reader, the second is answered as the copy was before it
+    /// (flat), not from the state the read has already set ("uploaded");
+    /// before, the second sampled the copy with nothing copied into it.
+    #[test]
+    fn a_shared_copy_in_flight_is_flat_for_every_resource_of_it() {
+        use xnw_formats::origin;
+        use xnw_formats::ttpf::{Page, Texture, Ttpf};
+        if host::host().is_none() {
+            return; // no host GPU here
+        }
+        let _one = serial();
+        let desc = ResourceDesc { dimension: 3, width: 64, height: 4, depth_or_array_size: 1, mip_levels: 1, format: 28, sample_count: 1, layout: 1, ..Default::default() };
+        let tex = Texture { hash: 1, width: 64, height: 4, mips: 1, format: 28, layers: 1, kind: 2, mode: 0, addr: 0x1_0000, span: 0x2000, words: [0; 4] };
+        let ttpf = Ttpf { pages: vec![Page { addr: 0x1_0000, size: 0x2000, offset: 0x1000, stored: 0x2000, storage: 0 }], textures: vec![tex], header_bytes: 0x100 };
+        let r = origin::registry();
+        let file = r.add(std::path::PathBuf::from("perf2-test-origin.ttpf"), ttpf);
+        r.put_decoded(file, 0, (0..0x2000u32).map(|i| (i as u8).wrapping_mul(11).wrapping_add(3)).collect());
+        const FRAME: usize = 0x7e00_0000;
+        let (a, b) = (create(&desc), create(&desc));
+        let skews: Vec<usize> = [a, b].iter().map(|&this| resource::texture_memory(this).unwrap().0 as usize & 0xfff).collect();
+        if skews[0] == skews[1] {
+            for this in [a, b] {
+                let (memory, _) = resource::texture_memory(this).unwrap();
+                r.map_va(memory as usize, 0x2000, FRAME as u64);
+            }
+            r.record_pages(file, 0x1000, &[FRAME], 0, 0x2000).unwrap();
+            let (ca, cb) = (resource::host_copy(a).unwrap(), resource::host_copy(b).unwrap());
+            assert!(Arc::ptr_eq(&ca, &cb), "one host copy per origin");
+            super::super::queue::pass_frame();
+            let _ = pass_finished();
+            let ask = |this| for_pass_async(this, Box::new(()), &mut |_| true).unwrap();
+            let first = ask(a);
+            assert!(first.flying && !first.ready);
+            read_finished(&ca);
+            assert_eq!(ca.uploaded.load(Relaxed), 0x1000, "the read has marked the copy uploaded");
+            let other = ask(b);
+            assert!(other.flying && !other.ready, "the other resource: flat until the pass has the upload");
+            assert_eq!(pass_finished().iter().filter(|(c, _, _)| Arc::ptr_eq(c, &ca)).count(), 1);
+            let other = ask(b);
+            assert!(other.ready, "recorded: the shared copy is ready for the other resource at once");
+            assert!(ask(a).ready);
+            read_finished(&ca);
+            let _ = pass_finished();
+            super::super::queue::pass_frame();
+        }
         for this in [a, b] {
             let (memory, _) = resource::texture_memory(this).unwrap();
             r.unmap_va(memory as usize, 0x2000);
@@ -2666,11 +2967,14 @@ mod tests {
         drop(for_pass_with(this, true, &mut |_| false, true).unwrap());
         assert_eq!(delta(was), [1, 1, 1, 0, 0, 0, 0, 0], "budget, pending, never uploaded");
         let texture = resource::host_resource(this).unwrap().clone();
-        let key = Arc::as_ptr(&staging(this, &texture).unwrap()) as usize;
-        reader().busy.lock().unwrap().insert(key);
+        let _ = staging(this, &texture).unwrap();
+        let key = Arc::as_ptr(&resource::host_copy(this).unwrap()) as usize;
+        reader().flight.lock().unwrap().copies.insert(key, (false, 0));
         let was = exits();
-        drop(for_pass_async(this, Box::new(()), &mut |_| true).unwrap());
-        reader().busy.lock().unwrap().remove(&key);
+        let t = for_pass_async(this, Box::new(()), &mut |_| true).unwrap();
+        assert!(t.flying && t.waiting && !t.ready);
+        drop(t);
+        reader().flight.lock().unwrap().copies.remove(&key);
         assert_eq!(delta(was), [0, 0, 0, 0, 0, 0, 1, 0], "async busy");
         super::super::queue::pass_frame(); // a fresh frame cap for the next test
         type Release = extern "system" fn(This) -> u32;

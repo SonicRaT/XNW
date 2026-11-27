@@ -1,4 +1,4 @@
-//! `XNW_WORLD_PROBE=<dir>[,frames=<n>][,max=<k>][,at=<f>[+<f>..]][,raw=<n>]`:
+//! `XNW_WORLD_PROBE=<dir>[,frames=<n>][,max=<k>][,at=<f>[+<f>..]][,raw=<n>][,gt|ct=<s>[+<s>..]]`:
 //! read a frame's world geometry out at the engine's geometry draw
 //! (title 0x140055E50, `rcx` = grmGeometry*)
 //! and write it as OBJ. Off (no hook) when unset.
@@ -107,6 +107,8 @@ macro_rules! miss {
 /// The frame pack v2 writer.
 mod pack;
 mod hairlive;
+mod hairribbon;
+mod headlive;
 mod uilive;
 /// Draw-time bones for the live pass (`drawbones=on`).
 mod skinhook;
@@ -114,12 +116,20 @@ mod skinhook;
 mod preskin;
 /// The thin hook (`XNW_HOOK_THIN=on`): the rest of a draw decoded by our threads.
 mod thin;
+/// The instance-batch cache (`XNW_HOOK_CACHE=on`): a batch's statics once per thread.
+mod instcache;
 /// The imposter submits' live reads (`imposters=on`).
 mod imposter;
 /// The bridged rows' live reads (`bridgeps=on|<hashes>`).
 mod bridgeps;
 /// The list's geometry reads (`geomcopy=direct`, `geomasync=on`).
 mod geomread;
+// Vehicle paint: the handler Draw hooks and the type-21 row read.
+mod paint;
+// INT1: the title's per-material vehicle colour, read at the list sink.
+mod vehmat;
+// NPC1: the far peds' palette colour (`slodtint`).
+mod slodtint;
 /// `xnw burst`: a captured burst through the live list and pass functions.
 pub(crate) mod burst;
 /// The burst's title memory as the run had it: the census and `XNW_ZEROCOPY=on` (ZC1).
@@ -159,6 +169,14 @@ struct Config {
     pack: bool,
     /// `hookin=1`: the hook's inputs per hook draw in the pack (v2.8).
     hookin: bool,
+    /// REFDIFF: `gt=<s>[+<s>..]` (the game clock, title+0xABBEF40 ms, since
+    /// the first cinematic instance plays: state 6 or 8) and `ct=<s>[+..]`
+    /// (that instance's own clock, +0x460): the first frame handed on at or
+    /// past each time and the `gtframes=F`-1 after it are dumped, as
+    /// upstream's REF5 keys its reference frames (`VICTORY_REF5_AT`,
+    /// `VICTORY_REF5_AT_CINE`). `(cinematic clock, seconds)`.
+    clock: Vec<(bool, f64)>,
+    clock_frames: u32,
     /// `scan=exit`: scan.txt from the scene scan's records at the exit of
     /// the compaction 0x14547BE70 (its wrapper 0x140B5F960 calls it from
     /// our hook), not at the drain's entry, which can race the next scan.
@@ -168,7 +186,7 @@ struct Config {
 fn parse(v: &str) -> Result<Config, String> {
     let mut parts = v.split(',').map(str::trim);
     let dir = parts.next().filter(|d| !d.is_empty()).ok_or("no directory")?;
-    let mut c = Config { dir: PathBuf::from(dir), frames: 3, max: 20_000, at: Vec::new(), raw: 0, render: false, seq: false, skinlog: 0, census: false, auto: None, auto_veh: 0, cut_present: false, pack: false, scan_exit: false, hookin: false };
+    let mut c = Config { dir: PathBuf::from(dir), frames: 3, max: 20_000, at: Vec::new(), raw: 0, render: false, seq: false, skinlog: 0, census: false, auto: None, auto_veh: 0, cut_present: false, pack: false, scan_exit: false, hookin: false, clock: Vec::new(), clock_frames: 1 };
     for p in parts {
         let (k, val) = p.split_once('=').ok_or_else(|| format!("`{p}`: key=value"))?;
         let n = |s: &str| s.trim().parse::<u64>().map_err(|_| format!("`{p}`: bad number"));
@@ -219,7 +237,16 @@ fn parse(v: &str) -> Result<Config, String> {
                 c.at = val.split('+').map(n).collect::<Result<_, _>>()?;
                 c.at.sort_unstable();
             }
-            _ => return Err(format!("`{p}`: unknown key (frames, max, at, seq, raw, skinlog, census, cut, pack, scan, hookin)")),
+            "gt" | "ct" => {
+                let cine = k.trim() == "ct";
+                for t in val.split('+') {
+                    c.clock.push((cine, t.trim().parse::<f64>().map_err(|_| format!("`{p}`: bad seconds"))?));
+                }
+                c.clock.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+                c.seq = true;
+            }
+            "gtframes" => c.clock_frames = (n(val)? as u32).max(1),
+            _ => return Err(format!("`{p}`: unknown key (frames, max, at, seq, raw, skinlog, census, cut, pack, scan, hookin, gt, ct, gtframes)")),
         }
     }
     Ok(c)
@@ -399,6 +426,8 @@ struct Draw {
     /// `skinrules` bit 8: an instanced vehicle draw's instances and the
     /// bones at its palette base, read at the list sink.
     wheel: Option<Box<skinhook::WheelInst>>,
+    /// `instrec`: a static instanced draw's worlds (one per instance record), read at the list sink.
+    inst_rec: Option<Box<Vec<[f32; 12]>>>,
     /// The capture's hook count when this draw was recorded (a sink pairs
     /// with the thread's last draw only while no other hook came between).
     hook_n: u64,
@@ -466,6 +495,12 @@ struct Draw {
     alpha_clip: bool,
     /// Layered effects: the layer diffuse descriptor slots.
     layer_desc: [u64; 4],
+    /// The effect class and ped tint ([`crate::worldtex::last_extra`]),
+    /// and the vehicle paint colours A, B (None: none) of a vehicle body draw.
+    extra: crate::worldtex::Extra,
+    paint: Option<[f32; 6]>,
+    /// INT1 (`vehmat`): the draw's material colour table, read at its list sink.
+    vehmat: Option<vehmat::Table>,
     /// The 2x2-quad sample mask at ctx+0x12360 (u64::MAX: solid).
     stipple: u64,
     /// `XNW_HOOK_THIN=on`: what the hook left for our threads (thin.rs).
@@ -526,6 +561,8 @@ struct Camera {
 
 struct Capture {
     frame: u64,
+    /// ENG11's present counter (u32 title+0xA9437AC) at the first hook of the frame: the key the live head take pairs on.
+    stamp: u32,
     ordinal: usize,
     /// When this capture began (its first draw).
     t0: Instant,
@@ -549,19 +586,19 @@ struct Capture {
     dumped_tex: Vec<u64>,
     /// Light capture: palette copies by (pointer, drawable, bones),
     /// and how often one pointer served another drawable in the frame.
-    pal_keys: HashMap<(u64, u64, u32), u32>,
+    pal_keys: KeyMap<(u64, u64, u32)>,
     pal_list: Vec<Vec<u8>>,
     pal_shared: u64,
     /// Instance record blocks by (records pointer, count).
-    inst_keys: HashMap<(u64, u32), u32>,
+    inst_keys: KeyMap<(u64, u32)>,
     /// Shared blocks: the static map records of kind-S batches are
     /// kept across frames (`STATIC_INST`), not copied every frame.
     inst_list: Vec<std::sync::Arc<Vec<u8>>>,
     /// Each block's source (0 cpu-list, 1 gpu-buffer list, 2 buffer view: grass or instfallback).
     inst_src: Vec<u8>,
     /// The frame's LOD records (140 B at *(rec+0x10)), once per pointer.
-    lod_keys: HashMap<u64, u32>,
-    lod_list: Vec<Vec<u8>>,
+    lod_keys: KeyMap<u64>,
+    lod_list: Vec<[u8; LODREC_BYTES]>,
     /// Skinned draws (by the skin constants), how many agree with the TLS
     /// palette pointer, and the palette buffer extent used (bones).
     skin_draws: u64,
@@ -576,14 +613,71 @@ struct Capture {
     /// Viewports whose first camera differed between recording threads.
     cam_conflicts: u32,
     /// The frame's hide bitsets, once per bits pointer.
-    mask_keys: HashMap<u64, u32>,
+    mask_keys: KeyMap<u64>,
     mask_list: Vec<Vec<u32>>,
     /// Draws per (effect, program set, stage, albedo outcome).
     census: HashMap<(u64, u64, u32, u8), u32>,
     /// The writer dumps this frame (decided when it is sent).
     dump: bool,
+    /// PERF4: when it was sent at its cut (`capskip::clock_ns`; 0: not yet).
+    cut_ns: u64,
     /// The frame pack's data, moved in when the frame is sent.
     pack: Mutex<Option<pack::Taken>>,
+    /// `XNW_HOOK_CACHE=on`: the key maps came from (and go back to) the
+    /// spares, and the merged-in captures' maps wait in `spent` for recycle.
+    keep_keys: bool,
+    spent: Vec<Keys>,
+    /// Tests: every instanced call's time (ns).
+    #[cfg(test)]
+    inst_ns: u64,
+}
+
+/// The hook's per-frame key maps (pointers to list indices): a folded
+/// multiply in place of SipHash (four to six lookups an instanced call).
+type KeyMap<K> = HashMap<K, u32, std::hash::BuildHasherDefault<instcache::PtrHash>>;
+
+/// A capture's per-frame key maps and the lists they index, kept with
+/// their capacity for the next frames (`XNW_HOOK_CACHE=on`): no growth,
+/// rehash or reallocation inside the hook.
+#[derive(Default)]
+struct Keys {
+    pal: KeyMap<(u64, u64, u32)>,
+    inst: KeyMap<(u64, u32)>,
+    lod: KeyMap<u64>,
+    mask: KeyMap<u64>,
+    census: HashMap<(u64, u64, u32, u8), u32>,
+    blocks: Vec<std::sync::Arc<Vec<u8>>>,
+    src: Vec<u8>,
+    lods: Vec<[u8; LODREC_BYTES]>,
+    masks: Vec<Vec<u32>>,
+}
+
+impl Capture {
+    /// The capture's key maps and lists (moved out; the capture keeps empty ones).
+    fn take_keys(&mut self) -> Keys {
+        use std::mem::take;
+        Keys { pal: take(&mut self.pal_keys), inst: take(&mut self.inst_keys), lod: take(&mut self.lod_keys), mask: take(&mut self.mask_keys), census: take(&mut self.census), blocks: take(&mut self.inst_list), src: take(&mut self.inst_src), lods: take(&mut self.lod_list), masks: take(&mut self.mask_list) }
+    }
+}
+
+static SPARE_KEYS: Mutex<Vec<Keys>> = Mutex::new(Vec::new());
+
+/// Cleared on the caller's thread (the writer's, at recycle), kept for a later capture.
+fn spare_keys(mut k: Keys) {
+    k.pal.clear();
+    k.inst.clear();
+    k.lod.clear();
+    k.mask.clear();
+    k.census.clear();
+    k.blocks.clear();
+    k.src.clear();
+    k.lods.clear();
+    k.masks.clear();
+    if let Ok(mut s) = SPARE_KEYS.lock()
+        && s.len() < 16
+    {
+        s.push(k);
+    }
 }
 
 /// The hook's parts, sampled every PART_SAMPLE-th call per thread.
@@ -595,13 +689,19 @@ impl Capture {
     /// Hands the draw vector back for the next frame (a Draw is about
     /// 1.5 KB: a fresh vector per frame cost growth copies and page faults
     /// inside the hook).
-    fn recycle(self) {
+    fn recycle(mut self) {
+        if self.keep_keys {
+            spare_keys(self.take_keys());
+            for k in std::mem::take(&mut self.spent) {
+                spare_keys(k);
+            }
+        }
         spare(self.draws);
     }
 
     /// One frame from the per-thread captures: draws appended (block,
     /// LOD record and palette indices rebased), cameras united, counts summed.
-    fn merge(mut self, o: Capture) -> Capture {
+    fn merge(mut self, mut o: Capture) -> Capture {
         let (blocks, lods, pals, masks) = (self.inst_list.len() as u32, self.lod_list.len() as u32, self.pal_list.len() as u32, self.mask_list.len() as u32);
         let shift = |i: u32, by: u32| if i == NO_PAL { NO_PAL } else { i + by };
         let mut draws = o.draws;
@@ -627,13 +727,13 @@ impl Capture {
         }
         self.draws.extend(draws.drain(..));
         spare(draws);
-        self.inst_list.extend(o.inst_list);
-        self.inst_src.extend(o.inst_src);
+        self.inst_list.append(&mut o.inst_list);
+        self.inst_src.append(&mut o.inst_src);
         for k in 0..7 {
             self.inst_calls[k] += o.inst_calls[k];
         }
-        self.lod_list.extend(o.lod_list);
-        self.mask_list.extend(o.mask_list);
+        self.lod_list.append(&mut o.lod_list);
+        self.mask_list.append(&mut o.mask_list);
         self.pal_list.extend(o.pal_list);
         self.geoms.extend(o.geoms);
         self.effects.extend(o.effects);
@@ -664,15 +764,29 @@ impl Capture {
         (self.seen, self.copied, self.over_budget, self.hook_ns) = (self.seen + o.seen, self.copied + o.copied, self.over_budget + o.over_budget, self.hook_ns + o.hook_ns);
         (self.pal_shared, self.skin_draws, self.skin_agree, self.geom_misses) = (self.pal_shared + o.pal_shared, self.skin_draws + o.skin_draws, self.skin_agree + o.skin_agree, self.geom_misses + o.geom_misses);
         self.skin_extent = self.skin_extent.max(o.skin_extent);
-        for (k, n) in o.census {
+        for (k, n) in o.census.drain() {
             *self.census.entry(k).or_default() += n;
         }
         self.ordinal = self.ordinal.min(o.ordinal);
+        if o.keep_keys {
+            // Cleared at recycle, on the writer's thread (a merge can run on a title thread).
+            self.spent.append(&mut o.spent);
+            // (o's lists were emptied by the appends above: their capacity goes back.)
+            self.spent.push(Keys { pal: o.pal_keys, inst: o.inst_keys, lod: o.lod_keys, mask: o.mask_keys, census: o.census, blocks: o.inst_list, src: o.inst_src, lods: o.lod_list, masks: o.mask_list });
+        }
         self
     }
 
+    #[cfg(test)]
     fn new(frame: u64, ordinal: usize) -> Capture {
-        Capture { frame, ordinal, t0: Instant::now(), seen: 0, draws: SPARE.lock().ok().and_then(|mut v| v.pop()).unwrap_or_else(|| Vec::with_capacity(4096)), geoms: HashMap::new(), effects: HashMap::new(), cameras: Vec::new(), unread: [0; KINDS.len()], copied: 0, inst_calls: [0; 7], over_budget: 0, hook_ns: 0, threads: Vec::new(), dumps: Vec::new(), dumped_tex: Vec::new(), pal_keys: HashMap::new(), pal_list: Vec::new(), pal_shared: 0, inst_keys: HashMap::new(), inst_list: Vec::new(), inst_src: Vec::new(), lod_keys: HashMap::new(), lod_list: Vec::new(), skin_draws: 0, skin_agree: 0, skin_extent: 0, hook_bones: skinhook::HookBones::default(), geom_misses: 0, parts: [0; PARTS], census: HashMap::new(), mask_keys: HashMap::new(), mask_list: Vec::new(), cam_conflicts: 0, dump: false, pack: Mutex::new(None) }
+        Capture::with_keys(frame, ordinal, false)
+    }
+
+    /// `keep`: the key maps from the spares (`XNW_HOOK_CACHE=on`).
+    fn with_keys(frame: u64, ordinal: usize, keep: bool) -> Capture {
+        let k = if keep { SPARE_KEYS.lock().ok().and_then(|mut v| v.pop()).unwrap_or_default() } else { Keys::default() };
+        Capture { frame, stamp: present_stamp(), ordinal, t0: Instant::now(), seen: 0, draws: SPARE.lock().ok().and_then(|mut v| v.pop()).unwrap_or_else(|| Vec::with_capacity(4096)), geoms: HashMap::new(), effects: HashMap::new(), cameras: Vec::new(), unread: [0; KINDS.len()], copied: 0, inst_calls: [0; 7], over_budget: 0, hook_ns: 0, threads: Vec::new(), dumps: Vec::new(), dumped_tex: Vec::new(), pal_keys: k.pal, pal_list: Vec::new(), pal_shared: 0, inst_keys: k.inst, inst_list: k.blocks, inst_src: k.src, lod_keys: k.lod, lod_list: k.lods, skin_draws: 0, skin_agree: 0, skin_extent: 0, hook_bones: skinhook::HookBones::default(), geom_misses: 0, parts: [0; PARTS], census: k.census, mask_keys: k.mask, mask_list: k.masks, cam_conflicts: 0, dump: false, cut_ns: 0, pack: Mutex::new(None), keep_keys: keep, spent: Vec::new(), #[cfg(test)]
+            inst_ns: 0 }
     }
 
     fn dump(&mut self, kind: &str, at: u64, len: usize, max: usize) {
@@ -744,6 +858,8 @@ struct State {
     /// `XNW_HOOK_THIN=on`: the hook reads only what the title may change
     /// before the frame ends; our threads decode the rest at the cut.
     thin: bool,
+    /// `XNW_HOOK_CACHE=on`: instanced batches from the per-thread batch cache (instcache.rs).
+    cache: bool,
 }
 
 type Slot = std::sync::Arc<Mutex<Option<Capture>>>;
@@ -839,6 +955,8 @@ impl State {
     /// Takes every slot's capture whose frame passes `take`, merges per frame
     /// and hands each frame on once, in order.
     fn send_where(&self, take: impl Fn(u64) -> bool) {
+        // PERF5 `bigcopy=drain`: the frames' big frame-table views are copied before they leave.
+        bridgeps::fill_drained(&take);
         let slots: Vec<Slot> = self.slots.lock().map(|v| v.clone()).unwrap_or_default();
         let mut done: Vec<Capture> = Vec::new();
         for s in &slots {
@@ -870,7 +988,8 @@ impl State {
             // Whether the writer dumps it is decided here, in send order
             // (it was decided by the writer, far behind the title), and the
             // frame's pack data moves into the capture (fault A).
-            c.dump = !self.cfg.render || auto_dump(&self.cfg, &c) || (c.ordinal != usize::MAX && self.cfg.raw > 0);
+            let clock = clock_dump(&self.cfg, self.title, c.frame);
+            c.dump = clock || !self.cfg.render || auto_dump(&self.cfg, &c) || (c.ordinal != usize::MAX && self.cfg.raw > 0);
             if !c.dump {
                 // Its scan snapshot is not wanted: the queue keeps only the
                 // dumped frames' (a 120-frame window kept 25 of 120 while it
@@ -883,6 +1002,7 @@ impl State {
             if self.cfg.pack {
                 c.pack = Mutex::new(pack::take(c.frame, c.dump));
             }
+            c.cut_ns = xnw_world::capskip::clock_ns();
             if let Ok(tx) = self.tx.lock() {
                 let _ = tx.send(c);
             }
@@ -903,6 +1023,9 @@ extern "system" fn on_imposter(frame: usize, _id: usize) {
     let r = |o: isize| unsafe { ((frame as isize + o) as *const u64).read() };
     let args = [r(-24) & 0xFFFF_FFFF, r(-32) & 0xFFFF_FFFF, r(-40) & 0xFFFF_FFFF, r(-48), r(0x30), r(0x40) & 0xFF];
     let frame = frame_key();
+    if cap_skipped(frame) && !pack::on() {
+        return;
+    }
     pack::imposter(frame, args, r(0x48));
     if imposter::on() {
         imposter::on_call(frame, args, r(0x48));
@@ -981,6 +1104,8 @@ const VIEW_MAKER_ENTRY: [u8; 14] = [0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x
 extern "system" fn on_view(frame: usize, _id: usize) {
     // SAFETY: the stub's frame.
     let r: [u64; 5] = unsafe { [frame - 24, frame - 32, frame - 40, frame - 48, frame + 8].map(|a| (a as *const u64).read()) };
+    // WALL1: one lock for every thread that makes views.
+    let _wall = xnw_core::framewall::scope(xnw_core::framewall::HOOK_VIEW);
     if let Ok(mut m) = VIEW_WRITERS.lock() {
         m.get_or_insert_with(HashMap::new).insert((r[0], (r[1] as u16) >> 2), [r[4], r[2], r[3]]);
     }
@@ -1032,6 +1157,10 @@ fn hook_draw(geom: u64, ret: u64, inst: Option<u64>) {
 /// drive it with fake title memory): this thread's own slot, so recording
 /// threads never wait for each other.
 fn hook_with(s: &State, now: u64, geom: u64, ret: u64, inst: Option<u64>, tls: u64) {
+    // PERF4 `capskip`: a frame whose list the pass would not draw is not captured.
+    if cap_skipped(now) {
+        return;
+    }
     let t0 = Instant::now();
     let sampled = CALLS.with(|n| {
         let k = n.get() + 1;
@@ -1059,7 +1188,7 @@ fn hook_with(s: &State, now: u64, geom: u64, ret: u64, inst: Option<u64>, tls: u
             Err(_) => return,
         };
     }
-    let c = g.get_or_insert_with(|| Capture::new(now, ordinal));
+    let c = g.get_or_insert_with(|| Capture::with_keys(now, ordinal, s.cache));
     if let Some(tl) = tl {
         c.parts[0] += PART_SAMPLE * tl.elapsed().as_nanos() as u64;
     }
@@ -1089,7 +1218,7 @@ fn hook_with(s: &State, now: u64, geom: u64, ret: u64, inst: Option<u64>, tls: u
             }
             if pack_seq != 0 {
                 pack::hook_inputs(now, pack_seq, tls, geom);
-                pack::hook_views(now, &[d.tex_desc, d.layer_desc[0], d.layer_desc[1], d.layer_desc[2], d.layer_desc[3]], &[(d.vb_at, d.vb_len), (d.mesh_at, d.mesh_len)]);
+                pack::hook_views(now, &[d.tex_desc, d.layer_desc[0], d.layer_desc[1], d.layer_desc[2], d.layer_desc[3], d.extra.tint_slot], &[(d.vb_at, d.vb_len), (d.mesh_at, d.mesh_len)]);
             }
         }
         // Instanced calls whose geometry draw was not recorded, by reason.
@@ -1099,17 +1228,30 @@ fn hook_with(s: &State, now: u64, geom: u64, ret: u64, inst: Option<u64>, tls: u
         if let Some(draw) = inst
             && c.draws.len() > before
         {
-            let ti = sampled.then(Instant::now);
+            // Tests time every instanced call (`inst_ns`), the hook a sampled one.
+            let ti = (sampled || cfg!(test)).then(Instant::now);
             // SAFETY: the calling thread's TLS block.
             let ctx = if tls != 0 { unsafe { pread::<u64>(tls + TLS_CTX) }.unwrap_or(0) } else { 0 };
-            capture_instances(c, draw, ctx);
+            if s.cache {
+                instcache::capture(c, draw, ctx);
+            } else {
+                capture_instances(c, draw, ctx);
+            }
             if let Some(ti) = ti {
-                c.parts[5] += PART_SAMPLE * ti.elapsed().as_nanos() as u64;
+                let ns = ti.elapsed().as_nanos() as u64;
+                if sampled {
+                    c.parts[5] += PART_SAMPLE * ns;
+                }
+                #[cfg(test)]
+                {
+                    c.inst_ns += ns;
+                }
             }
         }
     }
     let total = t0.elapsed().as_nanos() as u64;
     c.hook_ns += total;
+    xnw_core::framewall::add(xnw_core::framewall::HOOK_DRAW, total);
     if sampled {
         // The sampled total; "other" = total - the parts (render_frame).
         c.parts[6] += PART_SAMPLE * total;
@@ -1146,9 +1288,9 @@ fn bitset_copy(c: &mut Capture, p: u64) -> u32 {
     if let Some(i) = c.mask_keys.get(&bits) {
         return *i;
     }
-    let Some(b) = dcopy(bits, 4 * words as usize) else { return NO_PAL };
+    let Some(b) = dcopy_words(bits, words as usize) else { return NO_PAL };
     let i = c.mask_list.len() as u32;
-    c.mask_list.push(b.chunks_exact(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect());
+    c.mask_list.push(b);
     c.mask_keys.insert(bits, i);
     i
 }
@@ -1176,7 +1318,7 @@ fn capture_instances(c: &mut Capture, draw: u64, ctx: u64) {
     let lodrec = match c.lod_keys.get(&tp) {
         Some(i) => *i,
         // SAFETY: the LOD record the call hands to the culling shader (V).
-        None => match unsafe { dread::<[u8; LODREC_BYTES]>(tp) }.map(|b| b.to_vec()) {
+        None => match unsafe { dread::<[u8; LODREC_BYTES]>(tp) } {
             Some(b) => {
                 let i = c.lod_list.len() as u32;
                 c.lod_list.push(b);
@@ -1231,49 +1373,8 @@ fn capture_instances(c: &mut Capture, draw: u64, ctx: u64) {
             }
         } else {
             c.inst_calls[refused] += 1;
-            if REFUSAL_LOGS.fetch_add(1, Ordering::Relaxed) < 8 {
-                // L's first qwords (a vtable names its type) and the batch desc's.
-                let q = |b: &[u8], at: usize| b.get(at..at + 8).map_or(0, |s| u64::from_le_bytes(s.try_into().unwrap()));
-                let lq = lh.map(|lh| [q(&lh, 0), q(&lh, 8), q(&lh, 0x10), q(&lh, 0x18)]).unwrap_or_default();
-                let title = STATE.get().map_or(0, |s| s.title as u64);
-                let rel = |v: u64| if title != 0 && v >= title && v - title < 0x1000_0000 { format!("title+{:#x}", v - title) } else { format!("{v:#x}") };
-                xnw_core::info!("world probe: instance batch refused ({}): L {l:#x} (qwords {} {:#x} {:#x} {:#x}), records {recs:#x}, u16 count {count}, batch count {}, buffer {gpu:#x}, desc qwords {:#x} {:#x} {:#x} {:#x}", ["", "", "null list", "count differs", "list unreadable"][refused], rel(lq[0]), lq[1], lq[2], lq[3], le32(&h, 8), q(&h, 0x10), q(&h, 0x18), q(&h, 0x20), q(&h, 0x28));
-                // Grass (vtable 0x1461CE3D0, ctor 0x145BAAF30 [V]): +0x80/+0x90 are
-                // its AABB (FLT_MAX-initialised Vec4s, so "records" read two floats),
-                // atArrays {ptr, u16 count, u16 capacity} at +0x158/+0x168/+0x178/+0x188
-                // [V dtor 0x1457B1D00]; desc+0x68 = **(L+0x158). Which holds the
-                // instances, and their stride: these lines, plus the buffer view's bytes.
-                // SAFETY: the same list object (fault-fixed read).
-                if let Some(lx) = unsafe { dread::<[u8; 0x1A0]>(l) } {
-                    let arr: Vec<String> = [0x158usize, 0x168, 0x178, 0x188].iter().map(|&o| {
-                        let (p, n) = (q(&lx, o), u16::from_le_bytes([lx[o + 8], lx[o + 9]]));
-                        // SAFETY: the array's first bytes (fault-fixed read).
-                        let first = unsafe { dread::<[u8; 32]>(p) }.map_or("-".into(), |b| b.iter().map(|x| format!("{x:02x}")).collect::<String>());
-                        format!("+{o:#x} {p:#x} n {n} [{first}]")
-                    }).collect();
-                    let view = q(&lx, 0x158);
-                    // SAFETY: as above: element 0 of the +0x158 array and the buffer view behind desc+0x68.
-                    let e0 = unsafe { dread::<[u64; 4]>(q(&lx, 0x158)) }.unwrap_or_default();
-                    let range = crate::worldprobe::buffer_view_of(gpu);
-                    xnw_core::info!("world probe: refused L {l:#x}: aabb {:?} {:?}; arrays {}; +0x158 elements {e0:x?} (array {view:#x}); buffer view {range:x?} (bytes / batch count = {})", f32s::<4>(&lx[0x80..]), f32s::<4>(&lx[0x90..]), arr.join("; "), range.map_or(0, |(_, len)| len / u64::from(le32(&h, 8).max(1))));
-                }
-            }
-            // Fallback: the buffer view behind desc+0x68 (its CPU-visible bytes).
-            // Off by default (`instfallback=on`): in one capture the stage 76/69
-            // instances read this way have rotations of 1e29-1e37 and a zero
-            // translation (not IcInstance records): screen-sized black polygons.
-            // Grass batch lists (vtable 0x1461CE3D0; effects grass_batch_wind /
-            // grass_batch_lod_wind, stage 77): 16-B packed instances through the
-            // same buffer view, decoded as CS_Grass_BatchCull_ValidateInst does.
-            // SAFETY: L's vtable (fault-fixed read).
-            let is_grass = STATE.get().is_some_and(|s| unsafe { dread::<u64>(l) } == Some((s.title as u64).wrapping_add((GRASS_LIST_VT - IMAGE_BASE) as u64)));
-            let read = if is_grass && render_switch("grass", true) {
-                grass_records(l, gpu, n, c.frame)
-            } else if render_switch("instfallback", false) {
-                buffer_records(gpu, n, c.frame)
-            } else {
-                None
-            };
+            log_refusal(refused, l, lh, recs, count, h, gpu);
+            let read = fallback_records(fallback_mode(is_grass_list(l)), l, gpu, n, c.frame);
             match read {
                 Some((addr, b)) => {
                     c.inst_calls[5] += 1;
@@ -1327,6 +1428,70 @@ fn capture_instances(c: &mut Capture, draw: u64, ctx: u64) {
     {
         info.block = block;
     }
+}
+
+/// The first 8 refused kind-S batches, logged: L's first qwords (a vtable
+/// names its type), the desc's, and a grass list's arrays.
+fn log_refusal(refused: usize, l: u64, lh: Option<[u8; 0xA0]>, recs: u64, count: u32, h: [u8; 0x90], gpu: u64) {
+    if REFUSAL_LOGS.fetch_add(1, Ordering::Relaxed) < 8 {
+        // L's first qwords (a vtable names its type) and the batch desc's.
+        let q = |b: &[u8], at: usize| b.get(at..at + 8).map_or(0, |s| u64::from_le_bytes(s.try_into().unwrap()));
+        let lq = lh.map(|lh| [q(&lh, 0), q(&lh, 8), q(&lh, 0x10), q(&lh, 0x18)]).unwrap_or_default();
+        let title = STATE.get().map_or(0, |s| s.title as u64);
+        let rel = |v: u64| if title != 0 && v >= title && v - title < 0x1000_0000 { format!("title+{:#x}", v - title) } else { format!("{v:#x}") };
+        xnw_core::info!("world probe: instance batch refused ({}): L {l:#x} (qwords {} {:#x} {:#x} {:#x}), records {recs:#x}, u16 count {count}, batch count {}, buffer {gpu:#x}, desc qwords {:#x} {:#x} {:#x} {:#x}", ["", "", "null list", "count differs", "list unreadable"][refused], rel(lq[0]), lq[1], lq[2], lq[3], le32(&h, 8), q(&h, 0x10), q(&h, 0x18), q(&h, 0x20), q(&h, 0x28));
+        // Grass (vtable 0x1461CE3D0, ctor 0x145BAAF30 [V]): +0x80/+0x90 are
+        // its AABB (FLT_MAX-initialised Vec4s, so "records" read two floats),
+        // atArrays {ptr, u16 count, u16 capacity} at +0x158/+0x168/+0x178/+0x188
+        // [V dtor 0x1457B1D00]; desc+0x68 = **(L+0x158). Which holds the
+        // instances, and their stride: these lines, plus the buffer view's bytes.
+        // SAFETY: the same list object (fault-fixed read).
+        if let Some(lx) = unsafe { dread::<[u8; 0x1A0]>(l) } {
+            let arr: Vec<String> = [0x158usize, 0x168, 0x178, 0x188].iter().map(|&o| {
+                let (p, n) = (q(&lx, o), u16::from_le_bytes([lx[o + 8], lx[o + 9]]));
+                // SAFETY: the array's first bytes (fault-fixed read).
+                let first = unsafe { dread::<[u8; 32]>(p) }.map_or("-".into(), |b| b.iter().map(|x| format!("{x:02x}")).collect::<String>());
+                format!("+{o:#x} {p:#x} n {n} [{first}]")
+            }).collect();
+            let view = q(&lx, 0x158);
+            // SAFETY: as above: element 0 of the +0x158 array and the buffer view behind desc+0x68.
+            let e0 = unsafe { dread::<[u64; 4]>(q(&lx, 0x158)) }.unwrap_or_default();
+            let range = crate::worldprobe::buffer_view_of(gpu);
+            xnw_core::info!("world probe: refused L {l:#x}: aabb {:?} {:?}; arrays {}; +0x158 elements {e0:x?} (array {view:#x}); buffer view {range:x?} (bytes / batch count = {})", f32s::<4>(&lx[0x80..]), f32s::<4>(&lx[0x90..]), arr.join("; "), range.map_or(0, |(_, len)| len / u64::from(le32(&h, 8).max(1))));
+        }
+    }
+}
+
+/// Fallback for a refused kind-S batch: the buffer view behind desc+0x68 (its CPU-visible bytes).
+/// Off by default (`instfallback=on`): in one capture the stage 76/69
+/// instances read this way have rotations of 1e29-1e37 and a zero
+/// translation (not IcInstance records): screen-sized black polygons.
+/// Grass batch lists (vtable 0x1461CE3D0; effects grass_batch_wind /
+/// grass_batch_lod_wind, stage 77): 16-B packed instances through the
+/// same buffer view, decoded as CS_Grass_BatchCull_ValidateInst does.
+/// Mode: 0 none, 1 grass, 2 the buffer view (the switches, asked per call).
+fn fallback_mode(is_grass: bool) -> u8 {
+    if is_grass && render_switch("grass", true) {
+        1
+    } else if render_switch("instfallback", false) {
+        2
+    } else {
+        0
+    }
+}
+
+fn fallback_records(mode: u8, l: u64, gpu: u64, n: u32, frame: u64) -> Option<(u64, std::sync::Arc<Vec<u8>>)> {
+    match mode {
+        1 => grass_records(l, gpu, n, frame),
+        2 => buffer_records(gpu, n, frame),
+        _ => None,
+    }
+}
+
+/// Whether list L is a grass batch list (its vtable, fault-fixed read).
+fn is_grass_list(l: u64) -> bool {
+    // SAFETY: L's vtable (fault-fixed read).
+    STATE.get().is_some_and(|s| unsafe { dread::<u64>(l) } == Some((s.title as u64).wrapping_add((GRASS_LIST_VT - IMAGE_BASE) as u64)))
 }
 
 /// Kind-S static records by (L, records pointer, count): the bytes
@@ -1700,6 +1865,21 @@ unsafe fn pread<T: Copy>(addr: u64) -> Option<T> {
     (0x1_0000..0x8000_0000_0000).contains(&addr).then(|| unsafe { (addr as *const T).read_unaligned() })
 }
 
+/// [`dcopy`] of `n` u32 words, into one allocation.
+fn dcopy_words(addr: u64, n: usize) -> Option<Vec<u32>> {
+    if burst::serving() || !(0x1_0000..0x8000_0000_0000).contains(&addr) || addr.checked_add(4 * n as u64)? > 0x8000_0000_0000 {
+        return dcopy(addr, 4 * n).map(|b| b.chunks_exact(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect());
+    }
+    let mut v = Vec::<u32>::with_capacity(n);
+    // SAFETY: into our own buffer's 4n bytes of capacity; the length is set
+    // only after the copy wrote them all (u32 words, little-endian host).
+    unsafe { fcopy(v.as_mut_ptr().cast(), addr as *const u8, 4 * n) }.then(|| {
+        // SAFETY: as above.
+        unsafe { v.set_len(n) };
+        v
+    })
+}
+
 /// `len` bytes at `addr` by the fault-fixed copy (None: out of range or faulted).
 fn dcopy(addr: u64, len: usize) -> Option<Vec<u8>> {
     if burst::serving() {
@@ -1719,6 +1899,46 @@ fn dcopy(addr: u64, len: usize) -> Option<Vec<u8>> {
         unsafe { v.set_len(len) };
         v
     })
+}
+
+/// PERF5: [`dcopy`] of `len` bytes into `v` (its capacity reused: no
+/// allocation, and no first-touch faults once its pages are in). False:
+/// out of range or faulted (`v` empty).
+fn dcopy_vec(addr: u64, len: usize, v: &mut Vec<u8>) -> bool {
+    v.clear();
+    if burst::serving() {
+        return dcopy(addr, len).is_some_and(|b| {
+            v.extend_from_slice(&b);
+            true
+        });
+    }
+    if !(0x1_0000..0x8000_0000_0000).contains(&addr) || addr.checked_add(len as u64).is_none_or(|e| e > 0x8000_0000_0000) {
+        return false;
+    }
+    v.reserve(len);
+    // SAFETY: into `v`'s own `len` bytes of capacity; the length is set
+    // only after the copy wrote them all.
+    unsafe { fcopy(v.as_mut_ptr(), addr as *const u8, len) }.then(|| {
+        // SAFETY: as above.
+        unsafe { v.set_len(len) };
+    })
+    .is_some()
+}
+
+/// [`dcopy`] into `dst` (PERF4: the bridged sink's small reads without an
+/// allocation each); a burst reads its served memory as `dcopy` does.
+fn dcopy_into(addr: u64, dst: &mut [u8]) -> bool {
+    if burst::serving() {
+        return dcopy(addr, dst.len()).is_some_and(|v| {
+            dst.copy_from_slice(&v);
+            true
+        });
+    }
+    if !(0x1_0000..0x8000_0000_0000).contains(&addr) || addr.checked_add(dst.len() as u64).is_none_or(|e| e > 0x8000_0000_0000) {
+        return false;
+    }
+    // SAFETY: into `dst`'s own bytes; a fault in the copy is fixed up.
+    unsafe { fcopy(dst.as_mut_ptr(), addr as *const u8, dst.len()) }
 }
 
 // The hook's reads of title objects (direct, no syscall) with a fault
@@ -1895,6 +2115,20 @@ const SCAN_AUX: usize = 0x1_4940_BFE0;
 const GAME_CLOCK: usize = 0x1_4ABC_E278;
 static T_START: OnceLock<Instant> = OnceLock::new();
 
+/// ENG11 Recipe 2: `dword_14A9437AC`, incremented once per present (0x1424747C0);
+/// rows recorded with value F belong to the frame whose present makes it F+1.
+const PRESENT_COUNTER: usize = 0x1_4A94_37AC;
+
+/// FACE1: the present counter now (0: unknown, or a burst: its title memory is the capture's).
+pub(crate) fn present_stamp() -> u32 {
+    if burst::serving() {
+        return 0;
+    }
+    let Some(s) = STATE.get() else { return 0 };
+    // SAFETY: a title image global.
+    unsafe { pread::<u32>(real(s.title, PRESENT_COUNTER)) }.unwrap_or(0)
+}
+
 fn title_frame() -> u32 {
     let Some(s) = STATE.get() else { return 0 };
     // SAFETY: a title image global.
@@ -1956,7 +2190,7 @@ fn scan_snapshot() {
     let Some(s) = STATE.get().filter(|s| s.cfg.seq) else { return };
     // Only frames the seq writer will dump (it runs far behind the title).
     let f = title_frame();
-    if !s.cfg.at.contains(&u64::from(f)) && s.cfg.auto.is_none() {
+    if !s.cfg.at.contains(&u64::from(f)) && s.cfg.auto.is_none() && s.cfg.clock.is_empty() {
         return;
     }
     // SAFETY: title image globals.
@@ -1989,7 +2223,79 @@ extern "system" fn on_drain_flip(frame: usize, _id: usize) {
     // SAFETY: the stub's frame: the return address.
     let ret = unsafe { ((frame + 8) as *const u64).read() };
     if DRAIN_CUT.load(Ordering::Relaxed) && ret == real(s.title, DRAIN_RETURN) {
-        s.flush_drain(u64::from(title_frame()));
+        let k = u64::from(title_frame());
+        s.flush_drain(k);
+        cap_decide(k, render_switch("capskip", true), xnw_world::lists().pass_view());
+    } else {
+        CAP_SKIP.store(false, Ordering::Relaxed);
+    }
+}
+
+/// PERF4 `capskip=on|off` (default on; off: every frame captured, as
+/// before), `xnw_world::capskip`: the frame being drained is not captured
+/// (no draw hook capture, no list sinks, no pre-skin dispatch reads, no
+/// imposter reads, so no list): decided at the last drain flip.
+/// Never skipped: every 60th frame (the 60-frame lines are keyed on it),
+/// frames a dump or capture asks for (`CAP_ALLOWED`), a burst's frames.
+/// Left running on skipped frames: the drain marks and scan snapshot, the
+/// view maker hook (its writer map spans frames), the entity walk and
+/// ped skin bind hooks (thread state for the next recorded draw), the
+/// residency and scene-event hooks (worldahead: their queues drain at the
+/// next list), the UI keep path and the title's own encode.
+static CAP_SKIP: AtomicBool = AtomicBool::new(false);
+/// The run's mode allows it: screen list mode with the drain cut, no
+/// dumps (`at=`, `seq=`, `raw=`, `gt=`, census, `pack=2`).
+static CAP_ALLOWED: AtomicBool = AtomicBool::new(false);
+/// Frames skipped (the 60-frame line); means (ns) of the flip interval and
+/// of a cut to its list's publish; the last drain flip.
+static CAP_SKIPS: AtomicU64 = AtomicU64::new(0);
+static CAP_FRAME: AtomicU64 = AtomicU64::new(0);
+static CAP_BUILD: AtomicU64 = AtomicU64::new(0);
+static CAP_LAST_CUT: AtomicU64 = AtomicU64::new(0);
+
+/// Whether frame `now` is not captured (the hook's own frame key).
+#[inline]
+fn cap_skipped(now: u64) -> bool {
+    skip_frame(CAP_SKIP.load(Ordering::Relaxed), now)
+}
+
+/// A skipped drain skips its frame unless the 60-frame lines are keyed on it.
+#[inline]
+fn skip_frame(skip: bool, frame: u64) -> bool {
+    skip && frame % 60 != 0
+}
+
+/// [`cap_skipped`] for a sink (frame key read only on a skipped drain).
+#[inline]
+pub(crate) fn cap_skipped_now() -> bool {
+    CAP_SKIP.load(Ordering::Relaxed) && !burst::serving() && cap_skipped(frame_key())
+}
+
+/// At frame `k`'s cut: whether frame k+1 is captured (`on`: the switch;
+/// `pass`: the pass thread, None without one).
+fn cap_decide(k: u64, on: bool, pass: Option<xnw_world::capskip::PassView>) {
+    use xnw_world::capskip;
+    if !CAP_ALLOWED.load(Ordering::Relaxed) {
+        return;
+    }
+    let now = capskip::clock_ns();
+    let last = CAP_LAST_CUT.swap(now, Ordering::Relaxed);
+    // A gap over a second (a load, a pause) is no frame interval.
+    if last != 0 && now - last < 1_000_000_000 {
+        CAP_FRAME.store(capskip::mean(CAP_FRAME.load(Ordering::Relaxed), now - last), Ordering::Relaxed);
+    }
+    let skipped = cap_skipped(k);
+    if skipped {
+        CAP_SKIPS.fetch_add(1, Ordering::Relaxed);
+    }
+    let cut = capskip::Cut { now, frame: CAP_FRAME.load(Ordering::Relaxed), build: CAP_BUILD.load(Ordering::Relaxed), captured: !skipped };
+    CAP_SKIP.store(on && pass.is_some_and(|p| capskip::skip_next(&p, &cut)), Ordering::Relaxed);
+}
+
+/// A list published `ns` after its frame's cut.
+fn cap_built(ns: u64) {
+    if ns < 1_000_000_000 {
+        CAP_BUILD.store(xnw_world::capskip::mean(CAP_BUILD.load(Ordering::Relaxed), ns), Ordering::Relaxed);
     }
 }
 
@@ -2002,6 +2308,120 @@ static DRAIN_CUT: AtomicBool = AtomicBool::new(false);
 
 /// The frame a draw belongs to: the title's frame id under the drain cut,
 /// else our presented frame (the old cut).
+/// HAIR6 `hair=on`, UI1 `ui=on`: the pack writer's live modes (a capture's
+/// `pack=2` wins: the replay draws hair and UI from the capture). The run's
+/// start and a burst (LIVE1) call it.
+fn live_modes(render: bool) {
+    if hairlive::on() && render {
+        if pack::on() && !pack::live() {
+            xnw_core::warn!("world render: hair=on: the frame pack writer records a capture (pack=2): live hair off (the replay draws hair from the capture)");
+        } else {
+            pack::enable_hair();
+        }
+    }
+    // HAIR10 `hairribbon=on`: our guide ribbons (with `hair=on` its mode records what they read).
+    if hairribbon::on() && render {
+        if pack::on() && !pack::live() {
+            xnw_core::warn!("world render: hairribbon=on: the frame pack writer records a capture (pack=2): live ribbons off");
+        } else {
+            pack::enable_ribbon();
+        }
+    }
+    if headlive::on() && render {
+        if pack::on() && !pack::live() {
+            xnw_core::warn!("world render: head=on: the frame pack writer records a capture (pack=2): live head graph off (the replay runs it from the capture)");
+        } else {
+            pack::enable_head();
+        }
+    }
+    if uilive::on() && render {
+        if pack::on() && !pack::live() {
+            xnw_core::warn!("world render: ui=on: the frame pack writer records a capture (pack=2): live UI off (the replay draws it from the capture)");
+        } else {
+            match uilive::names() {
+                Ok(n) => {
+                    pack::enable_ui(n);
+                    xnw_world::set_ui_source(Some(ui_alone));
+                }
+                Err(e) => xnw_core::warn!("world render: ui=on: off: {e}"),
+            }
+        }
+    }
+}
+
+/// The frame of the last world list the live modes saw (LIVE1 front end).
+static LAST_LIST: AtomicU64 = AtomicU64::new(0);
+/// Frames without a world list before the UI is drawn alone (a world frame's
+/// list is a frame or two behind the present).
+const UI_ALONE_AFTER: u64 = 8;
+
+/// LIVE1 front end (`xnw_world::set_ui_source`, `ui=on`): at a present
+/// without a world list, after [`UI_ALONE_AFTER`] such frames, the last
+/// finished frame's UI rows from the live take, drawn into a layer.
+fn ui_alone() -> Option<(u64, std::sync::Arc<xnw_world::ui::UiLayer>)> {
+    let now = frame_key();
+    if !ui_shown() || now.saturating_sub(LAST_LIST.load(Ordering::Relaxed)) < UI_ALONE_AFTER {
+        return None;
+    }
+    let f = now.checked_sub(1)?;
+    let (data, blobs) = pack::take_live(f, 0)?;
+    let mut list = xnw_world::FrameList { frame: f, ..Default::default() };
+    uilive::frame(f, &mut list, data, std::sync::Arc::new(blobs));
+    list.ui.map(|u| (f, u))
+}
+
+/// `hair=on` (HAIR6), `ui=on` (UI1), default off: frame `frame`'s strand
+/// pixels and UI layer from the pack writer's live take into `list` (the
+/// list thread; a burst's frame loop, LIVE1).
+fn live_frame(frame: u64, stamp: u32, list: &mut xnw_world::FrameList) {
+    if !pack::live() {
+        return;
+    }
+    LAST_LIST.store(frame, Ordering::Relaxed);
+    // FACE1 probe: every 60 lists, whether the takes find their frame and what the pack's callbacks cost.
+    static LISTS: AtomicU64 = AtomicU64::new(0);
+    if LISTS.fetch_add(1, Ordering::Relaxed) % 60 == 59 {
+        xnw_core::info!("world render: frame {frame}: pack live (60 lists): {}", pack::live_probe());
+    }
+    let Some((data, blobs)) = pack::take_live(frame, stamp) else { return };
+    let blobs = std::sync::Arc::new(blobs);
+    // FACE1: the head graph first: the list's pre-skin takes its table.
+    if pack::head_live() && headlive::shown() {
+        headlive::frame(frame, data.clone(), blobs.clone());
+    }
+    if pack::hair_live() && xnw_core::live::on(xnw_core::live::HAIR, || u32::from(hairlive::on())) {
+        hairlive::frame(frame, list, data.clone(), blobs.clone());
+    }
+    if pack::ribbon_live() && xnw_core::live::on(xnw_core::live::HAIRRIBBON, || u32::from(hairribbon::on())) {
+        hairribbon::frame(frame, list, data.clone(), blobs.clone());
+    }
+    if ui_shown() {
+        uilive::frame(frame, list, data, blobs);
+    }
+}
+
+/// `ui=on` and the live switch (SW1 `ui`, capped: the pack writer's UI
+/// hooks are made at start; taken once a list).
+fn ui_shown() -> bool {
+    pack::ui_live() && xnw_core::live::on(xnw_core::live::UI, || u32::from(uilive::on()))
+}
+
+/// SW1: every live switch of the world probe read once at start, so the
+/// table holds the run's start values (`live.rs`); the bridgeps programs
+/// in their `bridgefam` bit order.
+pub(crate) fn live_prime() -> Vec<u32> {
+    use xnw_core::live;
+    live::value(live::BRIDGEPS, bridgeps::live_start);
+    live::value(live::BRIDGEFAM, bridgeps::fam_start);
+    live::value(live::BIGCOPY, bridgeps::drain_start);
+    live::value(live::HAIR, || u32::from(hairlive::on()));
+    live::value(live::HAIRRIBBON, || u32::from(hairribbon::on()));
+    live::value(live::HEAD, || u32::from(headlive::on()));
+    live::value(live::UI, || u32::from(uilive::on()));
+    live::value(live::TEX, crate::worldtex::tex_start);
+    bridgeps::wanted().to_vec()
+}
+
 fn frame_key() -> u64 {
     if burst::serving() {
         return burst::frame();
@@ -2055,6 +2475,31 @@ fn last_draw_streams() -> Option<(u64, u64, u64)> {
     }
     let d = c.draws.last()?;
     Some((d.vb_at, d.vb_len, d.mesh_at))
+}
+
+/// INT1: gives a vehicle draw's material table to this thread's last
+/// recorded draw (as [`attach_bridged`]). False: no such draw.
+fn attach_vehmat(t: vehmat::Table) -> bool {
+    if burst::serving() {
+        return burst::attach(|d| {
+            d.vehmat = Some(t);
+            true
+        });
+    }
+    let Some(s) = STATE.get() else { return false };
+    let slot = s.slot();
+    let Ok(mut g) = slot.lock() else { return false };
+    let now = frame_key();
+    match g.as_mut() {
+        Some(c) if c.frame == now => match c.draws.last_mut() {
+            Some(d) if d.hook_n == c.seen => {
+                d.vehmat = Some(t);
+                true
+            }
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// `bridgeps`: gives a draw's binding inputs to this thread's last
@@ -2112,12 +2557,66 @@ fn attach_sink_range(word: u32) -> bool {
 /// instanced wheels (`skinrules` bit 8), the PreSkinD records (`preskin=on`)
 /// and the bridged rows (`bridgeps`).
 static SINK_WHEELS: AtomicBool = AtomicBool::new(false);
+static SINK_INSTREC: AtomicBool = AtomicBool::new(false);
+
+/// Whether the instance-record consumer is installed (`instrec`).
+pub(crate) fn instrec_sink() -> bool {
+    SINK_INSTREC.load(Ordering::Relaxed)
+}
+
+/// `instrec`: gives a static instanced draw's worlds to this thread's last
+/// recorded draw, when that is the draw the sink belongs to (as `attach_wheel`).
+fn attach_instrec(w: Vec<[f32; 12]>) -> bool {
+    if burst::serving() {
+        return burst::attach(|d| (!d.skinned).then(|| d.inst_rec = Some(w)).is_some());
+    }
+    let Some(s) = STATE.get() else { return false };
+    let slot = s.slot();
+    let Ok(mut g) = slot.lock() else { return false };
+    let now = frame_key();
+    match g.as_mut() {
+        Some(c) if c.frame == now => match c.draws.last_mut() {
+            Some(d) if d.hook_n == c.seen && !d.skinned => {
+                d.inst_rec = Some(Box::new(w));
+                true
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// A row's world and instances from its instance records (`instrec`): the
+/// records' worlds after the list's instances, the row's world the identity.
+pub(crate) fn place_instrec(list: &mut xnw_world::FrameList, w: &[[f32; 12]]) -> (xnw_world::Mat, u32, u32) {
+    let first = (list.instances.len() / 12) as u32;
+    for x in w {
+        list.instances.extend_from_slice(x);
+    }
+    ([1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0], first, w.len() as u32)
+}
 static SINK_PRESKIN: AtomicBool = AtomicBool::new(false);
 static SINK_BRIDGE: AtomicBool = AtomicBool::new(false);
+static SINK_VEHMAT: AtomicBool = AtomicBool::new(false);
+static SINK_SLOD: AtomicBool = AtomicBool::new(false);
+
+/// NPC1: the sink being handed follows a `ped_slod_tint` hook draw (burst: its hook draw's effect).
+fn slod_want() -> bool {
+    SINK_SLOD.load(Ordering::Relaxed) && if burst::serving() { burst::current_slod() } else { slodtint::pending() }
+}
+
+/// INT1: the sink being handed follows a vehicle-body hook draw (burst: its hook draw's effect).
+fn vehmat_want() -> bool {
+    SINK_VEHMAT.load(Ordering::Relaxed) && if burst::serving() { burst::current_vehicle() } else { vehmat::pending() }
+}
 
 /// Registers the list sink's consumers the switches ask for (the live
 /// probe, and `xnw burst`, which hands them a capture's sinks).
 pub(crate) fn install_sinks(render: bool) {
+    if skinhook::instrec_start() && render {
+        SINK_INSTREC.store(true, Ordering::Relaxed);
+        xnw_core::info!("world render: instance records: draws of the static instanced programs (`*_inst` effects) read at the list sink (instrec=off: not)");
+    }
     if preskin::on() {
         preskin::install();
         SINK_PRESKIN.store(true, Ordering::Relaxed);
@@ -2131,7 +2630,15 @@ pub(crate) fn install_sinks(render: bool) {
         SINK_BRIDGE.store(true, Ordering::Relaxed);
         xnw_core::info!("world render: bridgeps: draws of pixel programs {:08x?} read at the list sink for the title's own programs in our pass", bridgeps::wanted());
     }
-    if SINK_PRESKIN.load(Ordering::Relaxed) || SINK_WHEELS.load(Ordering::Relaxed) || SINK_BRIDGE.load(Ordering::Relaxed) {
+    if vehmat::on() && render {
+        SINK_VEHMAT.store(true, Ordering::Relaxed);
+        xnw_core::info!("world render: vehmat: vehicle-body draws' material colours (T8+0x540 by T9+0x100) read at the list sink (vehmat=off: not)");
+    }
+    if slodtint::on() && render {
+        SINK_SLOD.store(true, Ordering::Relaxed);
+        xnw_core::info!("world render: slodtint: ped_slod_tint draws' palette colours (T8+0x60 by root 4 dword 0) read at the list sink (slodtint=off: not)");
+    }
+    if SINK_PRESKIN.load(Ordering::Relaxed) || SINK_WHEELS.load(Ordering::Relaxed) || SINK_BRIDGE.load(Ordering::Relaxed) || SINK_INSTREC.load(Ordering::Relaxed) || SINK_VEHMAT.load(Ordering::Relaxed) || SINK_SLOD.load(Ordering::Relaxed) {
         xnw_gpu::d3d12x::tap::set_draw_tap(Some((sink_want, on_sink)));
     }
 }
@@ -2142,18 +2649,54 @@ pub(crate) fn sinks_on() -> (bool, bool, bool) {
 }
 
 fn sink_want(pipeline: usize) -> bool {
-    (SINK_WHEELS.load(Ordering::Relaxed) && skinhook::wheel_want(pipeline)) || (SINK_PRESKIN.load(Ordering::Relaxed) && preskin::draw_want(pipeline)) || (SINK_BRIDGE.load(Ordering::Relaxed) && bridgeps::draw_want(pipeline))
+    // PERF4 `capskip`: no sink reads for a frame not captured (and nothing learnt for noencode).
+    if cap_skipped_now() {
+        return false;
+    }
+    let want = (SINK_INSTREC.load(Ordering::Relaxed) && skinhook::instrec_want(pipeline)) || (SINK_WHEELS.load(Ordering::Relaxed) && skinhook::wheel_want(pipeline)) || (SINK_PRESKIN.load(Ordering::Relaxed) && preskin::draw_want(pipeline)) || (SINK_BRIDGE.load(Ordering::Relaxed) && bridgeps::draw_want(pipeline)) || vehmat_want() || slod_want();
+    // ENG8: the answer classes the draw's program set for `XNW_PATCH=noencode` (a no-op when that is off).
+    crate::encode::learn(want);
+    want
+}
+
+/// The list's readers, for `encode.rs`: (one that reads every draw's binding: a capture's frame pack; one
+/// that picks draws by pipeline and says so through `encode::learn`: a sink consumer or a live pack mode).
+#[cfg(not(test))]
+pub(crate) fn list_readers() -> (bool, bool) {
+    let (wheels, preskin, bridge) = sinks_on();
+    (pack::on() && !pack::live(), wheels || preskin || bridge || instrec_sink() || vehmat_sink() || slod_sink() || pack::live())
 }
 
 fn on_sink(d: &xnw_gpu::d3d12x::tap::TapDraw) {
+    if SINK_INSTREC.load(Ordering::Relaxed) && skinhook::instrec_want(d.pipeline) {
+        skinhook::on_instrec_sink(d);
+    }
     if SINK_WHEELS.load(Ordering::Relaxed) && skinhook::wheel_want(d.pipeline) {
         skinhook::on_wheel_sink(d);
     } else if SINK_PRESKIN.load(Ordering::Relaxed) && preskin::draw_want(d.pipeline) {
+        let _t = xnw_core::framewall::scope(xnw_core::framewall::SINK_PRESKIN);
         preskin::on_draw_sink(d);
     }
     if SINK_BRIDGE.load(Ordering::Relaxed) && bridgeps::draw_want(d.pipeline) {
+        let _t = xnw_core::framewall::scope(xnw_core::framewall::SINK_BRIDGE);
         bridgeps::on_draw_sink(d);
     }
+    if vehmat_want() {
+        vehmat::on_draw_sink(d);
+    }
+    if slod_want() {
+        slodtint::on_draw_sink(d);
+    }
+}
+
+/// NPC1: whether far peds' palette blocks are read at the list sink.
+pub(crate) fn slod_sink() -> bool {
+    SINK_SLOD.load(Ordering::Relaxed)
+}
+
+/// INT1: whether vehicle material tables are read at the list sink.
+pub(crate) fn vehmat_sink() -> bool {
+    SINK_VEHMAT.load(Ordering::Relaxed)
 }
 
 /// A row's placement fields as the wheel placement reads and sets them.
@@ -2367,7 +2910,20 @@ fn capture_light(s: &State, c: &mut Capture, geom: u64, ret: u64, tls: u64, samp
         } else {
             (d.tex_desc, d.alpha_clip) = crate::worldtex::albedo(&crate::worldtex::globals(), d.shader);
             d.layer_desc = crate::worldtex::last_layers();
+            d.extra = crate::worldtex::last_extra();
         }
+        // A vehicle body draw takes the paint of this thread's last handler Draw.
+        let class = if thin { d.thin.tex.class } else { d.extra.class };
+        if class == crate::worldtex::CLASS_PAINT {
+            d.paint = paint::now();
+        }
+        // INT1: its sink is asked for the material table (WHL1: wheels and tyres too).
+        vehmat::set_pending(crate::worldtex::vehmat_class(class) && SINK_VEHMAT.load(Ordering::Relaxed));
+        // NPC1: a far ped's sink is asked for its palette block.
+        slodtint::set_pending(class == crate::worldtex::CLASS_SLOD && SINK_SLOD.load(Ordering::Relaxed));
+    } else {
+        vehmat::set_pending(false);
+        slodtint::set_pending(false);
     }
     d.stage_tls = (r64(TLS_STAGE) & 0xFFFF_FFFF) as u32;
     let ctx = r64(TLS_CTX);
@@ -3434,6 +3990,11 @@ fn write_frame_with(s: &State, c: &Capture, finish: bool) -> std::io::Result<()>
         for (i, b) in c.lod_list.iter().enumerate() {
             std::fs::write(raw.join(format!("lod-{i}.bin")), b)?;
         }
+        // The batches' hide and near fade-in bitsets (u32 words, LSB first; VEH3c),
+        // named by draws.tsv inst_hide / inst_near, so the replay culls as live does.
+        for (i, b) in c.mask_list.iter().enumerate() {
+            std::fs::write(raw.join(format!("mask-{i}.bin")), b.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
+        }
         // The frame's skinned bones (window or spans) and
         // where each (curIndex, curCount) starts in them.
         let skin = skin_copy_live(s, &c.draws);
@@ -3461,7 +4022,8 @@ fn write_frame_with(s: &State, c: &Capture, finish: bool) -> std::io::Result<()>
             head += &format!("\tslot{i}");
         }
         // The range word of the hook's record and of the draw's own (sink) record.
-        head += "\trange\town_range";
+        // Then the batch's hide and near fade-in bitsets: blobs/mask-N.bin (VEH3c).
+        head += "\trange\town_range\tinst_hide\tinst_near";
         writeln!(out, "{head}")?;
         let mut keys = (0u32, 0u32, 0u32);
         for (i, d) in c.draws.iter().enumerate() {
@@ -3556,6 +4118,10 @@ fn write_frame_with(s: &State, c: &Capture, finish: bool) -> std::io::Result<()>
             }
             let word = |w: Option<u32>| w.map_or("-".into(), |w| format!("{w:#x}"));
             row += &format!("\t{}\t{}", word(d.range), word(d.sink_range));
+            match d.inst {
+                Some(i) => row += &format!("\t{}\t{}", ix(i.mask), ix(i.near)),
+                None => row += "\t-\t-",
+            }
             writeln!(out, "{row}")?;
         }
         out.flush()?;
@@ -3896,6 +4462,12 @@ fn albedo(tex_at: u64, effect: u64) -> Albedo {
     }
 }
 
+/// `lights=on` at the run's start (asked once).
+fn lamps_asked() -> bool {
+    static ASKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ASKED.get_or_init(xnw_world::lamps::asked)
+}
+
 /// Turns a captured frame into the pass's list: each new geometry once (its
 /// title vertex buffer and meshlets copied here, on the writer thread, and
 /// the meshlets expanded to vertex-buffer indices; the vertex decode is the
@@ -3910,6 +4482,22 @@ fn render_frame(c: Capture, cache: &mut xnw_world::GeometryCache<()>, dump: Opti
     list.sun = tc.as_deref().and_then(sun_of);
     list.sky = tc.as_deref().and_then(sky_of);
     list.light = tc.as_deref().map(|b| light_of(b, list.sky.as_ref(), true));
+    // POST3: the game's step, s (GameClock game_ms.step +0xC, f32; read by 0x14119ab60 for the adaptation CB's dt [V]).
+    list.step = STATE.get().and_then(|s| bytes(real(s.title, GAME_TIME_MS + 0xC), 4)).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).filter(|x| x.is_finite() && *x >= 0.0);
+    // `lights=on` (LIGHT2): the title's scene lights, the render side's buffer of its CPU array
+    // (0x1487BAF40 + 374784 x dword_148FDC4D0, count dword_1488CD81C; set at frame stage 62 [V LIGHT1]).
+    if lamps_asked()
+        && let Some(s) = STATE.get()
+    {
+        let word = |va: usize| bytes(real(s.title, va), 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        list.lamps = match (word(0x1_48FD_C4D0), word(0x1_488C_D81C)) {
+            (Some(buf), Some(n)) if buf < 2 && n <= xnw_world::lamps::CAP => {
+                let at = real(s.title, 0x1_487B_AF40) + xnw_formats::framepack::LIGHT_ARRAY_BYTES as u64 * u64::from(buf);
+                (n == 0).then(Vec::new).or_else(|| bytes(at, n as usize * xnw_world::lamps::RECORD)).map(|b| std::sync::Arc::new(xnw_world::lamps::decode(&b, n)))
+            }
+            _ => None,
+        };
+    }
     if let Some(s) = STATE.get()
         && let Some(grid) = water_now(s.title)
         && let Some(cam) = list.main_camera()
@@ -3969,6 +4557,7 @@ fn render_frame(c: Capture, cache: &mut xnw_world::GeometryCache<()>, dump: Opti
     let mut veh_tables = skinhook::VehTables::default();
     let mut veh_rows = 0u32;
     let mut wheel_rows = 0u32;
+    let mut instrec_rows = 0u32;
     // Rows with an instanced draw's reads; of them left as they were: a remap already, no palette or instances, palette too far.
     let mut wheel_left = [0u32; 4];
     // The instanced wheels' own palette (made at the first such row): their
@@ -3988,17 +4577,7 @@ fn render_frame(c: Capture, cache: &mut xnw_world::GeometryCache<()>, dump: Opti
     // draws for this frame (the pack writer's live hair mode), their pixels with the list.
     // `ui=on` (UI1, default off): the title's UI draws for this frame (the
     // writer's live UI mode), drawn through its programs into the list's UI layer.
-    if pack::live()
-        && let Some((data, blobs)) = pack::take_live(c.frame)
-    {
-        let blobs = std::sync::Arc::new(blobs);
-        if pack::hair_live() {
-            hairlive::frame(c.frame, &mut list, data.clone(), blobs.clone());
-        }
-        if pack::ui_live() {
-            uilive::frame(c.frame, &mut list, data, blobs);
-        }
-    }
+    live_frame(c.frame, c.stamp, &mut list);
     // The title's multi-pass techniques (0x1451AD540: one draw
     // per technique pass, passes[base+k] with its own program set) submit the
     // same geometry, placement, state and sample mask again; our pass draws
@@ -4037,6 +4616,8 @@ fn render_frame(c: Capture, cache: &mut xnw_world::GeometryCache<()>, dump: Opti
     // Albedo per (texture, effect) once a frame: origin_of walks the
     // texture registry (shared counters, per-file lookup) on every call.
     let mut albedos: HashMap<(u64, u64), Albedo> = HashMap::new();
+    // INT1: material tables placed in this list's instance floats, by table.
+    let mut vm_placed: HashMap<usize, u32> = HashMap::new();
     // Each list row's v1 draw (draws.tsv index), as list-draws.tsv.
     let mut list_v1: Vec<usize> = Vec::new();
     let v1_of = |d: &Draw| (d as *const Draw as usize - c.draws.as_ptr() as usize) / std::mem::size_of::<Draw>();
@@ -4157,7 +4738,7 @@ fn render_frame(c: Capture, cache: &mut xnw_world::GeometryCache<()>, dump: Opti
             if cull_batch != NO_CULL {
                 list.cull.rows.push((list.draws.len() as u32, cull_batch));
             }
-            list.draws.push(DrawRecord { geom: key, world: identity, viewport: d.viewport, effect: d.shader, albedo: Albedo::Flat(xnw_world::flat_colour(d.shader)), palette: NO_PALETTE, stage: stage_of(d), inst_first: first, inst_count: count, bone_first: 0, bone_count: 0, material: xnw_world::Material { albedo_desc: d.tex_desc, alpha_clip: d.alpha_clip, layers: d.layer_desc, stipple: xnw_world::stipple_lanes(d.stipple), state_index: [d.state[0], d.state[1], d.state[2]], ..Default::default() }, state: states.get(d), remap: xnw_world::NO_REMAP, ped: false });
+            list.draws.push(DrawRecord { geom: key, world: identity, viewport: d.viewport, effect: d.shader, albedo: Albedo::Flat(xnw_world::flat_colour(d.shader)), palette: NO_PALETTE, stage: stage_of(d), inst_first: first, inst_count: count, bone_first: 0, bone_count: 0, material: xnw_world::Material { albedo_desc: d.tex_desc, alpha_clip: d.alpha_clip, layers: d.layer_desc, stipple: xnw_world::stipple_lanes(d.stipple), state_index: [d.state[0], d.state[1], d.state[2]], tint_palette: d.extra.tint_slot, tint_rows: d.extra.tint_rows, tint_inv: d.extra.tint_inv, paint: d.paint.unwrap_or([0.0; 6]), paint_on: d.paint.is_some(), ..Default::default() }, state: states.get(d), remap: xnw_world::NO_REMAP, ped: false });
             list_v1.push(v1_of(d));
             continue;
         }
@@ -4215,11 +4796,28 @@ fn render_frame(c: Capture, cache: &mut xnw_world::GeometryCache<()>, dump: Opti
             place_wheel(&mut list, &mut wheel_pal, w, &mut wr, &mut wheel_left, &mut wheel_rows);
         }
         let WheelRow { world, palette, bone_first, bone_count, remap, inst_first, inst_count } = wr;
+        // VEH2: a placed wheel row is a vehicle program (no ped weight normalisation, as the
+        // vehicle rules above); its 205-bone flag would otherwise keep it in the ped skip
+        // (its remap now set, so `preskinbits` bit 3 leaves it flagged).
+        let ped = ped && !(d.wheel.is_some() && inst_count > 0);
+        // `instrec`: a static instanced draw's row from its records (not an instanced-call row: those carry instances already).
+        let (world, inst_first, inst_count) = match d.inst_rec.as_deref() {
+            Some(w) if inst_count == 0 && palette == xnw_world::NO_PALETTE && !w.is_empty() => {
+                instrec_rows += 1;
+                place_instrec(&mut list, w)
+            }
+            _ => (world, inst_first, inst_count),
+        };
         let tex = d.diffuse.map_or(0, |(_, _, _, t)| t.at);
         let ta = Instant::now();
         let alb = (tex != 0).then(|| *albedos.entry((tex, d.effect)).or_insert_with(|| albedo(tex, d.effect)));
         split[2] += ta.elapsed().as_nanos() as u64;
-        list.draws.push(DrawRecord { geom: key, world, viewport: d.viewport, effect: d.shader.max(d.effect), albedo: if let Some(a) = alb { a } else { Albedo::Flat(xnw_world::flat_colour(d.shader)) }, palette, stage: stage_of(d), inst_first, inst_count, bone_first, bone_count, material: xnw_world::Material { albedo_desc: d.tex_desc, alpha_clip: d.alpha_clip, layers: d.layer_desc, stipple: xnw_world::stipple_lanes(d.stipple), state_index: [d.state[0], d.state[1], d.state[2]], ..Default::default() }, state: states.get(d), remap, ped });
+        let vehmat = d.vehmat.as_ref().and_then(|t| vehmat::place(&mut list, &mut vm_placed, t));
+        // POL2: the livery section (relative to the block) and its masks ride with it.
+        let (livery_at, livery) = d.vehmat.as_ref().filter(|_| vehmat.is_some()).map_or((0, [0; 2]), |t| (t.livery_at, t.livery));
+        // NPC1: a far ped's block: the vertex program's k mode.
+        let slod = d.vehmat.as_ref().filter(|_| vehmat.is_some()).map_or(0, |t| t.slod);
+        list.draws.push(DrawRecord { geom: key, world, viewport: d.viewport, effect: d.shader.max(d.effect), albedo: if let Some(a) = alb { a } else { Albedo::Flat(xnw_world::flat_colour(d.shader)) }, palette, stage: stage_of(d), inst_first, inst_count, bone_first, bone_count, material: xnw_world::Material { albedo_desc: d.tex_desc, alpha_clip: d.alpha_clip, layers: d.layer_desc, stipple: xnw_world::stipple_lanes(d.stipple), state_index: [d.state[0], d.state[1], d.state[2]], tint_palette: d.extra.tint_slot, tint_rows: d.extra.tint_rows, tint_inv: d.extra.tint_inv, paint: d.paint.unwrap_or([0.0; 6]), paint_on: d.paint.is_some(), vehmat, coat: d.extra.class == crate::worldtex::CLASS_PAINT, livery_at, livery, slod, ..Default::default() }, state: states.get(d), remap, ped });
         list_v1.push(v1_of(d));
     }
     if skinlog && c.frame % 60 == 0 {
@@ -4247,6 +4845,9 @@ fn render_frame(c: Capture, cache: &mut xnw_world::GeometryCache<()>, dump: Opti
     }
     if c.frame % 60 == 0 && rules & skinhook::VEH_INST != 0 {
         xnw_core::info!("{}", skinhook::wheel_line(c.frame, wheel_rows, wheel_left));
+    }
+    if c.frame % 60 == 0 && instrec_sink() {
+        xnw_core::info!("{}", skinhook::instrec_line(c.frame, instrec_rows));
     }
     let inst_ms = ti.elapsed().as_secs_f64() * 1e3;
     if c.frame % 60 == 0 {
@@ -4364,9 +4965,11 @@ fn render_frame(c: Capture, cache: &mut xnw_world::GeometryCache<()>, dump: Opti
             // The join key is the draw's own record read at its sink, not the hook's.
             let draw_of = |row: usize| list_v1.get(row).and_then(|&i| c.draws.get(i));
             list.preskin = preskin::frame_for(list.frame, &list, |row| draw_of(row).and_then(|d| d.sink_range).unwrap_or(u32::MAX));
+            // `pedhold`: rows without an item this frame take their last one.
+            let held = preskin::hold(&mut list) as usize;
             if frame % 60 == 0 {
                 let words: Vec<(Option<u32>, Option<u32>)> = (0..list.draws.len()).filter_map(draw_of).map(|d| (d.sink_range, d.range)).collect();
-                xnw_core::info!("{}", preskin::join_line(frame, &words, list.preskin.draws.len()));
+                xnw_core::info!("{}", preskin::join_line(frame, &words, list.preskin.draws.len() - held));
             }
         }
         // `bridgeps`: the rows whose sinks were read, for the title's own programs in our pass.
@@ -4399,9 +5002,13 @@ fn render_frame(c: Capture, cache: &mut xnw_world::GeometryCache<()>, dump: Opti
             }
         }
         xnw_world::lists().publish(list);
+        if c.cut_ns != 0 {
+            cap_built(xnw_world::capskip::clock_ns().saturating_sub(c.cut_ns));
+        }
     }
     if frame % 60 == 0 {
         let (published, replaced) = xnw_world::lists().counts();
+        let skips = CAP_SKIPS.load(Ordering::Relaxed);
         let mut passes: Vec<((u64, u32), usize)> = Vec::new();
         for d in &c.draws {
             match passes.iter_mut().find(|(k, _)| *k == (d.pass.0, d.pass.1)) {
@@ -4411,7 +5018,7 @@ fn render_frame(c: Capture, cache: &mut xnw_world::GeometryCache<()>, dump: Opti
         }
         let passes: Vec<String> = passes.iter().map(|((p, s), n)| format!("{p:#x}/{s} {n}")).collect();
         xnw_core::info!(
-            "world render: frame {frame}: {} draws seen, {draws} recorded ({main} main view), {palettes} palettes, skinned draws {skin_draws} ({skin_agree} agree with the TLS pointer, extent {skin_extent} bones); {new} new geometries ({} KiB copied, {failed} failed, geometry not ready {not_ready}), cache {} ({evicted} evicted); hook {:.2} ms ({} B read: palettes), list {:.2} ms; lists {published} published, {replaced} replaced; passes {}; entries (60 frames) {}; instanced batches {batches} (cpu-list {}, gpu-buffer {gpu_batches}; instanced calls not recorded: {} without TLS, {} geometry unreadable), ({no_lod} without a LOD record), instances: tested {tested}, outside frustum {outside}, wrong LOD {wrong_lod}, hidden {hidden}, drawn {drawn}; {inst_ms:.2} ms; batches with a near fade-in set {near_batches}",
+            "world render: frame {frame}: {} draws seen, {draws} recorded ({main} main view), {palettes} palettes, skinned draws {skin_draws} ({skin_agree} agree with the TLS pointer, extent {skin_extent} bones); {new} new geometries ({} KiB copied, {failed} failed, geometry not ready {not_ready}), cache {} ({evicted} evicted); hook {:.2} ms ({} B read: palettes), list {:.2} ms; lists {published} published, {replaced} replaced, {skips} frames not captured (capskip); passes {}; entries (60 frames) {}; instanced batches {batches} (cpu-list {}, gpu-buffer {gpu_batches}; instanced calls not recorded: {} without TLS, {} geometry unreadable), ({no_lod} without a LOD record), instances: tested {tested}, outside frustum {outside}, wrong LOD {wrong_lod}, hidden {hidden}, drawn {drawn}; {inst_ms:.2} ms; batches with a near fade-in set {near_batches}",
             c.seen,
             copied >> 10,
             cache.len(),
@@ -4444,7 +5051,31 @@ fn render_frame(c: Capture, cache: &mut xnw_world::GeometryCache<()>, dump: Opti
         // The albedo slot read at the hook, over the last 60 frames.
         let t = crate::worldtex::take_counts();
         let alpha = c.draws.iter().filter(|d| d.alpha_clip).count();
-        xnw_core::info!("world render: frame {frame}: albedo at the hook (60 frames): slot found {}, no albedo variable {}, not resident {}, not a view {}, effect lookups {}; this frame {alpha} alpha-clip draws", t[0], t[1], t[2], t[3], t[4]);
+        xnw_core::info!("world render: frame {frame}: albedo at the hook (60 frames): slot found {}, fallback {}, no albedo variable {}, not resident {}, not a view {}, effect lookups {}; this frame {alpha} alpha-clip draws", t[0], t[5], t[1], t[2], t[3], t[4]);
+        // Vehicle handler Draws (with a type-21 paint row) since the last line; this frame's painted and tinted draws.
+        let pc = paint::take();
+        let painted = c.draws.iter().filter(|d| d.paint.is_some()).count();
+        let bodies = c.draws.iter().filter(|d| d.extra.class == crate::worldtex::CLASS_PAINT).count();
+        let tinted = c.draws.iter().filter(|d| d.extra.tint_slot != 0).count();
+        let peds = c.draws.iter().filter(|d| d.extra.class == crate::worldtex::CLASS_PED).count();
+        xnw_core::info!("world render: frame {frame}: paint calls {} (60 frames), with paint {}; this frame painted draws {painted} of {bodies} vehicle-body draws, tint rows {tinted} of {peds} ped-effect draws", pc[0], pc[1]);
+        // W16P: why reads fail, over the same 60 frames.
+        let tw = crate::worldtex::take_tint();
+        let paint_why: Vec<String> = paint::REASONS.iter().zip(&pc[2..]).map(|(n, v)| format!("{n} {v}")).collect();
+        let tint_why: Vec<String> = crate::worldtex::TINT_NAMES.iter().zip(&tw).map(|(n, v)| format!("{n} {v}")).collect();
+        xnw_core::info!("world render: frame {frame}: paint rejected (60 frames): {}; tint (60 frames): {}", paint_why.join(", "), tint_why.join(", "));
+        if vehmat_sink() {
+            // INT1: this frame's vehicle-body draws with a material table (sinks over 60 frames).
+            let rows = c.draws.iter().filter(|d| d.vehmat.is_some()).count() as u32;
+            let tables = c.draws.iter().filter_map(|d| d.vehmat.as_ref().map(|t| std::sync::Arc::as_ptr(t) as usize)).collect::<std::collections::HashSet<_>>().len();
+            let asked = c.draws.iter().filter(|d| crate::worldtex::vehmat_class(d.extra.class)).count();
+            xnw_core::info!("{}", vehmat::line(frame, rows, asked, tables));
+        }
+        if slod_sink() {
+            let slod = c.draws.iter().filter(|d| d.extra.class == crate::worldtex::CLASS_SLOD).count();
+            let rows = c.draws.iter().filter(|d| d.vehmat.as_ref().is_some_and(|t| t.slod != 0)).count();
+            xnw_core::info!("{}", slodtint::line(frame, rows, slod));
+        }
         let decoded: Vec<String> = states.known.iter().take(12).map(|(k, v)| match v {
             Some(s) => format!("{}/{}/{}: depth {}{} f{} bias {} slope {:.2} cull {}{} blend {:?}", k[0], k[1], k[2], u8::from(s.depth_enable), if s.depth_write { "w" } else { "" }, s.depth_func, s.depth_bias, f32::from_bits(s.slope_bias), s.cull, if s.front_ccw { " ccw" } else { "" }, s.blend),
             None => format!("{}/{}/{}: unread", k[0], k[1], k[2]),
@@ -4459,7 +5090,7 @@ fn render_frame(c: Capture, cache: &mut xnw_world::GeometryCache<()>, dump: Opti
             (0..6).map(|k| format!("{} {:.2} ms", PART_NAMES[k], ms(p[k]))).collect::<Vec<_>>().join(", "),
             ms(p[6].saturating_sub(known)),
             hook_ms,
-            thin::line()
+            thin::line() + &instcache::line()
         );
         let top: Vec<String> = census.iter().take(10).map(|((s, k), n)| format!("{s}/{}/{}/{} {n}", k[0], k[1], k[2])).collect();
         xnw_core::info!("world render: frame {frame}: state census (stage/blend/depth-stencil/raster draws): {}; sun {:?}", top.join(", "), list_sun);
@@ -4750,7 +5381,77 @@ fn want_pack(frame: u64) -> bool {
     }
     let open = |done: &AtomicBool, left: &AtomicU64| !(done.load(Ordering::Relaxed) && left.load(Ordering::Relaxed) == 0);
     let auto_open = s.cfg.auto.is_some() && (open(&AUTO_DONE, &AUTO_LEFT) || (s.cfg.auto_veh > 0 && open(&VEH_DONE, &VEH_LEFT)));
-    auto_open || (s.cfg.raw > 0 && s.cfg.at.contains(&frame))
+    auto_open || clock_near(&s.cfg, s.title) || (s.cfg.raw > 0 && s.cfg.at.contains(&frame))
+}
+
+/// REFDIFF: the title's clocks as upstream's REF5 reads them
+///.
+const GAME_TIME_MS: usize = 0x1_4ABB_EF40;
+const CINE_MANAGER: usize = 0x1_4A9E_CAC8;
+/// The game ms when instance 0 first played (`u64::MAX`: not yet).
+static PLAY_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+static CLOCK_FIRED: AtomicU64 = AtomicU64::new(0);
+static CLOCK_LEFT: AtomicU64 = AtomicU64::new(0);
+
+/// (seconds since the cinematic played on the game clock, cinematic time
+/// while it plays, game ms, cinematic state); None when the clock is unreadable.
+fn clock_read(title: usize) -> Option<(Option<f64>, Option<f64>, u32, u32)> {
+    // SAFETY: title image globals (pread); the instance chain by the fault-fixed copy (dread).
+    let ms = unsafe { pread::<u32>(real(title, GAME_TIME_MS)) }?;
+    let inst = unsafe { pread::<u64>(real(title, CINE_MANAGER)) }.filter(|&m| m != 0).and_then(|m| unsafe { dread::<u64>(m + 0x20) }).filter(|&a| a != 0).and_then(|a| unsafe { dread::<u64>(a) }).filter(|&i| i != 0);
+    // SAFETY: as above (fault-fixed reads).
+    let (state, time) = inst.map_or((u32::MAX, f32::NAN), |i| unsafe { (dread::<u32>(i + 0x43C).unwrap_or(u32::MAX), dread::<f32>(i + 0x460).unwrap_or(f32::NAN)) });
+    let playing = matches!(state, 6 | 8);
+    if playing && PLAY_MS.compare_exchange(u64::MAX, u64::from(ms), Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        xnw_core::info!("world probe: clock: the cinematic plays at game ms {ms} (cinematic time {time:.3} s)");
+    }
+    let play = PLAY_MS.load(Ordering::Relaxed);
+    let since = (play != u64::MAX).then(|| (f64::from(ms) - play as f64) / 1000.0);
+    Some((since, (playing && time.is_finite()).then_some(f64::from(time)), ms, state))
+}
+
+/// Whether a clock window is open or within 2 s of opening (the pack
+/// records only frames it may write).
+fn clock_near(cfg: &Config, title: usize) -> bool {
+    if cfg.clock.is_empty() {
+        return false;
+    }
+    if CLOCK_LEFT.load(Ordering::Relaxed) > 0 {
+        return true;
+    }
+    let Some((since, cine, _, _)) = clock_read(title) else { return false };
+    let fired = CLOCK_FIRED.load(Ordering::Relaxed);
+    cfg.clock.iter().enumerate().take(64).any(|(i, &(c, at))| fired >> i & 1 == 0 && (if c { cine } else { since }).is_some_and(|now| now >= at - 2.0))
+}
+
+/// `gt=` / `ct=`: whether `frame` (handed on in order) is dumped.
+fn clock_dump(cfg: &Config, title: usize, frame: u64) -> bool {
+    if cfg.clock.is_empty() {
+        return false;
+    }
+    let Some((since, cine, ms, state)) = clock_read(title) else { return false };
+    let line = || format!("frame {frame} game ms {ms} cine state {state} since play {} cine time {}", since.map_or("-".into(), |t| format!("{t:.3}")), cine.map_or("-".into(), |t| format!("{t:.3}")));
+    if CLOCK_LEFT.load(Ordering::Relaxed) > 0 {
+        CLOCK_LEFT.fetch_sub(1, Ordering::Relaxed);
+        xnw_core::info!("world probe: clock window: {}", line());
+        return true;
+    }
+    for (i, &(c, at)) in cfg.clock.iter().enumerate().take(64) {
+        let Some(now) = (if c { cine } else { since }) else { continue };
+        if CLOCK_FIRED.load(Ordering::Relaxed) >> i & 1 != 0 || now < at {
+            continue;
+        }
+        CLOCK_FIRED.fetch_or(1 << i, Ordering::Relaxed);
+        let key = if c { "ct" } else { "gt" };
+        if now - at > 5.0 {
+            xnw_core::info!("world probe: clock: {key} {at} s jumped over, nothing dumped: {}", line());
+            continue;
+        }
+        CLOCK_LEFT.store(u64::from(cfg.clock_frames - 1), Ordering::Relaxed);
+        xnw_core::info!("world probe: clock: {key} {at} s passed, window of {} frames: {}", cfg.clock_frames, line());
+        return true;
+    }
+    false
 }
 
 /// A draw's stage: TLS+0x950 at the draw, else the last pass begin.
@@ -5039,10 +5740,10 @@ fn dump_list(dir: &std::path::Path, list: &FrameList) -> std::io::Result<()> {
     std::fs::create_dir_all(&fdir)?;
     std::fs::create_dir_all(&shared)?;
     // albedo_desc (descriptor slot, hex) and alpha_clip (0/1) at the end.
-    let mut out = String::from("mesh_at\tmesh_len\tvb_at\tvb_len\tib\thash\tviewport\tstage\tpalette\tinst_first\tinst_count\teffect\tworld\tbone_first\tbone_count\talbedo_desc\talpha_clip\tremap\tped\tlayer0\tlayer1\tlayer2\tlayer3\tstipple\tstate\trstate\n");
+    let mut out = String::from("mesh_at\tmesh_len\tvb_at\tvb_len\tib\thash\tviewport\tstage\tpalette\tinst_first\tinst_count\teffect\tworld\tbone_first\tbone_count\talbedo_desc\talpha_clip\tremap\tped\tlayer0\tlayer1\tlayer2\tlayer3\tstipple\tstate\trstate\ttint_palette\ttint_rows\ttint_inv\tpaint\n");
     for r in &list.draws {
         let g = r.geom;
-        let _ = writeln!(out, "{:#x}\t{}\t{:#x}\t{}\t{}\t{:#x}\t{:#x}\t{}\t{}\t{}\t{}\t{:#x}\t{}\t{}\t{}\t{:#x}\t{}\t{}\t{}\t{:#x}\t{:#x}\t{:#x}\t{:#x}\t{:#x}\t{}/{}/{}\t{}", g.mesh_at, g.mesh_len, g.vb_at, g.vb_len, g.ib, g.hash, r.viewport, r.stage, r.palette, r.inst_first, r.inst_count, r.effect, matrix_text(&r.world), r.bone_first, r.bone_count, r.material.albedo_desc, u8::from(r.material.alpha_clip), r.remap, u8::from(r.ped), r.material.layers[0], r.material.layers[1], r.material.layers[2], r.material.layers[3], r.material.stipple, r.material.state_index[0], r.material.state_index[1], r.material.state_index[2], rstate_text(r.state));
+        let _ = writeln!(out, "{:#x}\t{}\t{:#x}\t{}\t{}\t{:#x}\t{:#x}\t{}\t{}\t{}\t{}\t{:#x}\t{}\t{}\t{}\t{:#x}\t{}\t{}\t{}\t{:#x}\t{:#x}\t{:#x}\t{:#x}\t{:#x}\t{}/{}/{}\t{}\t{:#x}\t{:#x}\t{}\t{}", g.mesh_at, g.mesh_len, g.vb_at, g.vb_len, g.ib, g.hash, r.viewport, r.stage, r.palette, r.inst_first, r.inst_count, r.effect, matrix_text(&r.world), r.bone_first, r.bone_count, r.material.albedo_desc, u8::from(r.material.alpha_clip), r.remap, u8::from(r.ped), r.material.layers[0], r.material.layers[1], r.material.layers[2], r.material.layers[3], r.material.stipple, r.material.state_index[0], r.material.state_index[1], r.material.state_index[2], rstate_text(r.state), r.material.tint_palette, u32::from(r.material.tint_rows[0]) | u32::from(r.material.tint_rows[1]) << 8 | u32::from(r.material.tint_rows[2]) << 16, r.material.tint_inv, if r.material.paint_on { r.material.paint.iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>().join("|") } else { "-".into() });
         let stem = shared.join(format!("k-{:x}-{:x}", g.mesh_at, g.hash));
         if !stem.with_extension("vb").exists()
             && let Some(vb) = bytes(g.vb_at, g.vb_len.min(64 << 20) as usize)
@@ -5129,13 +5830,15 @@ pub unsafe fn start(base: usize) {
     };
     crate::worldtex::set_globals(base);
     let (cfg_cut_present, cfg_scan_exit, cfg_hookin) = (cfg.cut_present, cfg.scan_exit, cfg.hookin);
+    // PERF4 `capskip`: only in the screen list mode with nothing dumped.
+    let cfg_cap_allowed = cfg.render && !cfg.seq && cfg.at.is_empty() && cfg.raw == 0 && !cfg.pack && cfg.auto.is_none() && cfg.clock.is_empty() && !cfg.census;
     // The residency and scene-event hooks in every recording mode (capture
     // too: place.tsv / cine.tsv); geometry bytes are offered only to a screen pass.
     let (install, offer) = crate::worldahead::modes(render.as_deref());
     if install {
         crate::worldahead::set_offer(offer);
         // The rows go only into frame dumps; a screen run dumps with `raw=` or `seq=auto` (c.dump).
-        crate::worldahead::set_rows(!cfg.render || cfg.raw > 0 || cfg.auto.is_some());
+        crate::worldahead::set_rows(!cfg.render || cfg.raw > 0 || cfg.auto.is_some() || !cfg.clock.is_empty());
         // SAFETY: forwarded (nothing runs the title yet).
         unsafe { crate::worldahead::install(base) };
     }
@@ -5162,26 +5865,10 @@ pub unsafe fn start(base: usize) {
             xnw_core::warn!("world probe: pack=2 writes seq frames only (add seq=...); pack off");
         }
     }
-    // HAIR6 `hair=on`: the writer's live hair mode (a capture's `pack=2` wins: hair stays the replay's).
-    if hairlive::on() && cfg.render {
-        if pack::on() {
-            xnw_core::warn!("world render: hair=on: the frame pack writer records a capture (pack=2): live hair off (the replay draws hair from the capture)");
-        } else {
-            pack::set_arena(real(base, ARENA_BASE));
-            pack::enable_hair();
-        }
+    if cfg.render {
+        pack::set_arena(real(base, ARENA_BASE));
     }
-    // UI1 `ui=on`: the writer's live UI mode (a capture's `pack=2` wins: the replay draws the UI then).
-    if uilive::on() && cfg.render {
-        if pack::on() && !pack::live() {
-            xnw_core::warn!("world render: ui=on: the frame pack writer records a capture (pack=2): live UI off (the replay draws it from the capture)");
-        } else {
-            match uilive::names() {
-                Ok(n) => pack::enable_ui(n),
-                Err(e) => xnw_core::warn!("world render: ui=on: off: {e}"),
-            }
-        }
-    }
+    live_modes(cfg.render);
     install_sinks(cfg.render);
     // The imposter reads need the arena and the type table (the pack sets
     // them too; they are addresses only).
@@ -5198,7 +5885,10 @@ pub unsafe fn start(base: usize) {
     if thin::wanted() {
         xnw_core::info!("world probe: thin hook {}", if thin { format!("on: the hook copies what the title may change before the frame ends; {} threads decode the rest at the cut", thin::threads()) } else { "asked for, off (screen mode without pack=2 only)".to_string() });
     }
-    let state = State { cfg, title: base, tls_index: index, g: Globals::of(base), base: AtomicU64::new(u64::MAX), wait_world, done: AtomicBool::new(false), pending: AtomicU64::new(u64::MAX), slots: Mutex::new(Vec::new()), sent: AtomicU64::new(u64::MAX), late: [AtomicU64::new(0), AtomicU64::new(0)], tx: Mutex::new(tx), thin };
+    if instcache::wanted() {
+        xnw_core::info!("world probe: instance cache on: a batch's desc, list, handler words, LOD record and static records once per thread (rec+0/+8/+0x10 checked per draw; unloads and 600 frames unused drop it)");
+    }
+    let state = State { cfg, title: base, tls_index: index, g: Globals::of(base), base: AtomicU64::new(u64::MAX), wait_world, done: AtomicBool::new(false), pending: AtomicU64::new(u64::MAX), slots: Mutex::new(Vec::new()), sent: AtomicU64::new(u64::MAX), late: [AtomicU64::new(0), AtomicU64::new(0)], tx: Mutex::new(tx), thin, cache: instcache::wanted() };
     if STATE.set(state).is_err() {
         return;
     }
@@ -5264,6 +5954,11 @@ pub unsafe fn start(base: usize) {
     }
     let drain_cut = hooked == 2 && !cfg_cut_present;
     DRAIN_CUT.store(drain_cut, Ordering::Relaxed);
+    let cap_allowed = drain_cut && cfg_cap_allowed;
+    CAP_ALLOWED.store(cap_allowed, Ordering::Relaxed);
+    if cap_allowed {
+        xnw_core::info!("world probe: capskip {}: a frame whose list the pass thread would replace unseen is not captured (hooks, sinks, list build; every 60th frame kept; capskip=off: every frame)", if render_switch("capskip", true) { "on" } else { "off (switch)" });
+    }
     xnw_core::info!("world probe: frame cut {}", if drain_cut { "at the title's drain (frame id dword_14ABCE2A0; lists close when the drain returns)" } else { "at our present (old)" });
     // The ped skin bind 0x144E351B0 (which remap table the next ped draws use).
     let at = real(base, PED_SKIN_BIND) as usize;
@@ -5275,6 +5970,10 @@ pub unsafe fn start(base: usize) {
         }
     } else {
         xnw_core::warn!("world probe: ped skin bind 0x144E351B0 entry {got:02x?} not the expected one; no ped remap");
+    }
+    // Vehicle handler Draws carry the paint to their geometry draws (`paint=off`: none).
+    if std::env::var_os("XNW_WORLD_RENDER").is_some() {
+        paint::install(base, &|va| real(base, va) as usize);
     }
     // Each draw's entity (the draw-list walk's entry).
     let walk = real(base, LIST_WALK) as usize;
@@ -5319,11 +6018,14 @@ pub unsafe fn start(base: usize) {
         }
     }
     std::thread::spawn(move || {
+        // PERF5: the list recorder below the title's workers (XNW_HELPER_PRIO=normal: not).
+        xnw_core::win::helper_thread();
         let s = STATE.get().unwrap();
         let mut cache = xnw_world::GeometryCache::<()>::default();
         let mut panics = 0u32;
         for mut c in rx {
             let frame = c.frame;
+            let _wall = xnw_core::framewall::scope(xnw_core::framewall::LIST_BUILD);
             // The thin hook's draws decoded before the list is built.
             if s.thin {
                 thin::decode(&mut c);
@@ -5970,8 +6672,8 @@ mod tests {
 
     fn test_state(dir: &std::path::Path, seq: bool) -> State {
         let (tx, _rx) = mpsc::channel::<Capture>();
-        let cfg = Config { dir: dir.to_path_buf(), frames: 3, max: 100_000, at: Vec::new(), raw: 1, render: false, seq, skinlog: 0, census: false, auto: None, auto_veh: 0, cut_present: false, pack: false, scan_exit: false, hookin: false };
-        State { cfg, title: 0, tls_index: 0, g: Globals::default(), base: AtomicU64::new(0), wait_world: false, done: AtomicBool::new(false), pending: AtomicU64::new(u64::MAX), slots: Mutex::new(Vec::new()), sent: AtomicU64::new(u64::MAX), late: [AtomicU64::new(0), AtomicU64::new(0)], tx: Mutex::new(tx), thin: false }
+        let cfg = Config { dir: dir.to_path_buf(), frames: 3, max: 100_000, at: Vec::new(), raw: 1, render: false, seq, skinlog: 0, census: false, auto: None, auto_veh: 0, cut_present: false, pack: false, scan_exit: false, hookin: false, clock: Vec::new(), clock_frames: 1 };
+        State { cfg, title: 0, tls_index: 0, g: Globals::default(), base: AtomicU64::new(0), wait_world: false, done: AtomicBool::new(false), pending: AtomicU64::new(u64::MAX), slots: Mutex::new(Vec::new()), sent: AtomicU64::new(u64::MAX), late: [AtomicU64::new(0), AtomicU64::new(0)], tx: Mutex::new(tx), thin: false, cache: false }
     }
 
     /// An instanced call's handler fields as 0x1435A4D50 / 0x144E54970
@@ -6116,6 +6818,7 @@ mod tests {
         s.flush_drain(10);
         let f = rx.try_recv().unwrap();
         assert_eq!((f.frame, f.draws.len()), (10, 12), "one list, all three threads");
+        assert!(f.cut_ns != 0, "PERF4: stamped at its cut (the capskip build mean)");
         assert!(rx.try_recv().is_err());
         std::thread::scope(|sc| {
             sc.spawn(|| draw(&s, 11, 2));
@@ -6132,6 +6835,17 @@ mod tests {
         s.flush_drain(12);
         assert!(rx.try_recv().is_err(), "a late frame is not sent twice");
         assert_eq!(s.late.each_ref().map(|a| a.load(Ordering::Relaxed)), [3, 1]);
+    }
+
+    /// PERF4 `capskip`: a skipped drain still captures every 60th frame (the
+    /// 60-frame lines); the switch is on unless `capskip=off`.
+    #[test]
+    fn capskip_keeps_every_sixtieth_frame_and_its_switch() {
+        assert!(skip_frame(true, 121) && !skip_frame(true, 120) && !skip_frame(true, 0) && !skip_frame(false, 121));
+        assert!(switch_in("screen,gbuf=on", "capskip", true) && !switch_in("screen,capskip=off", "capskip", true) && switch_in("capskip=off,capskip=on", "capskip", true));
+        // Without a pass thread or with the switch off, no decision skips (CAP_ALLOWED is off in tests: no state change).
+        cap_decide(7, true, None);
+        assert!(!CAP_SKIP.load(Ordering::Relaxed));
     }
 
     /// A 40-frame sequence written by the writer: every frame complete
@@ -6827,6 +7541,8 @@ mod tests {
         // The wrapper's first 15 bytes move to the trampoline (its call made absolute).
         assert_eq!(crate::watch::relocated_len(&COMPACT_WRAPPER_BYTES), Some(15));
         assert_eq!(parse("d,seq=auto:peds>=4:draws>=2000:vehicles>=20:frames=6").map(|c| (c.auto, c.auto_veh)), Ok((Some((4, 2000, 6)), 20)));
+        // REFDIFF: game and cinematic clock keys (game clock first, each kind rising).
+        assert_eq!(parse("d,pack=2,ct=27.039,gt=60+37.1,gtframes=2").map(|c| (c.clock, c.clock_frames, c.seq)), Ok((vec![(false, 37.1), (false, 60.0), (true, 27.039)], 2, true)));
         assert!(is_vehicle_effect("standard_vehicle_paint") && is_vehicle_effect("vehicle_tyre") && !is_vehicle_effect("standard"));
         assert!(parse("").is_err());
         assert!(parse("d,bogus=1").is_err());

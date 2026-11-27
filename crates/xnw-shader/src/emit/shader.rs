@@ -46,6 +46,20 @@ pub const DESCRIPTOR_WORDS_SPACE: u32 = 6;
 /// each kind, sampler slots, the sampler guard).
 pub const HEAP_BOUNDS_SPACE: u32 = 7;
 
+/// XNW (BND1): the image dimensions a confined program may pick by index
+/// ([`Shader::confined`]), as DXIL resource kinds, in the order of the
+/// confinement words' masks (words 1-6) and of the heap's null images
+/// (2D: the bounds' word 1; the others at the confinement's word 7 on):
+/// 2D, 2D array, cube, 3D, 1D, 1D array. The translator declares no
+/// other image kind (a cube array is read as a cube, multisampled images
+/// are refused).
+pub const CONFINE_KINDS: [u32; 6] = [2, 7, 5, 4, 1, 6];
+
+/// The place of DXIL resource kind `kind` in [`CONFINE_KINDS`].
+pub fn confine_kind(kind: u32) -> Option<usize> {
+    CONFINE_KINDS.iter().position(|k| *k == kind)
+}
+
 /// What the host writes per view-heap slot in the runtime stride table, for
 /// buffers a shader reads without a stride known when it was translated.
 ///
@@ -123,6 +137,10 @@ thread_local! {
     /// XNW: of the last module this thread finished, what
     /// [`super::bitcode::Module::mark_nonuniform`] returned ([`super::last_nonuniform`]).
     pub(crate) static NONUNIFORM_MARKED: std::cell::Cell<(usize, usize, usize)> = const { std::cell::Cell::new((0, 0, 0)) };
+    /// XNW (SWEEP1): whether to keep the called functions' names
+    /// ([`super::collect_ops`]), and those of the last module finished.
+    pub(crate) static COLLECT_OPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static OPS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
@@ -236,6 +254,8 @@ pub(crate) struct Shader {
     pub host_copies: Option<u32>,
     /// XNW: the eight heap-limit words, loaded once in the entry block.
     heap_limits: Option<[V; 8]>,
+    /// XNW (BND1): the eight confinement words, loaded once in the entry block.
+    confine: Option<[V; 8]>,
     /// Mesh fallback: the root SRV lengths' buffer, and per root SRV
     /// handle the highest offset a 16-byte load may start at.
     root_lens: Option<V>,
@@ -309,6 +329,7 @@ impl Shader {
             page_table: None,
             host_copies: None,
             heap_limits: None,
+            confine: None,
             root_lens: None,
             root_limits: Vec::new(),
             flags: 0,
@@ -668,6 +689,87 @@ impl Shader {
         }
     }
 
+    /// XNW (BND1): the eight confinement words (`b1` in
+    /// [`HEAP_BOUNDS_SPACE`], [`super::Options::confine`]), loaded once in
+    /// the entry block: the first slot of the draw's own block of views it
+    /// picks by index; the masks of that block's slots (bit k: slot first
+    /// + k, 32 at most) holding a 2D, a 2D array, a cube, a 3D, a 1D and a
+    /// 1D array view ([`CONFINE_KINDS`]); the first of the heap's five
+    /// null images that are not 2D (2D array, cube, 3D, 1D, 1D array).
+    pub fn confine_words(&mut self) -> [V; 8] {
+        if let Some(w) = self.confine {
+            return w;
+        }
+        let (z, one) = (self.m.i32(0), self.m.i32(1));
+        let bind = [one, one, self.m.i32(HEAP_BOUNDS_SPACE), self.m.i8(2)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let entry = self.entry;
+        let h = self.op(entry, "createHandleFromBinding", Attr::ReadNone, self.t.handle, 217, &[bind, one, f]);
+        let h = self.annotate(entry, h, 13, 32);
+        let r0 = self.op(entry, "cbufferLoadLegacy.i32", Attr::ReadOnly, self.t.cbuf_ret, 59, &[h, z]);
+        let r1 = self.op(entry, "cbufferLoadLegacy.i32", Attr::ReadOnly, self.t.cbuf_ret, 59, &[h, one]);
+        let mut w = [z; 8];
+        for (k, slot) in w.iter_mut().enumerate() {
+            *slot = self.m.extract(entry, if k < 4 { r0 } else { r1 }, k as u32 % 4);
+        }
+        self.confine = Some(w);
+        w
+    }
+
+    /// The heap's permanent null a handle of `props` reads in place of an
+    /// index that is not its draw's: by kind, as [`Shader::bounded`]
+    /// lists them; with [`super::Options::confine`] an image that is not
+    /// 2D reads the null image of its own dimension (D3D12 leaves a read
+    /// through a view of another dimension undefined, a null one too).
+    fn null_for(&mut self, block: usize, sampler: bool, props: (u32, u32)) -> V {
+        let w = self.heap_limit_words();
+        let uav = props.0 & 0x1000 != 0;
+        match (sampler, props.0 & 0xFF, uav) {
+            (true, _, _) => w[7],
+            (false, 13, _) => w[5],
+            (false, 10..=12, false) => w[2],
+            (false, 10..=12, true) => w[3],
+            (false, _, true) => w[4],
+            (false, kind, false) => match confine_kind(kind).filter(|k| *k > 0 && super::CONFINE.with(std::cell::Cell::get)) {
+                Some(k) => {
+                    let first = self.confine_words()[7];
+                    let k = self.m.i32(k as u32 - 1);
+                    self.m.bin(block, super::bitcode::Bin::Add, first, k)
+                }
+                None => w[1],
+            },
+        }
+    }
+
+    /// XNW (BND1, [`super::Options::confine`]): `index`, an index the
+    /// program computed for a view it picks from the heap, if it names a
+    /// slot of the draw's own block that holds a view of the dimension
+    /// `props` declares; else the null of that kind ([`Shader::null_for`]).
+    /// A select on the index, both bounds and the dimension in one test:
+    /// `index - first` below 32 and its bit set in the dimension's mask
+    /// ([`Shader::confine_words`]). The host sets a bit only for a slot
+    /// whose descriptor it wrote with that dimension, so a buffer, a
+    /// constant view or a written image picked this way has no mask and
+    /// reads its null: the bridge binds none of those by index.
+    pub fn confined(&mut self, block: usize, index: V, props: (u32, u32)) -> V {
+        use super::bitcode::{Bin, pred};
+        let null = self.null_for(block, false, props);
+        let Some(kind) = confine_kind(props.0 & 0xFF).filter(|_| props.0 & 0x1000 == 0) else {
+            return null;
+        };
+        let c = self.confine_words();
+        let rel = self.m.bin(block, Bin::Sub, index, c[0]);
+        let (k32, k31, one, zero) = (self.m.i32(32), self.m.i32(31), self.m.i32(1), self.m.i32(0));
+        let near = self.m.cmp(block, pred::IULT, rel, k32);
+        let shift = self.m.bin(block, Bin::And, rel, k31);
+        let bit = self.m.bin(block, Bin::LShr, c[1 + kind], shift);
+        let bit = self.m.bin(block, Bin::And, bit, one);
+        let held = self.m.cmp(block, pred::NE, bit, zero);
+        let own = self.m.bin(block, Bin::And, near, held);
+        self.m.select(block, own, index, null)
+    }
+
     /// XNW: after VIctory 05c681c, GPL-3.0-or-later; words of
     /// spec section 7): `index` if it lies in its heap, else the heap's
     /// permanent null of the kind `props` names: a select on the index
@@ -678,15 +780,8 @@ impl Shader {
     /// sampler slots, null sampler.
     fn bounded(&mut self, block: usize, index: V, sampler: bool, props: (u32, u32)) -> V {
         let w = self.heap_limit_words();
-        let uav = props.0 & 0x1000 != 0;
-        let (limit, null) = match (sampler, props.0 & 0xFF, uav) {
-            (true, _, _) => (w[6], w[7]),
-            (false, 13, _) => (w[0], w[5]),
-            (false, 10..=12, false) => (w[0], w[2]),
-            (false, 10..=12, true) => (w[0], w[3]),
-            (false, _, false) => (w[0], w[1]),
-            (false, _, true) => (w[0], w[4]),
-        };
+        let limit = if sampler { w[6] } else { w[0] };
+        let null = self.null_for(block, sampler, props);
         let inside = self.m.cmp(block, super::bitcode::pred::IULT, index, limit);
         self.m.select(block, inside, index, null)
     }
@@ -706,6 +801,23 @@ impl Shader {
             flags::RESOURCE_HEAP
         };
         let index = self.bounded(block, index, sampler, props);
+        self.heap_handle_at(block, index, sampler, nonuniform, props)
+    }
+
+    /// XNW (BND1): a view heap handle for an index that is already the
+    /// draw's own or a null ([`Shader::confined`], [`Shader::null_for`]):
+    /// not bounded again.
+    pub fn heap_handle_own(&mut self, block: usize, index: V, props: (u32, u32)) -> V {
+        self.flags |= flags::RESOURCE_HEAP;
+        self.heap_handle_at(block, index, false, false, props)
+    }
+
+    /// The typed null of `props`' kind, as an index ([`Shader::null_for`]).
+    pub fn null_index(&mut self, block: usize, props: (u32, u32)) -> V {
+        self.null_for(block, false, props)
+    }
+
+    fn heap_handle_at(&mut self, block: usize, index: V, sampler: bool, nonuniform: bool, props: (u32, u32)) -> V {
         let nonuniform = nonuniform || super::NONUNIFORM_HEAP.with(std::cell::Cell::get);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
@@ -793,6 +905,11 @@ impl Shader {
                 }
             }
         }
+        // XNW (KILL1): [`super::Options::one_return`], before the uniformity
+        // pass (its post-dominators then meet in the joined block).
+        if super::ONE_RETURN.with(std::cell::Cell::get) {
+            self.m.join_returns();
+        }
         // XNW: every heap index that may differ between lanes
         // is declared non-uniform, after the passes (they move reads).
         let (keep, masked) = super::HEAP_UNIFORMITY.with(std::cell::Cell::get);
@@ -800,6 +917,10 @@ impl Shader {
         NONUNIFORM_MARKED.with(|c| c.set(marked));
         let insts = self.m.inst_count();
         INSTS.with(|c| c.set(insts));
+        if COLLECT_OPS.with(std::cell::Cell::get) {
+            let called = self.m.called();
+            OPS.with(|o| *o.borrow_mut() = called);
+        }
         #[cfg(test)]
         OPT_STATS.with(|c| c.set((before, insts)));
         let mut resources = None;
@@ -866,6 +987,30 @@ impl Shader {
                     kind: 2,
                     space: HEAP_BOUNDS_SPACE,
                     register: 0,
+                    dxil_kind: 13,
+                });
+            }
+            // XNW (BND1): the confinement words, `b1` beside the bounds.
+            if self.confine.is_some() {
+                let arr = self.m.array(8, self.t.i32);
+                let ty = self.m.named_struct("HeapConfine", vec![arr]);
+                let p = self.m.ptr(ty);
+                let u = self.m.undef(p);
+                let ops = vec![
+                    Some(i32c(&mut self, cbv_list.len() as u32)),
+                    Some(self.m.md_value(u)),
+                    Some(empty),
+                    Some(i32c(&mut self, HEAP_BOUNDS_SPACE)),
+                    Some(i32c(&mut self, 1)),
+                    Some(i32c(&mut self, 1)),
+                    Some(i32c(&mut self, 32)),
+                    None,
+                ];
+                cbv_list.push(Some(self.m.md_node(ops)));
+                bindings.push(Binding {
+                    kind: 2,
+                    space: HEAP_BOUNDS_SPACE,
+                    register: 1,
                     dxil_kind: 13,
                 });
             }

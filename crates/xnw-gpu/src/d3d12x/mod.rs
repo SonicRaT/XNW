@@ -62,6 +62,7 @@ pub use host::{lock_owners, on_failure};
 pub use queue::frames_presented;
 pub use frameskip::render_all as frameskip_render_all;
 pub use pipeline::note_phase as pipeline_phase;
+pub use pipeline::warm::sweep as pipeline_sweep;
 pub use pipeline::warm::{Outcome as PrebuildOutcome, Settings as PrebuildSettings, at_launch as prebuild_at_launch, summary as prebuild_summary, warm as prebuild};
 
 /// The pipelines an earlier run found too slow to compile in-run (key, programs).
@@ -81,6 +82,26 @@ pub fn set_screen_source(f: fn() -> Option<windows::Win32::Graphics::Direct3D12:
 
 pub(crate) fn screen_source() -> Option<fn() -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource>> {
     SCREEN_SOURCE.get().copied()
+}
+
+/// PASS1: called once a present is done with the picture the screen source
+/// gave (its compose is sent; `host::wait_shown` waits for its GPU work).
+static SCREEN_SHOWN: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Sets what a present calls when it is done with our picture (first call wins).
+pub fn set_screen_shown(f: fn()) {
+    let _ = SCREEN_SHOWN.set(f);
+}
+
+/// Held from the screen source's picture to the end of its present.
+pub(crate) struct Shown;
+
+impl Drop for Shown {
+    fn drop(&mut self) {
+        if let Some(f) = SCREEN_SHOWN.get() {
+            f();
+        }
+    }
 }
 pub(crate) use shadow::gpu_written_copy;
 pub(crate) use descriptor::host::bindless_viewed_changed;
@@ -155,6 +176,12 @@ pub mod layout {
     pub const LIST6_IID: super::Iid = super::list::LIST_IIDS[7];
     pub const FENCE_IID: super::Iid = super::fence::FENCE_IIDS[0];
     pub const RESOURCE_IID: super::Iid = super::resource::RESOURCE_IIDS[0];
+}
+
+/// Whether null mode (`XNW_GPU=null...`) has reached its point: from then on
+/// no title draw reaches the host GPU (`frameskip.rs`).
+pub fn null_now() -> bool {
+    frameskip::null_now()
 }
 
 /// Frames presented so far.

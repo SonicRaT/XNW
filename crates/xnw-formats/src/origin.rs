@@ -301,7 +301,15 @@ pub struct Registry {
     /// Runs ever recorded absent, and the bypass counters.
     absent_runs: AtomicU64,
     counts_x1: [AtomicU64; 6],
+    /// The textures pages arrived for (file, texture), kept once a
+    /// consumer asked (`arrived_on`): the count cut from the front and the
+    /// last [`ARRIVED_KEPT`], oldest first ([`Registry::arrived_since`]).
+    arrived_on: std::sync::atomic::AtomicBool,
+    arrived: Mutex<(u64, VecDeque<(u32, u32)>)>,
 }
+
+/// Arrivals kept at most ([`Registry::arrived_since`]).
+const ARRIVED_KEPT: usize = 1 << 16;
 
 /// Names of [`Registry::bypass_counts`].
 pub const BYPASS_COUNTS: [&str; 6] = ["bypassed", "filled on demand", "page requests", "bytes not read", "bytes not decoded", "decode us avoided (est.)"];
@@ -361,6 +369,28 @@ impl Registry {
             reasons: Default::default(),
             absent_runs: AtomicU64::new(0),
             counts_x1: Default::default(),
+            arrived_on: std::sync::atomic::AtomicBool::new(false),
+            arrived: Mutex::new((0, VecDeque::new())),
+        }
+    }
+
+    /// The textures pages were recorded for (file, texture; repeats
+    /// possible) since `from` (a count this gave before; None: the first
+    /// ask), into `out`, and the count now. True when some were not kept
+    /// (the first ask, or more than [`ARRIVED_KEPT`] since `from`): then any
+    /// texture may have new pages. Each consumer keeps its own count;
+    /// arrivals are kept from the first ask on.
+    pub fn arrived_since(&self, from: Option<u64>, out: &mut Vec<(u32, u32)>) -> (u64, bool) {
+        out.clear();
+        self.arrived_on.store(true, Ordering::Relaxed);
+        let a = self.arrived.lock().unwrap_or_else(|e| e.into_inner());
+        let upto = a.0 + a.1.len() as u64;
+        match from {
+            Some(f) if f >= a.0 => {
+                out.extend(a.1.iter().skip((f - a.0) as usize).copied());
+                (upto, false)
+            }
+            _ => (upto, true),
         }
     }
 
@@ -441,6 +471,14 @@ impl Registry {
         drop(maps);
         self.note_absent(absent);
         self.counts[2].fetch_add(1, Ordering::Relaxed);
+        if self.arrived_on.load(Ordering::Relaxed) {
+            let mut a = self.arrived.lock().unwrap_or_else(|e| e.into_inner());
+            a.1.push_back((file, r.texture));
+            if a.1.len() > ARRIVED_KEPT {
+                a.1.pop_front();
+                a.0 += 1;
+            }
+        }
         if let Some(hook) = ARRIVAL.get() {
             hook(file, r.page, r.texture);
         }
@@ -808,6 +846,11 @@ pub fn prefix_of(addr: u64, len: u64) -> (Option<Origin>, Cut) {
     registry().prefix_of(addr, len)
 }
 
+/// [`Registry::arrived_since`] on the process's registry.
+pub fn arrived_since(from: Option<u64>, out: &mut Vec<(u32, u32)>) -> (u64, bool) {
+    registry().arrived_since(from, out)
+}
+
 /// [`Registry::peek`] on the process's registry.
 pub fn peek(addr: u64, len: u64) -> Option<Origin> {
     registry().peek(addr, len)
@@ -862,6 +905,36 @@ mod tests {
         assert_eq!(runs(&m), vec![(10, 15, 100), (15, 20, 900), (22, 35, 907), (35, 40, 305)]);
         m.remove(0, 100);
         assert!(m.is_empty());
+    }
+
+    /// Arrivals are kept from the first ask on (it reports "look at
+    /// all"), in order, absent reads too; each consumer reads from its own
+    /// count.
+    #[test]
+    fn arrivals_kept_after_first_ask() {
+        let (r, f) = registry_with_file();
+        let mut got = Vec::new();
+        r.record_pages(f, 0x100, &[0x10_0000], 0, 0x1000);
+        let (a, lost) = r.arrived_since(None, &mut got);
+        assert!(lost && got.is_empty(), "first ask: look at all, nothing kept before it");
+        r.record_pages(f, 0x400, &[0x10_0010], 0, 0x1_0000);
+        r.record_absent(f, 0x200, &[0x10_0000], 0x1000, 0x1000);
+        let (b, lost) = r.arrived_since(Some(a), &mut got);
+        assert!(!lost);
+        assert_eq!(got, vec![(f, 1), (f, 0)]);
+        assert_eq!(r.arrived_since(Some(b), &mut got), (b, false));
+        assert!(got.is_empty(), "nothing new since b");
+        // Another consumer from its own count sees them still.
+        r.arrived_since(Some(a), &mut got);
+        assert_eq!(got.len(), 2);
+        // A read that resolves to nothing is no arrival.
+        r.record_pages(f, 0x108, &[0x10_0000], 0, 0x1000);
+        assert_eq!(r.arrived_since(Some(b), &mut got), (b, false));
+        // Past the kept count: lost.
+        for _ in 0..=ARRIVED_KEPT {
+            r.record_pages(f, 0x400, &[0x10_0010], 0, 0x1_0000);
+        }
+        assert!(r.arrived_since(Some(b), &mut got).1, "cut: look at all");
     }
 
     /// One file: texture 0 at 0x0 (pages 0x0 + 0x1000 + 0x2000), texture

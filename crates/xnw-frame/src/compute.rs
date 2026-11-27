@@ -26,11 +26,11 @@ use xnw_shader::emit;
 use xnw_world::compute::{self as cr, Arg, Buffer, Image, Job, Outcome, Res, Runner, Shape, Use};
 use xnw_world::preskin::{self, Kind};
 
+use xnw_core::pair::fold;
+
 use crate::le32;
 use crate::pack::Pack;
 
-/// A buffer's address as the title's GPU sees it, past its CPU address.
-const GPU_ALIAS: u64 = 0x4_0000_0000;
 /// Kind 60 (`GROUPS`, v2.9): x, y, z group counts of a dispatch sink.
 pub const GROUPS: u16 = 60;
 /// In `named`'s map: a slot read as a constant buffer.
@@ -38,7 +38,7 @@ const NAMED_CBV: u32 = u32::MAX;
 
 /// The runner's key of a title address (CPU and GPU aliases agree).
 pub fn key(addr: u64) -> u64 {
-    if addr == 0 { 0 } else { addr % GPU_ALIAS }
+    if addr == 0 { 0 } else { fold(addr) }
 }
 
 enum LRes {
@@ -53,6 +53,14 @@ enum LArg {
     Constants(Vec<u32>),
     Table(Vec<(u32, LRes)>),
     View(Vec<u8>),
+}
+
+/// HAIR7: table views [`load`] left for the runner to bind in place (since the last [`in_place_taken`]).
+static IN_PLACE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// HAIR7: the views [`load`] left in place since the last call.
+pub fn in_place_taken() -> u64 {
+    IN_PLACE.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// A dispatch sink's record as owned bytes, and what it lacked.
@@ -137,6 +145,14 @@ fn shape(v: &fp::SlotView, read: Option<u8>) -> Option<(Shape, u32)> {
 /// The record of dispatch sink `sink` for a program that reads `uses`
 /// (table slots, by kind) and `named` (table slots with strides).
 pub fn load(pack: &Pack, sink: u32, uses: &[Use], named: &HashMap<(u16, u32), u32>) -> Loaded {
+    load_with(pack, sink, uses, named, &|_| false)
+}
+
+/// [`load`], with no bytes for a buffer whose address `held` says the
+/// runner already keeps (the runner binds what it keeps and ignores them;
+/// FACE1: the head graph's 25 MB arena was copied for each of its ~190
+/// dispatches, seconds a frame).
+pub fn load_with(pack: &Pack, sink: u32, uses: &[Use], named: &HashMap<(u16, u32), u32>, held: &dyn Fn(u64) -> bool) -> Loaded {
     let mut out = Loaded::default();
     let put = |roots: &mut Vec<LArg>, i: u16, a: LArg| {
         if roots.len() <= usize::from(i) {
@@ -169,13 +185,34 @@ pub fn load(pack: &Pack, sink: u32, uses: &[Use], named: &HashMap<(u16, u32), u3
             let uav = v.layout == view::UNORDERED && v.kind == view::BUFFER;
             match v.kind {
                 view::CONSTANT | view::BUFFER | view::PLACED_BUFFER => {
-                    let bytes = pack.slot_bytes(sink, root, v.slot).ok().map(|(_, b)| b).unwrap_or_default();
                     let kind = match (v.kind, v.format, stride) {
                         (view::CONSTANT, ..) | (_, _, Some(&NAMED_CBV)) => Kind::Cbv,
                         (view::BUFFER, f, _) if f != 0 && f != 39 => Kind::Typed { format: f as i32, bytes: v.width.max(1) as u32 },
                         (_, _, Some(&s)) if s > 4 => Kind::Structured(s),
                         _ => Kind::Raw,
                     };
+                    // HAIR7: a view a live sink left in place is bound there by
+                    // a runner that binds in place (`Runner::in_place`), when
+                    // its page window is open: no bytes here.
+                    let at = fp::table_slot(u32::from(root), v.slot);
+                    let placed = !uav
+                        && kind != Kind::Cbv
+                        && pack.data.refs_of(sink).any(|r| r.kind == kind::BUFFER && r.slot == at && Pack::in_place(r))
+                        && xnw_gpu::shared::world_part(xnw_gpu::shared::WORLD_BRIDGE)
+                        && kind.extent(v.bytes).is_some_and(|(size, _)| xnw_gpu::shared::world_ready(key(v.addr), size, xnw_world::bridge::unit(kind)));
+                    if placed {
+                        IN_PLACE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        slots.push((v.slot, LRes::Buffer { key: key(v.addr), kind, uav, len: v.bytes, bytes: Vec::new() }));
+                        continue;
+                    }
+                    if kind != Kind::Cbv && v.addr != 0 && held(key(v.addr)) {
+                        slots.push((v.slot, LRes::Buffer { key: key(v.addr), kind, uav, len: v.bytes, bytes: Vec::new() }));
+                        continue;
+                    }
+                    let bytes = pack.slot_bytes(sink, root, v.slot).ok().map(|(_, b)| b).unwrap_or_default();
+                    if bytes.is_empty() && uav && pack.data.refs_of(sink).any(|r| r.kind == kind::BUFFER && r.slot == at && Pack::in_place(r)) {
+                        out.lacks.push(format!("root {root} slot {}: {} B unordered view left in place, not read: zeros", v.slot, v.bytes));
+                    }
                     if bytes.is_empty() && !uav {
                         out.lacks.push(format!("root {root} slot {}: {} B ({:?}) without bytes: zeros", v.slot, v.bytes, kind));
                     }

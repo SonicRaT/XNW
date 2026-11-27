@@ -18,6 +18,12 @@
 //! `WaveSize`, 8 lanes) are right in every case. The hardware adapter must
 //! be right in every case (asserted); on the software adapter only the
 //! native rows are. This is sink 490 of pk8a f1027 (report).
+//!
+//! Mode 2 (FACE1) keeps every lane: the branch is wave-wide, as the
+//! console's `s_cbranch_execz` is (taken by the wave when no lane is in the
+//! mask), and the operations take the mask as data. That is how the
+//! translator lowers a divergent branch around a whole-wave section; it
+//! must be right on every adapter (asserted).
 
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
@@ -41,17 +47,21 @@ void main(uint t : SV_GroupIndex, uint3 g : SV_GroupID) {
     uint lane = WaveGetLaneIndex();
     o.Store4(at, uint4(t, lane, WaveReadLaneFirst(t), WaveGetLaneCount()));
     uint4 r = uint4(WaveActiveCountBits(true), 0, 0, 0);
-#if EXIT
+    bool on = true;
+#if EXIT == 1
     if (lane >= K) {
         o.Store4(at + 16, r);
         return;
     }
+#elif EXIT == 2
+    on = lane < K;
+    if (WaveActiveAnyTrue(on))
 #else
     if (lane < K)
 #endif
     {
-        r.y = WaveActiveCountBits(true);
-        r.z = (uint)WaveActiveSum(1.0f);
+        r.y = WaveActiveCountBits(on);
+        r.z = (uint)WaveActiveSum(on ? 1.0f : 0.0f);
         r.w = WaveReadLaneAt(t, 0);
     }
     o.Store4(at + 16, r);
@@ -78,16 +88,17 @@ fn dxc() -> Option<PathBuf> {
     dirs.into_iter().rev().map(|d| d.join("dxc.exe")).find(|p| p.is_file())
 }
 
-fn compile(dxc: &Path, threads: u32, ws: u32, exit: bool) -> Vec<u8> {
-    compile_src(dxc, "w", SRC, threads, ws, exit)
+fn compile(dxc: &Path, threads: u32, ws: u32, mode: u8) -> Vec<u8> {
+    compile_src(dxc, "w", SRC, threads, ws, mode)
 }
 
-fn compile_src(dxc: &Path, name: &str, text: &str, threads: u32, ws: u32, exit: bool) -> Vec<u8> {
+/// `mode`: 0 the first K lanes branch, 1 the others return, 2 a wave-wide branch (every lane stays).
+fn compile_src(dxc: &Path, name: &str, text: &str, threads: u32, ws: u32, mode: u8) -> Vec<u8> {
     let dir = std::env::temp_dir().join(format!("xnw-wave-packing-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let (src, out) = (dir.join(format!("{name}.hlsl")), dir.join(format!("{name}{threads}-{ws}-{}-{}.dxil", u8::from(exit), k())));
+    let (src, out) = (dir.join(format!("{name}.hlsl")), dir.join(format!("{name}{threads}-{ws}-{mode}-{}.dxil", k())));
     std::fs::write(&src, text).unwrap();
-    let run = Command::new(dxc).args(["-nologo", "-O3", "-T", "cs_6_6", "-E", "main"]).arg(format!("-DWS={ws}")).arg(format!("-DNT={threads}")).arg(format!("-DEXIT={}", u8::from(exit))).arg(format!("-DK={}", k())).arg("-Fo").arg(&out).arg(&src).output().unwrap();
+    let run = Command::new(dxc).args(["-nologo", "-O3", "-T", "cs_6_6", "-E", "main"]).arg(format!("-DWS={ws}")).arg(format!("-DNT={threads}")).arg(format!("-DEXIT={mode}")).arg(format!("-DK={}", k())).arg("-Fo").arg(&out).arg(&src).output().unwrap();
     assert!(run.status.success(), "dxc: {}", String::from_utf8_lossy(&run.stderr));
     std::fs::read(out).unwrap()
 }
@@ -161,26 +172,27 @@ fn wave_packing() {
     let Some(dxc) = dxc() else { return println!("SKIPPED: no dxc") };
     let soft = host.caps.wave_lanes.0 < 32;
     let mut wrong = Vec::new();
-    for (threads, exit) in [64u32, 128, 192, 256, 512, 1024].into_iter().flat_map(|t| [(t, false), (t, true)]) {
+    for (threads, mode) in [64u32, 128, 192, 256, 512, 1024].into_iter().flat_map(|t| [(t, 0u8), (t, 1), (t, 2)]) {
         for ws in [64u32, 32, 0] {
             if ws > 0 && !(host.caps.wave_lanes.0..=host.caps.wave_lanes.1).contains(&ws) {
                 continue;
             }
-            let cs = compile(&dxc, threads, ws, exit);
+            let cs = compile(&dxc, threads, ws, mode);
             let mut bad = Vec::new();
             for _ in 0..std::env::var("XNW_WAVE_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(1) {
                 let w = run(&host, &cs, threads).expect("dispatch");
                 let (b, line) = judge(&w, threads, ws);
-                println!("{line}{}", if exit { " (other lanes return)" } else { "" });
+                println!("{line}{}", ["", " (other lanes return)", " (wave-wide branch)"][usize::from(mode)]);
                 bad.extend(b);
             }
             if !bad.is_empty() {
-                wrong.push((threads, ws, exit));
+                wrong.push((threads, ws, mode));
             }
         }
     }
     println!("wrong: {wrong:?}");
     assert!(wrong.iter().all(|&(_, ws, _)| ws != 0), "native waves ran wrong: {wrong:?}");
+    assert!(wrong.iter().all(|&(_, _, mode)| mode != 2), "a wave-wide branch ran wrong: {wrong:?}");
     if !soft {
         assert!(wrong.is_empty(), "the hardware adapter ran waves wrong: {wrong:?}");
     }
@@ -252,7 +264,7 @@ fn lane_reads() {
             continue;
         }
         let threads = ws.max(64);
-        let cs = compile_src(&dxc, "r", READS, threads, ws, false);
+        let cs = compile_src(&dxc, "r", READS, threads, ws, 0);
         let w = run(&host, &cs, threads).expect("dispatch");
         let bad = judge_reads(&w);
         println!("WaveSize({ws:2}) lanes {:3}: reads wrong (name, lane, got, want) {bad:?}", w[2]);

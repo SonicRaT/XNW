@@ -74,6 +74,32 @@ pub(crate) struct Host {
     next_rtv: AtomicU32,
     /// The window's swap chain and compositor (`present.rs`, base 58).
     pub(crate) presenter: Mutex<Option<super::present::Presenter>>,
+    /// PASS1: submissions sent without a wait ([`Host::execute_nowait`]),
+    /// oldest first; finished (popped) only under `submitted`, in order.
+    pending: Mutex<std::collections::VecDeque<Pending>>,
+    /// Wakes the retire thread when a submission is sent without a wait.
+    pending_cv: std::sync::Condvar,
+}
+
+/// PASS1: a submission sent without a CPU wait (a kept UI list with
+/// `uiwait=off`, the show's compose with `showwait=off`): what it holds
+/// until its fence value is reached, then its bottom-of-pipe writes and the
+/// title's queue signals made after it, in submission order.
+struct Pending {
+    value: u64,
+    lists: usize,
+    /// Title lists (kept UI): later title submissions, the title's queue
+    /// signals and its memory waits come after it. The compose (ours) only
+    /// holds its own list.
+    title: bool,
+    prepared: std::time::Instant,
+    _lists: Vec<Option<ID3D12CommandList>>,
+    retired: Vec<Retired>,
+    uploaded: Vec<Uploads>,
+    flight: Option<super::descriptor::gate::Flight>,
+    writes: Vec<(usize, Written, usize)>,
+    /// Title fences (held references) and the values their queue signals set.
+    signals: Vec<(usize, u64)>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -463,6 +489,61 @@ pub(crate) fn upload_pool_bytes() -> u64 {
 /// classification (us).
 pub(crate) static SKIPPED_WORK: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
+/// PASS1: finishes the submissions sent without a wait as their fence
+/// values are reached, so a title that waits on their writes or signals
+/// (and submits nothing meanwhile) goes on.
+fn retire_thread(host: &'static Host) {
+    // SAFETY: plain creation of our own event.
+    let Ok(event) = (unsafe { CreateEventW(None, false, false, None) }) else {
+        xnw_core::warn!("d3d12x: retire thread: no event; pending submissions finish at the next submission");
+        return;
+    };
+    loop {
+        let (value, lists) = {
+            let mut q = host.pending.lock().unwrap_or_else(|e| e.into_inner());
+            while q.is_empty() {
+                q = host.pending_cv.wait(q).unwrap_or_else(|e| e.into_inner());
+            }
+            q.front().map(|p| (p.value, p.lists)).expect("not empty")
+        };
+        // SAFETY: a plain query.
+        if unsafe { host.fence.GetCompletedValue() } < value {
+            host.wait_fence(event, value, lists);
+        }
+        let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        host.retire_pending(&mut submitted, 0);
+    }
+}
+
+/// PASS1: the last compose sent without a wait (its fence value; 0: none).
+pub(crate) static LAST_SHOW: AtomicU64 = AtomicU64::new(0);
+
+/// PASS1: the last compose has run on the GPU (no wait).
+pub fn shown_done() -> bool {
+    let value = LAST_SHOW.load(Ordering::Acquire);
+    // SAFETY: a plain query.
+    value == 0 || host_if_made().is_none_or(|h| unsafe { h.fence.GetCompletedValue() } >= value)
+}
+
+/// PASS1: waits until the last compose has run on the GPU (our pass thread,
+/// before it writes a picture the compose read). No lock is taken.
+pub fn wait_shown() {
+    let value = LAST_SHOW.load(Ordering::Acquire);
+    let Some(h) = host_if_made() else { return };
+    // SAFETY: plain queries on our fence; our own event, closed here.
+    unsafe {
+        if value == 0 || h.fence.GetCompletedValue() >= value {
+            return;
+        }
+        let Ok(event) = CreateEventW(None, false, false, None) else { return };
+        if h.fence.SetEventOnCompletion(value, event).is_ok() {
+            const WAIT_TIMEOUT: u32 = 0x102;
+            while WaitForSingleObject(event, 1000).0 == WAIT_TIMEOUT && h.device.GetDeviceRemovedReason().is_ok() {}
+        }
+        let _ = CloseHandle(event);
+    }
+}
+
 /// `XNW_GPU_DEADLINE=<ms>`: how long a submission may run before the
 /// process ends itself (0: no deadline). Default 1200 on a hardware
 /// adapter (Windows' GPU timeout is 2 s), 0 on WARP.
@@ -579,6 +660,25 @@ fn dred_report(device: &ID3D12Device) {
                 node = n.pNext;
             }
         }
+        // CLOTH3: the last marker before the first operation not run, per unfinished list
+        // (breadcrumb contexts: the bridged rows' program names, `bridged::dred_marks`).
+        if let Ok(d1) = dred.cast::<windows::Win32::Graphics::Direct3D12::ID3D12DeviceRemovedExtendedData1>()
+            && let Ok(out) = d1.GetAutoBreadcrumbsOutput1()
+        {
+            let mut node = out.pHeadAutoBreadcrumbNode;
+            while !node.is_null() {
+                let n = &*node;
+                let done = if n.pLastBreadcrumbValue.is_null() { 0 } else { *n.pLastBreadcrumbValue };
+                if done < n.BreadcrumbCount && !n.pBreadcrumbContexts.is_null() {
+                    let cx = std::slice::from_raw_parts(n.pBreadcrumbContexts, n.BreadcrumbContextsCount as usize);
+                    if let Some(c) = cx.iter().filter(|c| c.BreadcrumbIndex <= done).max_by_key(|c| c.BreadcrumbIndex) {
+                        let name = if n.pCommandListDebugNameA.is_null() { String::new() } else { std::ffi::CStr::from_ptr(n.pCommandListDebugNameA.cast()).to_string_lossy().into_owned() };
+                        xnw_core::warn!("d3d12x: removal: list {name}: last marker before the stop (op {}): {}", c.BreadcrumbIndex, c.pContextString.to_string().unwrap_or_default());
+                    }
+                }
+                node = n.pNext;
+            }
+        }
         if let Ok(D3D12_DRED_PAGE_FAULT_OUTPUT { PageFaultVA, .. }) = dred.GetPageFaultAllocationOutput() {
             if PageFaultVA != 0 {
                 xnw_core::warn!("d3d12x: removal: page fault at GPU address {PageFaultVA:#x}");
@@ -667,8 +767,14 @@ pub fn host_device() -> Option<&'static crate::host::Host> {
 
 /// The submission host, made on first use over the one host device;
 /// `None` without one (lists then record nothing and nothing runs).
+static HOST: OnceLock<Option<Host>> = OnceLock::new();
+
+/// The submission host if it was made (never makes it).
+pub(crate) fn host_if_made() -> Option<&'static Host> {
+    HOST.get()?.as_ref()
+}
+
 pub(crate) fn host() -> Option<&'static Host> {
-    static HOST: OnceLock<Option<Host>> = OnceLock::new();
     HOST.get_or_init(|| {
         let device = host_device()?.device.clone();
         match create(device) {
@@ -706,6 +812,8 @@ fn create(device: ID3D12Device) -> windows::core::Result<Host> {
             next_dsv: AtomicU32::new(0),
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
+            pending: Mutex::new(std::collections::VecDeque::new()),
+            pending_cv: std::sync::Condvar::new(),
         })
     }
 }
@@ -739,6 +847,9 @@ pub(crate) struct HostList {
     prelude_crumbs: super::crumbs::ListCrumbs,
     /// `ui=keep`: it holds kept work since its reset (uikeep.rs).
     pub(crate) kept: std::sync::atomic::AtomicBool,
+    /// PASS1: the fence value of its last submission sent without a wait
+    /// (0: none): its reset and release wait for it first ([`HostList::settle`]).
+    pub(crate) inflight: AtomicU64,
 }
 
 // SAFETY: D3D12 lists are used by one thread at a time (the title's rule);
@@ -968,6 +1079,7 @@ impl Host {
                 crumbs: super::crumbs::ListCrumbs::new(),
                 prelude_crumbs: super::crumbs::ListCrumbs::new(),
                 kept: std::sync::atomic::AtomicBool::new(false),
+                inflight: AtomicU64::new(0),
             })
             .inspect(|l: &HostList| {
                 l.crumbs.mark(&l.list, "list begin");
@@ -979,9 +1091,140 @@ impl Host {
     /// Runs closed lists in order and waits for them, then does what the
     /// lists' shaders wrote back and their bottom-of-pipe writes.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        self.submit(runs, true, true);
+    }
+
+    /// PASS1: [`Host::execute`] without the CPU wait: the submission's
+    /// fence value, its writes and what it holds go to [`Pending`], finished
+    /// by the retire thread or by whoever needs it first (a later title
+    /// submission, a reset or release of one of its lists, a title queue
+    /// signal is deferred behind it). `title`: the lists are the title's.
+    /// Waited as before (None) when its shaders write title memory back,
+    /// when the GPU is stepped or synchronous (`XNW_GPU_STEP`,
+    /// `XNW_GPU_SYNC`) or the late log is on.
+    pub(crate) fn execute_nowait(&'static self, runs: &[&HostList], title: bool) -> Option<u64> {
+        static RETIRE: std::sync::Once = std::sync::Once::new();
+        RETIRE.call_once(|| {
+            let _ = std::thread::Builder::new().name("xnw retire".into()).spawn(move || retire_thread(self));
+            xnw_core::info!("d3d12x: submissions without a wait: {} (XNW_WORLD_RENDER uiwait=, showwait=); a retire thread finishes them at their fence", if title { "kept UI lists" } else { "the show's compose" });
+        });
+        self.submit(runs, false, title)
+    }
+
+    /// The value the last title submission sent without a wait ends at (0: none).
+    fn title_pending(&self) -> u64 {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().rev().find(|p| p.title).map_or(0, |p| p.value)
+    }
+
+    /// PASS1: a title submission sent without a wait is finished before
+    /// this one's CPU work (memory waits, skipped lists' copies and writes):
+    /// the title's effects stay in submission order.
+    pub(crate) fn settle_title(&self) {
+        if self.title_pending() != 0 {
+            let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+            let to = self.title_pending();
+            self.retire_pending(&mut submitted, to);
+        }
+    }
+
+    /// PASS1: every submission up to fence `value` finished (waited for).
+    fn settle_to(&self, value: u64) {
+        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        self.retire_pending(&mut submitted, value);
+    }
+
+    /// PASS1: finishes the pending submissions in order: those done, and
+    /// those up to `wait_to` waited for (`submitted` held: the event is ours).
+    fn retire_pending(&self, _held: &mut u64, wait_to: u64) {
+        loop {
+            let Some((value, lists)) = self.pending.lock().unwrap_or_else(|e| e.into_inner()).front().map(|p| (p.value, p.lists)) else { return };
+            // SAFETY: a plain query.
+            if unsafe { self.fence.GetCompletedValue() } < value {
+                if value > wait_to {
+                    return;
+                }
+                let at = std::time::Instant::now();
+                self.wait_fence(self.event, value, lists);
+                xnw_core::framewall::add(xnw_core::framewall::KEPT_WAIT, at.elapsed().as_nanos() as u64);
+            }
+            self.finish_front();
+        }
+    }
+
+    /// Waits on `event` for our fence to reach `value`; past the deadline
+    /// (`XNW_GPU_DEADLINE`) the process ends, as a waited submission's would.
+    fn wait_fence(&self, event: HANDLE, value: u64, lists: usize) {
+        // SAFETY: our fence and an event of the caller's.
+        unsafe {
+            if self.fence.SetEventOnCompletion(value, event).is_err() {
+                return;
+            }
+            if deadline_ms() > 0 {
+                const WAIT_TIMEOUT: u32 = 0x102;
+                if WaitForSingleObject(event, deadline_ms()).0 == WAIT_TIMEOUT {
+                    deadline_hit(self, value, lists);
+                }
+            } else {
+                WaitForSingleObject(event, INFINITE);
+            }
+        }
+    }
+
+    /// The oldest pending submission has run: what it held goes, its writes
+    /// are made, then the queue signals deferred behind it (popped and
+    /// signalled under the pending lock, so a signal made meanwhile never
+    /// lands before them).
+    fn finish_front(&self) {
+        let (flight, retired, uploaded, writes, prepared, lists) = {
+            let mut q = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(p) = q.front_mut() else { return };
+            (p.flight.take(), std::mem::take(&mut p.retired), std::mem::take(&mut p.uploaded), std::mem::take(&mut p.writes), p.prepared, p.lists)
+        };
+        drop(flight);
+        SUBMISSION_US[1].fetch_add(prepared.elapsed().as_micros() as u64, Ordering::Relaxed);
+        // SAFETY: a plain query.
+        if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+            fail(format_args!("host GPU device removed after a submission of {lists} lists (sent without a wait)"));
+        }
+        drop(retired);
+        drop(uploaded);
+        for (at, what, bytes) in writes {
+            what.write(at as *mut u8, bytes);
+        }
+        let mut q = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(p) = q.pop_front() {
+            for (fence, value) in p.signals {
+                super::fence::signal_held(fence as This, value);
+            }
+        }
+    }
+
+    /// PASS1: a title queue signal: behind the last title submission sent
+    /// without a wait, else at once (every earlier submission has run).
+    pub(crate) fn signal_after(&self, fence: This, value: u64) {
+        let mut q = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        match q.iter_mut().rev().find(|p| p.title) {
+            Some(p) => {
+                super::object::add_ref(fence);
+                p.signals.push((fence as usize, value));
+            }
+            None => {
+                super::fence::signal(fence, value);
+            }
+        }
+    }
+
+    /// The submission core: `wait` false sends without the CPU wait when it may.
+    fn submit(&self, runs: &[&HostList], wait: bool, title: bool) -> Option<u64> {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = super::counters::timed(super::counters::LOCK_SUBMITTED, &self.submitted);
+        // PASS1: the title's submissions sent without a wait come first
+        // (their descriptor window, copy-backs and writes); the compose's
+        // only when done (it reads none of the title's heaps). A compose sent
+        // without a wait waits for none: the queue orders it after them.
+        let to = if !wait && !title { 0 } else { self.title_pending() };
+        self.retire_pending(&mut submitted, to);
         // Shader loop counts start from zero for each submission.
         super::loopcount::clear();
         // Who holds the submission, for stall dumps.
@@ -1039,10 +1282,51 @@ impl Host {
             lists.push(Some(last));
         }
         SIGNALLED.store(*submitted, Ordering::Relaxed);
+        // PASS1: sent without a wait only when nothing comes back from its shaders.
+        let nowait = !wait
+            && !super::crumbs::stepping()
+            && !super::crumbs::sync()
+            && !super::late::on()
+            && batch.bindless_writes.is_empty()
+            && !runs.iter().any(|l| l.deferred().copies.iter().any(|s| matches!(s, Step::GpuWrite(..))));
         // Descriptor writes from other threads from here until the wait
         // below is over are staged, then put in place (`descriptor::gate`):
-        // no slot this submission may read changes while it runs.
-        let flight = super::descriptor::gate::begin();
+        // no slot this submission may read changes while it runs. The
+        // compose sent without a wait reads only its own heap: no window.
+        let flight = if nowait && !title { None } else { super::descriptor::gate::begin() };
+        if nowait {
+            // SAFETY: closed lists; the fence is ours.
+            unsafe {
+                if !lists.is_empty() {
+                    self.queue.ExecuteCommandLists(&lists);
+                }
+                stage(STAGE_EXECUTE, prepared);
+                if let Err(e) = self.queue.Signal(&self.fence, *submitted) {
+                    fail(format_args!("d3d12x: host submission not signalled: {e}"));
+                }
+            }
+            SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
+            super::counters::submission((prepared - started).as_micros() as u64, snapshots);
+            let value = *submitted;
+            for list in runs {
+                list.inflight.store(value, Ordering::Relaxed);
+            }
+            let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
+            self.pending.lock().unwrap_or_else(|e| e.into_inner()).push_back(Pending {
+                value,
+                lists: runs.len(),
+                title,
+                prepared,
+                _lists: lists,
+                retired,
+                uploaded,
+                flight,
+                writes,
+                signals: Vec::new(),
+            });
+            self.pending_cv.notify_one();
+            return Some(value);
+        }
         // SAFETY: closed lists; the fence and event are ours.
         unsafe {
             if !lists.is_empty() {
@@ -1131,6 +1415,7 @@ impl Host {
                 what.write(at as *mut u8, bytes);
             }
         }
+        None
     }
 
     /// A host render target view of `resource`, valid until it is recorded.
@@ -1236,7 +1521,24 @@ impl HostList {
 
     /// Only after the list's last submission finished (every one is waited
     /// for).
+    /// PASS1: its last submission sent without a wait has run (waited
+    /// for, with every pending one before it): the allocator, its upload
+    /// memory and the objects it names may go or be reused.
+    pub(crate) fn settle(&self) {
+        let value = self.inflight.swap(0, Ordering::Relaxed);
+        if value == 0 {
+            return;
+        }
+        if let Some(h) = host_if_made()
+            // SAFETY: a plain query.
+            && unsafe { h.fence.GetCompletedValue() } < value
+        {
+            h.settle_to(value);
+        }
+    }
+
     pub(crate) fn reset(&self) {
+        self.settle();
         self.kept.store(false, Ordering::Relaxed);
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1905,6 +2207,22 @@ pub fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
             });
         }
     });
+}
+
+/// Reads the 32-byte descriptor records at `slots` into `out` (one per
+/// slot; `false`: not read, ask [`copy_mapped`]): one look at the traps for
+/// all ([`super::watch::reading_all`]), then a guarded copy in place each
+/// (a page not there ends that copy, never faults). Per record,
+/// `copy_mapped` took the pair and guard locks and a `ReadProcessMemory`.
+pub fn copy_records(slots: &[u64], out: &mut Vec<([u8; 32], bool)>) {
+    out.clear();
+    let ranges: Vec<(usize, usize)> = slots.iter().map(|&s| (s as usize, 32)).collect();
+    super::watch::reading_all(&ranges);
+    for &s in slots {
+        let mut rec = [0u8; 32];
+        let ok = xnw_core::plaincopy::guarded(rec.as_mut_ptr(), s as *const u8, rec.len());
+        out.push((rec, ok));
+    }
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not

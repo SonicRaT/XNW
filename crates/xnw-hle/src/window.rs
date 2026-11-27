@@ -76,6 +76,20 @@ pub extern "system" fn ShowWindow(window: HANDLE, command: i32) -> i32 {
 /// Read before the title runs (run.rs), so no title call does the lookup.
 pub fn read_switches() {
     let _ = headless();
+    let off = std::env::var("XNW_LIVE_KEYS").is_ok_and(|v| matches!(v.trim(), "0" | "off"));
+    LIVE_KEYS.store(!off, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// SW1: F1-F12 drive the live switches (`xnw_core::live::key`) and never
+/// reach the title (its procedure here, its key poll in `gameinput.rs`);
+/// on for a title run unless `XNW_LIVE_KEYS=0` (off until read: tests).
+static LIVE_KEYS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The virtual keys F1-F12.
+pub(crate) const LIVE_VK: std::ops::RangeInclusive<usize> = 0x70..=0x7B;
+
+pub(crate) fn live_keys() -> bool {
+    LIVE_KEYS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// See [`CreateWindowExW`].
@@ -119,6 +133,15 @@ unsafe extern "system" fn procedure(window: HANDLE, message: u32, wparam: usize,
     // A console has no window menu: Alt or F10 would freeze the title's
     // thread in a modal menu loop. The mouse still opens it.
     if message == WM_SYSCOMMAND && wparam & 0xFFF0 == SC_KEYMENU {
+        return 0;
+    }
+    // SW1: F1-F12 (down, up; F10 comes as a system key): ours alone; a
+    // first press (lparam bit 30 clear: not an auto-repeat) flips its switch.
+    const KEY_MESSAGES: [u32; 4] = [0x100, 0x101, 0x104, 0x105];
+    if live_keys() && KEY_MESSAGES.contains(&message) && LIVE_VK.contains(&wparam) {
+        if (message == 0x100 || message == 0x104) && lparam & (1 << 30) == 0 {
+            xnw_core::live::key(wparam - LIVE_VK.start(), xnw_gpu::d3d12x::presented());
+        }
         return 0;
     }
     // SAFETY: the procedure `hook` stored, called the way the system would.

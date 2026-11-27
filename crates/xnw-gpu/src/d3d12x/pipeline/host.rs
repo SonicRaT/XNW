@@ -921,6 +921,9 @@ impl HostPipeline {
         if gated(&stages.iter().map(|s| s.0).collect::<Vec<_>>(), &label) {
             return None;
         }
+        if let Some(why) = stages.iter().find_map(|s| library::denied_program(s.0)) {
+            return refuse(why, &label);
+        }
         let host = super::super::host::host_device()?;
 
         // The root signature the translated shaders' bindings define.
@@ -1207,6 +1210,9 @@ fn mesh_pipeline(ms: &Arc<Shader>, ps: Option<&Arc<Shader>>, g: Option<&Graphics
     }
     if gated(&std::iter::once(ms).chain(ps).collect::<Vec<_>>(), &label) {
         return None;
+    }
+    if let Some(why) = std::iter::once(ms).chain(ps).find_map(|s| library::denied_program(s)) {
+        return refuse(why, &label);
     }
     let Some(layout) = ms.translated()?.mesh.clone() else {
         return refuse("mesh program without a record layout".into(), &label);

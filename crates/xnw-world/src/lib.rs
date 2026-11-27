@@ -51,6 +51,8 @@ pub mod compute;
 pub mod bridged;
 /// The title's mesh programs in our pass (`bridgems`).
 pub mod bridge_ms;
+/// The reducer's switches (`XNW_REDUCE`, `xnw shader-reduce`).
+pub mod reduce;
 /// The ped pre-skin as our own compute pass: the frame's items, the draws' copies.
 pub mod preskin_gpu;
 /// Strand hair: the title's strand draws as data, the strand vertex rule.
@@ -61,8 +63,24 @@ pub mod gpucull;
 pub mod gbuf;
 /// `ourlight=on`: our own lighting over our G-buffer, one full-screen pass (LITE1).
 pub mod ourlight;
+/// `carshade=on`: vehicle paint in our lighting pass, a clearcoat with environment reflection (CAR1).
+pub mod carshade;
+/// `sunshadow=on`: cascade depth of ours from the title's cascade rows, a screen term for our lighting pass (SHADOW1).
+pub mod sunshadow;
+/// `lights=on`: the title's local lights (its CPU scene-light records) in our lighting pass (LIGHT2).
+pub mod lamps;
+/// `post=on`: our lighting pass in scene-linear RGBA16F, one composite of ours (exposure, the title's curve, sRGB, dither) (LIGHT2 after POST1).
+pub mod post;
 /// UI1: the title's UI draws through its own programs into a layer over our picture (`ui=on`).
 pub mod ui;
+/// The world pass's draws resolved into packets, then recorded (on parallel lists with `precord=on`).
+pub mod precord;
+// PROF1: the record time by section (`XNW_RECORD_PROF`).
+pub mod recprof;
+/// PERF4: capture only the frames the pass will draw (`capskip`).
+pub mod capskip;
+// INT1: the title's per-material vehicle colour (T8+0x540; `vehmat=off`).
+pub mod vehmat;
 
 pub type Mat = [f32; 16];
 
@@ -133,6 +151,143 @@ pub fn unjittered(proj: &Mat) -> Mat {
     let mut p = *proj;
     (p[8], p[9]) = (0.0, 0.0);
     p
+}
+
+/// FLK1: the viewport origin (pixels) that takes the TAA jitter out of a
+/// draw whose own programs project with the title's jittered projection
+/// (the bridged rows): clip x gets `z_view * p8` and w is `z_view * p11`,
+/// so the whole draw sits `p8 / p11` NDC to the side (y: `p9 / p11`), the
+/// same for every vertex; depth is untouched. Our pass draws without the
+/// jitter ([`unjittered`]), and the bridged rows are depth tested against
+/// it GREATER_EQUAL without a bias: on a plane the jitter's sign along the
+/// depth gradient passed or failed the whole surface, a new sign every
+/// frame or two (the title's sequence, `frac(n * 0.7549 + 0.5) - 0.5`,
+/// has period 4 in sign). (0, 0) when our pass keeps the jitter too
+/// ([`keep_jitter`]) or `XNW_BRIDGE_UNJITTER=off` (the A/B switch).
+pub fn unjitter_px(proj: &Mat, width: u32, height: u32) -> [f32; 2] {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| !matches!(std::env::var("XNW_BRIDGE_UNJITTER").as_deref().map(str::trim), Ok("off" | "0")));
+    if !on || KEEP_JITTER.load(std::sync::atomic::Ordering::Relaxed) || proj[11] == 0.0 {
+        return [0.0; 2];
+    }
+    [-proj[8] / proj[11] * width as f32 * 0.5, proj[9] / proj[11] * height as f32 * 0.5]
+}
+
+/// FLK1: the title's view constants in a bridged row's inputs (b0, 0x1E0
+/// bytes: +0x160 the view-projection for camera-relative positions,
+/// rotation times the jittered projection; +0xD0 the camera's x and y
+/// within its 32 m cell and its z, +0xDC the cell as two i16; +0x60 and
+/// +0x140 the jitter [V pk6 f1205-1217, pk7h f1076-1078: equal to the
+/// list camera's on every row but the 41 below]). Found by shape in the
+/// view table (root 1; slot 5, or 7 for ab2e3004): a buffer of that
+/// length whose matrix has a unit fourth column and holds the jitter
+/// stored at +0x60. (Shape alone is not enough: fb1c6d2a's material
+/// constants at root 2 slot 0 are 0x1E0 bytes with (0, 1, 0) there
+/// [V pk7h, pk8a: 2-3 rows a frame; the card's 4 rows in 56 of 60 frames].)
+const VIEW_ROOT: usize = 1;
+const VIEW_CB: usize = 0x1E0;
+const VIEW_CB_VP: usize = 0x160;
+const VIEW_CB_CAM: usize = 0xD0;
+
+fn view_cb(b: &[u8]) -> Option<[f32; 16]> {
+    if b.len() != VIEW_CB {
+        return None;
+    }
+    let m: [f32; 16] = std::array::from_fn(|i| f32::from_le_bytes([b[VIEW_CB_VP + 4 * i], b[VIEW_CB_VP + 4 * i + 1], b[VIEW_CB_VP + 4 * i + 2], b[VIEW_CB_VP + 4 * i + 3]]));
+    let jit = |k: usize| f32::from_le_bytes([b[0x60 + 4 * k], b[0x61 + 4 * k], b[0x62 + 4 * k], b[0x63 + 4 * k]]);
+    // The rotation's columns are orthogonal, so column k of R * P dotted with its fourth is -P[2][k]: the jitter.
+    let dot = |k: usize| -(m[k] * m[3] + m[4 + k] * m[7] + m[8 + k] * m[11]);
+    ((m[3] * m[3] + m[7] * m[7] + m[11] * m[11] - 1.0).abs() < 1e-3 && (dot(0) - jit(0)).abs() < 1e-5 && (dot(1) - jit(1)).abs() < 1e-5).then_some(m)
+}
+
+/// A camera's position from its view matrix (row vectors: `-t * R^T`).
+fn camera_pos(view: &Mat) -> [f32; 3] {
+    std::array::from_fn(|i| -(view[12] * view[4 * i] + view[13] * view[4 * i + 1] + view[14] * view[4 * i + 2]))
+}
+
+/// How far a bridged row's view constants are from camera `cam`, the one
+/// our pass lays depth with: the largest difference of the view-projection's
+/// entries, and of the camera position in metres (None: the row has no
+/// view constants). The sink reads a draw's constants later than the hook
+/// reads its camera: pk6 f1217 has 41 rows (stage 71) whose constants
+/// hold a camera 21.6 m away that no viewport of the frame has [V].
+pub fn bridge_cam_delta(o: &bridged::Owned, cam: &Camera) -> Option<(f32, f32)> {
+    let (vp, pos) = (cam.view_proj(true), camera_pos(&cam.view));
+    let mut out: Option<(f32, f32)> = None;
+    for r in o.roots.iter().skip(VIEW_ROOT).take(1) {
+        let bridged::ORoot::Table(t) = r else { continue };
+        for (_, s) in t {
+            let bridged::OSlot::Buffer(_, b) = s else { continue };
+            let Some(m) = view_cb(b) else { continue };
+            let dvp = m.iter().zip(&vp).take(12).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+            let f = |k: usize| f32::from_le_bytes([b[VIEW_CB_CAM + 4 * k], b[VIEW_CB_CAM + 4 * k + 1], b[VIEW_CB_CAM + 4 * k + 2], b[VIEW_CB_CAM + 4 * k + 3]]);
+            let cell = |k: usize| f32::from(i16::from_le_bytes([b[VIEW_CB_CAM + 12 + 2 * k], b[VIEW_CB_CAM + 13 + 2 * k]])) * 32.0;
+            let dpos = [(cell(0) + f(0) - pos[0]).abs(), (cell(1) + f(1) - pos[1]).abs(), (f(2) - pos[2]).abs()].into_iter().fold(0.0, f32::max);
+            let (a, b) = out.unwrap_or((0.0, 0.0));
+            out = Some((a.max(dvp), b.max(dpos)));
+        }
+    }
+    out
+}
+
+/// Gives a bridged row's view constants camera `cam` (`bridgecam=2`): the
+/// view-projection, the position and its cell, the jitter.
+pub fn bridge_cam_set(o: &mut bridged::Owned, cam: &Camera) {
+    let (vp, pos) = (cam.view_proj(true), camera_pos(&cam.view));
+    for r in o.roots.iter_mut().skip(VIEW_ROOT).take(1) {
+        let bridged::ORoot::Table(t) = r else { continue };
+        for (_, s) in t {
+            let bridged::OSlot::Buffer(_, b) = s else { continue };
+            if view_cb(b).is_none() {
+                continue;
+            }
+            let b = std::sync::Arc::make_mut(b);
+            let mut put = |at: usize, v: f32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+            for (i, v) in vp.iter().enumerate() {
+                put(VIEW_CB_VP + 4 * i, *v);
+            }
+            let cells = [(pos[0] / 32.0).floor(), (pos[1] / 32.0).floor()];
+            put(VIEW_CB_CAM, pos[0] - cells[0] * 32.0);
+            put(VIEW_CB_CAM + 4, pos[1] - cells[1] * 32.0);
+            put(VIEW_CB_CAM + 8, pos[2]);
+            for at in [0x60, 0x140] {
+                put(at, cam.proj[8]);
+                put(at + 4, cam.proj[9]);
+            }
+            for (k, c) in cells.iter().enumerate() {
+                b[VIEW_CB_CAM + 12 + 2 * k..VIEW_CB_CAM + 14 + 2 * k].copy_from_slice(&(*c as i16).to_le_bytes());
+            }
+        }
+    }
+}
+
+/// A row counts as another camera's past these (view-projection entry;
+/// metres): `bridgecam=1` leaves it out. `bridgecam=2` rewrites past
+/// [`CAM_SAME`], float noise of the two ways to the same camera.
+pub const CAM_OFF: (f32, f32) = (1e-4, 0.02);
+pub const CAM_SAME: (f32, f32) = (4e-6, 2e-3);
+
+/// FLK1 `bridgecam` (live; `XNW_BRIDGE_CAM=0|1|2` starts it, default 0).
+pub fn bridge_cam() -> u32 {
+    xnw_core::live::value(xnw_core::live::BRIDGECAM, || std::env::var("XNW_BRIDGE_CAM").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// FLK1 `bridgebias` (live; `XNW_BRIDGE_BIAS=n` starts it): the bridged
+/// rows' viewport MinDepth, n * 1e-7: their depth b + z * (1 - b) is
+/// tested against ours, so a row up to b behind our depth still passes
+/// (reverse Z, z = near / d: at d metres that is b * d * d / near metres). 0: none.
+pub fn bridge_bias() -> f32 {
+    xnw_core::live::value(xnw_core::live::BRIDGEBIAS, || std::env::var("XNW_BRIDGE_BIAS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)) as f32 * 1e-7
+}
+
+/// Since the last bridgeps line: bridged rows seen, rows of another camera
+/// ([`CAM_OFF`]), frames with one, rows rewritten, the largest differences (f32 bits).
+static CAM_SEEN: [std::sync::atomic::AtomicU32; 6] = [const { std::sync::atomic::AtomicU32::new(0) }; 6];
+
+/// `; cameras: ...` for the bridgeps line (the counters start again).
+pub fn bridge_cam_text() -> String {
+    let v: [u32; 6] = std::array::from_fn(|k| CAM_SEEN[k].swap(0, std::sync::atomic::Ordering::Relaxed));
+    format!("; cameras (bridgecam={}, bias {}, ulps {}, slope {}/4): {} rows since the last line, {} with view constants of another camera in {} frames ({} given the list camera), largest difference {:.6} in the view-projection, {:.3} m in position", bridge_cam(), bridge_bias(), bridged::rel_bias().0, bridged::rel_bias().1, v[0], v[1], v[2], v[3], f32::from_bits(v[4]), f32::from_bits(v[5]))
 }
 
 /// Keep the jitter (default off): the bridge audit compares our pass with
@@ -526,8 +681,31 @@ pub struct Material {
     pub albedo_key: u64,
     /// The effect's alpha-clip (cut-out) flag.
     pub alpha_clip: bool,
-    /// The tint palette row (0: none).
-    pub tint_row: u16,
+    /// Ped tint: the palette's descriptor slot (0: none), rows
+    /// r0..r2 (0xFF: none) and 1/rows (palette rows), from the effect's b4
+    /// block at the hook.
+    pub tint_palette: u64,
+    pub tint_rows: [u8; 3],
+    pub tint_inv: f32,
+    /// Vehicle paint: colours A, B of the vehicle handler whose
+    /// Draw ran before this draw (`paint_on`: read).
+    pub paint: [f32; 6],
+    pub paint_on: bool,
+    /// INT1 (`vehmat=on`): the dword index in [`FrameList::instances`] of this
+    /// draw's 256-entry material colour table ([`vehmat`]; None: none).
+    pub vehmat: Option<u32>,
+    /// CAR1 (`carshade=on`): a vehicle paint-class row (`standard_vehicle*`:
+    /// bodies and interiors; not wheels and tyres): its pixels take the clearcoat.
+    pub coat: bool,
+    /// POL2 (`vehlivery=on`): the livery section's dword index in the
+    /// draw's [`Self::vehmat`] block (0: none) and its two mask textures'
+    /// descriptor slots ([`vehmat::Livery`]; 0: none).
+    pub livery_at: u32,
+    pub livery: [u64; 2],
+    /// NPC1 (`slodtint=on`): a far-ped row whose [`Self::vehmat`] block is
+    /// [`vehmat::slod_lut`]'s (0: none; 1: k = the x byte of mesh word 0x04's
+    /// stream, 2: its three-channel k; [`vehmat::slod_mode`]).
+    pub slod: u8,
     /// The effect name hash.
     pub effect_name: u32,
     /// The albedo view's descriptor slot (`view+0x18` at the
@@ -598,6 +776,11 @@ pub struct FrameList {
     pub water: Option<Water>,
     /// Lighting from the timecycle (None: the earlier look).
     pub light: Option<lighting::Lighting>,
+    /// The game's step of this frame, s (GameClock game_ms.step, title 0x14ABBEF4C, 0 when paused;
+    /// None: not read, offline): `post=on`'s adaptation (POST3).
+    pub step: Option<f32>,
+    /// `lights=on`: the title's scene lights of this frame (None: not read).
+    pub lamps: Option<std::sync::Arc<Vec<lamps::SceneLight>>>,
     /// The heightmap terrain's tile records of this frame (None: not read).
     pub terrain: Option<std::sync::Arc<terrain::Terrain>>,
     /// The frame's imposter batches (None: not read).
@@ -607,9 +790,15 @@ pub struct FrameList {
     /// HAIR6 (`hair=on`, default off): the strand pixels of the title's own
     /// strand chain and draws, drawn over our picture under the depth test.
     pub hair: Option<std::sync::Arc<hair::Pixels>>,
-    /// UI1 (`ui=on`, default off): the title's UI layer (RGBA8 premultiplied,
-    /// width x height), drawn over our picture with the plane blend.
-    pub ui: Option<std::sync::Arc<(u32, u32, Vec<u8>)>>,
+    /// HAIR7: the strand depth on the device instead (no readback; drawn
+    /// as `hair` is, by one full-screen triangle).
+    pub hair_depth: Option<std::sync::Arc<hair::StrandDepth>>,
+    /// HAIR10 (`hairribbon=on`, default off): our guide ribbons, posed on the
+    /// CPU from the title's strand records (camera-relative points).
+    pub hair_ribbons: Option<std::sync::Arc<hair::Ribbons>>,
+    /// UI1 (`ui=on`, default off): the title's UI layer (RGBA8 premultiplied:
+    /// bytes, or LIVE1's buffer on the GPU), drawn over our picture with the plane blend.
+    pub ui: Option<std::sync::Arc<ui::UiLayer>>,
     /// Instanced rows culled on the device (`gpucull=on`; empty: none): their
     /// `inst_first`/`inst_count` index the cull's output, not `instances`.
     pub cull: gpucull::CullFrame,
@@ -661,8 +850,15 @@ impl FrameList {
 #[derive(Default)]
 pub struct Lists {
     ready: Mutex<Option<FrameList>>,
+    /// PASS1: wakes the pass thread when a list is published.
+    wake: std::sync::Condvar,
     published: std::sync::atomic::AtomicU64,
     dropped: std::sync::atomic::AtomicU64,
+    /// PERF4 (`capskip`): a pass thread takes from this slot; since when it
+    /// draws its list (`capskip::clock_ns`, 0: waiting); mean ns per list.
+    drawer: std::sync::atomic::AtomicBool,
+    busy_since: std::sync::atomic::AtomicU64,
+    step: std::sync::atomic::AtomicU64,
 }
 
 impl Lists {
@@ -679,10 +875,34 @@ impl Lists {
             *r = Some(list);
             self.published.fetch_add(1, Relaxed);
         }
+        self.wake.notify_one();
     }
 
     pub fn take(&self) -> Option<FrameList> {
         self.ready.lock().ok()?.take()
+    }
+
+    /// PASS1: the newest list, waiting for one up to `timeout`.
+    pub fn wait_take(&self, timeout: std::time::Duration) -> Option<FrameList> {
+        let r = self.ready.lock().ok()?;
+        let (mut r, _) = self.wake.wait_timeout_while(r, timeout, |r| r.is_none()).ok()?;
+        r.take()
+    }
+
+    /// A list is waiting to be drawn.
+    pub fn has_ready(&self) -> bool {
+        self.ready.lock().is_ok_and(|r| r.is_some())
+    }
+
+    /// PERF4: the pass thread as the capture skip rule sees it (None: no
+    /// pass thread takes from this slot).
+    pub fn pass_view(&self) -> Option<capskip::PassView> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.drawer.load(Relaxed) {
+            return None;
+        }
+        let since = self.busy_since.load(Relaxed);
+        Some(capskip::PassView { busy_since: (since != 0).then_some(since), step: self.step.load(Relaxed), waiting: self.has_ready() })
     }
 
     /// (published, replaced before being drawn).
@@ -849,7 +1069,7 @@ pub struct HostGeometry {
 /// views sized to the buffers, so the hardware bound holds too. Bone
 /// indices are checked against the palette's bone count.
 pub const RAW_SHADER: &str = r#"
-#define RS "RootConstants(num32BitConstants=58, b0), DescriptorTable(SRV(t0), visibility=SHADER_VISIBILITY_VERTEX), DescriptorTable(SRV(t1), visibility=SHADER_VISIBILITY_VERTEX), DescriptorTable(SRV(t2), visibility=SHADER_VISIBILITY_VERTEX), DescriptorTable(SRV(t3, numDescriptors=4096), visibility=SHADER_VISIBILITY_PIXEL), CBV(b1, visibility=SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter=FILTER_ANISOTROPIC, maxAnisotropy=8, visibility=SHADER_VISIBILITY_PIXEL)"
+#define RS "RootConstants(num32BitConstants=58, b0), DescriptorTable(SRV(t0), visibility=SHADER_VISIBILITY_VERTEX), DescriptorTable(SRV(t1), visibility=SHADER_VISIBILITY_VERTEX), DescriptorTable(SRV(t2), visibility=SHADER_VISIBILITY_ALL), DescriptorTable(SRV(t3, numDescriptors=4096), visibility=SHADER_VISIBILITY_PIXEL), CBV(b1, visibility=SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter=FILTER_ANISOTROPIC, maxAnisotropy=8, visibility=SHADER_VISIBILITY_PIXEL), StaticSampler(s1, filter=FILTER_MIN_MAG_MIP_POINT, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP, visibility=SHADER_VISIBILITY_PIXEL)"
 cbuffer Draw : register(b0) {
     row_major float4x4 mvp;
     float4 world3[3];
@@ -865,9 +1085,9 @@ cbuffer Draw : register(b0) {
     float4 sunDir;    // 40: the timecycle's light direction (xyz), ambient (w)
     float4 sunCol;    // 44: its colour (rgb), w = 1 when set (else the fixed sun)
     uint texIndex;    // 48: albedo entry in our table t3 (0: flat), checked on the CPU
-    uint matFlags;    // 49: bit 0 alpha clip (a < 0.5 discards), bit 1 sRGB view
+    uint matFlags;    // 49: bit 0 alpha clip (a < 0.5 discards), bit 1 sRGB view, bit 2 paint (albedo.rgb = colour A), bit 3 ped tint, bit 4 decal G-buffer (gbuf::DECAL_ALPHA), bit 5 clearcoat (carshade::COAT)
     uint layerTex;    // 50: four layer entries of t3, 8 bits each (0: none)
-    uint layerFlags;  // 51: bit 0 layered, bits 1-2 colour stream (1: COLOR0 at 0x30, 2: COLOR1 at 0x34), bit 3 debug colours
+    uint layerFlags;  // 51: bit 0 layered, bits 1-2 colour stream (1: COLOR0 at 0x30, 2: COLOR1 at 0x34), bit 3 debug colours, bit 9 livery (POL2: layerTex = mask entries 0-7, 8-15, section dword in the vehmat block 16-31), bit 11 slod row, bit 12 its three-channel k (NPC1)
     float4 fog;       // 52: fog colour (rgb), 1 / distance (w; 0: off)
     uint remapAt;     // 56: dword index in t1 of remap[base] (0xFFFFFFFF: none)
     uint skinPad;     // 57
@@ -896,6 +1116,33 @@ ByteAddressBuffer pal : register(t1);
 ByteAddressBuffer inst : register(t2);
 Texture2D albedoTex[4096] : register(t3); // TEX_SLOTS (test `albedo_table_matches_tex_slots`)
 SamplerState wrapAniso : register(s0);
+SamplerState pointClamp : register(s1);
+// Ped tint: palette entry pi's row `row` at u, point-sampled, LOD 0 (v = (row + 0.5) / rows).
+float3 palRow(uint pi, float u, uint row, float inv) { return albedoTex[min(pi, 4095)].SampleLevel(pointClamp, float2(u, (row + 0.5) * inv), 0).rgb; }
+// PAL1 (`vehmat`): palette row k of the draw's material block in t2 (dword
+// asuint(albedo.w) - 1; the rows follow its 256 entries, 128 RGBA8 texels
+// each), at u linearly between texel centres, clamped, each texel sRGB-
+// decoded first when the view is sRGB (a sampler filters after the decode).
+// The title samples it at v = (row + 0.5) / 256, LOD 0 [V a8000c5c 0x2a20].
+float3 vmTexel(uint a, bool srgb) {
+    bool ok = a + 4 <= instBytes && a < 0x7FFFFFF0;
+    uint c = inst.Load(ok ? a : 0);
+    float3 v = ok ? float3(c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF) / 255.0 : float3(0, 0, 0);
+    return srgb ? lerp(v / 12.92, pow((v + 0.055) / 1.055, 2.4), step(0.04045, v)) : v;
+}
+float3 vmPal(uint k, float u, bool srgb) {
+    uint row = asuint(albedo.w) - 1 + 256 + k * 128;
+    float x = clamp(saturate(u) * 128 - 0.5, 0, 127);
+    uint x0 = (uint)x, x1 = min(x0 + 1, 127);
+    return lerp(vmTexel((row + x0) * 4, srgb), vmTexel((row + x1) * 4, srgb), x - x0);
+}
+// POL2 (`vehlivery=on`): a table entry's colour (vehmat's kinds; 0: `d`), re-encoded as the base is.
+float3 vmSlot(uint e, float tg, float3 d, bool enc) {
+    uint vk = (e >> 24) & 7;
+    float3 vc = float3(e & 0xFF, (e >> 8) & 0xFF, (e >> 16) & 0xFF) / 255.0;
+    if (vk == 2 || vk == 3) vc = vmPal(e & 0xFFFF, tg, vk == 2);
+    return vk == 0 ? d : enc ? pow(saturate(vc), 1.0 / 2.2) : vc;
+}
 // `?:` runs both sides: the condition picks the address (0 is inside every
 // view), then the value; a load past a view is never issued (GBV id 1005, HANG1).
 float3 il(uint i, uint k) { uint a = (i * 12 + k) * 4; bool ok = a + 12 <= instBytes && a < 0x7FFFFFF0; float3 v = asfloat(inst.Load3(ok ? a : 0)); return ok ? v : float3(0, 0, 0); }
@@ -903,6 +1150,19 @@ uint ld(uint a) { bool ok = a + 4 <= vbBytes && a < 0x7FFFFFF0; uint v = vb.Load
 float4 pl(uint i) { uint a = i * 16; bool ok = a + 16 <= palBytes && a < 0x7FFFFFF0; float4 v = asfloat(pal.Load4(ok ? a : 0)); return ok ? v : float4(0, 0, 0, 0); }
 uint pu(uint i) { uint a = i * 4; bool ok = a + 4 <= palBytes && a < 0x7FFFFFF0; uint v = pal.Load(ok ? a : 0); return ok ? v : 0; }
 uint at(uint w, uint v) { return ((w >> 3) & 0x3C) * v + ((w >> 7) & 0x1FFFFFC); }
+// NPC1: the far-ped (`ped_slod_tint`) palette index k of a vertex's RGBA8 word, as
+// mesh program 132ea7e6 makes it (vehmat::slod_k): the x byte, or (rgb) x, y, z
+// quantised by 21.25 / 255 with y and z offset 21 and 42 when at least 0.5.
+uint slodK(uint c, bool rgb) {
+    if (!rgb) return c & 0xFF;
+    float3 q = float3(c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF) * (21.25 / 255.0);
+    uint k = uint(round(q.x));
+    if (q.y >= 0.5) k += uint(round(q.y)) + 21;
+    if (q.z >= 0.5) k += uint(round(q.z)) + 42;
+    return min(k, 255);
+}
+// The title's sRGB decode (vehmat::slod_decode).
+float3 slodDecode(float3 c) { return lerp(c / 12.92, pow((c + 0.055) / 1.055, 2.4), step(0.04045001, c)); }
 float3 position(uint v) {
     uint w = ld(0), a = at(w, v);
     if ((w & 15) == 3) return float3(asfloat(ld(a)), asfloat(ld(a + 4)), asfloat(ld(a + 8)));
@@ -925,18 +1185,119 @@ float3 normal(uint v) {
     e += float2(e.x >= 0 ? -t : t, e.y >= 0 ? -t : t);
     return normalize(float3(e, z) + 1e-6);
 }
-float2 uv(uint v) {
-    uint w = ld(12);
+float2 uvAt(uint wa, uint v) {
+    uint w = ld(wa);
     uint a = at(w, v), x = ld(a);
     if ((w & 15) == 2 || (w & 15) == 3) return float2(asfloat(x), asfloat(ld(a + 4)));
     return max(float2(int(x << 16) >> 16, int(x) >> 16) / 32767.0, -1.0) * asfloat(ld(0x7C));
 }
+float2 uv(uint v) { return uvAt(12, v); }
+// A dword of t2 (0 past it).
+uint vmLoad(uint d) { uint a = d * 4; bool ok = a + 4 <= instBytes && a < 0x7FFFFFF0; uint v = inst.Load(ok ? a : 0); return ok ? v : 0; }
 float3 bone(uint b, float3 p, float w4) {
     float4 r0 = pl(palFirst + 3 * b), r1 = pl(palFirst + 3 * b + 1), r2 = pl(palFirst + 3 * b + 2);
     float4 q = float4(p, w4);
     return float3(dot(r0, q), dot(r1, q), dot(r2, q));
 }
-struct VsOut { float4 pos : SV_Position; float3 normal : NORMAL; float2 uv : TEXCOORD0; float4 col : COLOR0; };
+struct VsOut { float4 pos : SV_Position; float3 normal : NORMAL; float2 uv : TEXCOORD0; float4 col : COLOR0; nointerpolation uint vm : BLENDINDICES0; nointerpolation uint lv : BLENDINDICES1; float4 uv12 : TEXCOORD1; float2 uvl : TEXCOORD2; };
+// POL2 (`vehlivery=on`): the livery over the vehicle's material colour, as
+// PS_VehicleLiveryOn* does [V 05483074 0x2300-0x2b68]. i.lv names layer A
+// (record bits 0-7, present bit 8) and B (16-23, bit 24) in the section at
+// dword asuint(albedo.w) - 1 + (layerTex >> 16) (vehmat::Livery::section:
+// 264 dwords, then 32 a record: +0 .. +36 as read, the A / B mask's entry,
+// the X / A / B UV scale, then the 16 slot entries).
+// - A's record (record 0 without A) bounds the livery: (u, v) of the UV set
+//   +0 byte 1 picks (1: UV0, 2: word 0x10, else word 0x38) through the f16
+//   2x3 at +4 .. +12 must fall in [0, 1]^2, else none [V 0x23dc-0x24b0].
+// - each layer samples its mask at the UV set +0 byte 0 picks times its
+//   scale; n = int(16 b) picks slot +0x20 + n, r its weight by the record's
+//   bit masks (vehmat::weight_b / weight_a); the two heaviest of base, B, A
+//   are kept (vehmat::keep_two) and blended [I: normalised].
+// The mask is sampled with the gradients of the whole quad (SampleGrad):
+// the layer and its UV set are flat per primitive. The bias at T8+0xA00
+// +0xd4 [V 0x25d8] is not applied (I).
+// POL3: the UV sets are the mesh program's after its UV transform (i.uvl,
+// i.uv12; vehmat::LIVERY_UVX); a livery slot's palette row is sampled at
+// u = 0.5, not the texture's green [V 05483074 0x2550/0x2874 v102/v95 = 0.5,
+// their samples 0x2f34/0x3c54; the +0xAA0 +48 bits 6/7 terms not ported, I].
+// layerFlags bit 10 (`vehlivery=debug`): the first step that stops the
+// livery, over the colour: blue no layer word, red outside A's rect,
+// magenta no mask texture, yellow mask weight 0, cyan the slot has no
+// colour, green the livery (by its weight). POL4: bit 11 (`vehlivery=mask`)
+// shows the mask as sampled (raw r g b) inside the rect, bit 12
+// (`vehlivery=uv`) the mask's UV (set x scale) as frac(u), frac(v), 0.25.
+float2 lvUv(VsOut i, uint sel) { return sel == 1 ? i.uvl : sel == 2 ? i.uv12.xy : i.uv12.zw; }
+float2 lvX(float2 q, float3 a, float3 b) { return float2(dot(a, float3(q, 1)), dot(b, float3(q, 1))); }
+float4 lvMask(VsOut i, uint field, uint sel, float sc, float4 g0, float4 g1, float4 g2) {
+    uint ti = field < 2 ? (layerTex >> (8 * field)) & 0xFF : 0;
+    float4 g = sel == 1 ? g0 : sel == 2 ? g1 : g2;
+    return ti != 0 ? albedoTex[ti].SampleGrad(wrapAniso, lvUv(i, sel) * sc, g.xy * sc, g.zw * sc) : float4(-1, -1, -1, -1);
+}
+bool lvBit(uint w, uint k) { return ((w >> (k & 31)) & 1) != 0; }
+float3 vmLivery(VsOut i, float3 base, bool enc) {
+    uint s = asuint(albedo.w) - 1 + (layerTex >> 16) + 272;
+    float4 g0 = float4(ddx(i.uvl), ddy(i.uvl)), g1 = float4(ddx(i.uv12.xy), ddy(i.uv12.xy)), g2 = float4(ddx(i.uv12.zw), ddy(i.uv12.zw));
+    uint lv = i.lv;
+    uint ra = s + 32 * (lv & 0xFF), rb = s + 32 * ((lv >> 16) & 0xFF);
+    uint selR = (vmLoad(ra) >> 8) & 0xFF;
+    float2 q = lvUv(i, selR);
+    uint h4 = vmLoad(ra + 1), h8 = vmLoad(ra + 2), h12 = vmLoad(ra + 3);
+    float ru = q.x * f16tof32(h8) + q.y * f16tof32(h8 >> 16) + f16tof32(h4);
+    float rv = q.x * f16tof32(h12) + q.y * f16tof32(h12 >> 16) + f16tof32(h4 >> 16);
+    bool inside = ru == saturate(ru) && rv >= 0 && rv <= 1;
+    bool xTex = vmLoad(ra + 9) != 0;
+    // Layer B [V 0x2580-0x2798].
+    float wb = 0, v59 = 0, v60 = 0;
+    uint eb = 0;
+    float4 mb = lvMask(i, vmLoad(rb + 11), vmLoad(rb) & 0xFF, asfloat(vmLoad(rb + 14)), g0, g1, g2);
+    if ((lv & 0x1000000) != 0 && mb.x >= 0) {
+        uint n = min((uint)(mb.b * 16), 15);
+        float c1 = saturate((mb.r - 0.52) * 2.0839999), c2 = saturate((mb.r - 0.1) * 2.5);
+        uint m16 = vmLoad(rb + 4), m20 = vmLoad(rb + 5), m24 = vmLoad(rb + 6), m28 = vmLoad(rb + 7);
+        float v100 = (xTex && lvBit(m16, n)) ? c1 : 0;
+        wb = lvBit(m20, n) ? c2 : lvBit(m28, 16 + n) ? c1 : v100;
+        v59 = lvBit(m24, 16 + n) ? c2 : 0;
+        v60 = lvBit(m24, n) ? c2 : 0;
+        eb = vmLoad(rb + 16 + n);
+    }
+    // Layer A [V 0x2890-0x2a3c].
+    float wa = 0;
+    uint ea = 0;
+    float4 ma = lvMask(i, vmLoad(ra + 10), vmLoad(ra) & 0xFF, asfloat(vmLoad(ra + 13)), g0, g1, g2);
+    if ((lv & 0x100) != 0 && ma.x >= 0) {
+        uint n = min((uint)(ma.b * 16), 15);
+        float c1 = saturate((ma.r - 0.52) * 2.0839999), c2 = saturate((ma.r - 0.1) * 2.5);
+        uint m16 = vmLoad(ra + 4), m20 = vmLoad(ra + 5);
+        float v50 = (xTex && lvBit(m16, n)) ? c1 - v60 : 0;
+        wa = saturate(lvBit(m20, n) ? c2 - v59 : v50);
+        ea = vmLoad(ra + 16 + n);
+    }
+    if ((layerFlags & 0x400) != 0) {
+        bool hasA = (lv & 0x100) != 0, hasB = (lv & 0x1000000) != 0;
+        // POL4 (`vehlivery=mask` / `=uv`): inside the rect, A's mask (B's without A) as read, or its UV.
+        if ((layerFlags & 0x1800) != 0 && inside && (hasA || hasB)) {
+            uint rr = hasA ? ra : rb;
+            float4 m = hasA ? ma : mb;
+            float2 mq = lvUv(i, vmLoad(rr) & 0xFF) * asfloat(vmLoad(rr + (hasA ? 13 : 14)));
+            if ((layerFlags & 0x800) != 0 && m.x >= 0) return m.rgb;
+            if ((layerFlags & 0x1000) != 0) return float3(frac(mq), 0.25);
+        }
+        float w = max(hasA ? wa : 0, hasB ? wb : 0);
+        uint e = (hasB && wb >= wa) ? eb : ea;
+        float3 dc = !hasA && !hasB ? float3(0.1, 0.2, 1) : !inside ? float3(1, 0.1, 0.1)
+            : (!hasA || ma.x < 0) && (!hasB || mb.x < 0) ? float3(1, 0.1, 1) : w <= 0 ? float3(1, 1, 0.1)
+            : ((e >> 24) & 7) == 0 ? float3(0.1, 1, 1) : float3(0.1, 1, 0.1);
+        return lerp(base, dc, dc.g == 1 && dc.r < 0.5 ? 0.25 + 0.75 * w : 0.6);
+    }
+    if (!inside) return base;
+    // Keep two of three [V 0x2b1c-0x2b60].
+    float w1 = 1 - wb, w2 = wb, a = wa * w1;
+    w1 *= 1 - wa;
+    float3 c1 = base, c2 = vmSlot(eb, 0.5, base, enc), ca = vmSlot(ea, 0.5, base, enc);
+    if (w1 > w2) { if (a > w2) { w2 = a; c2 = ca; } }
+    else if (a > w1) { w1 = a; c1 = ca; }
+    return (w1 * c1 + w2 * c2) / max(w1 + w2, 1e-4);
+}
 [RootSignature(RS)]
 VsOut vs(uint v : SV_VertexID, uint instance : SV_InstanceID) {
     float3 p = position(v), n = normal(v);
@@ -986,6 +1347,46 @@ VsOut vs(uint v : SV_VertexID, uint instance : SV_InstanceID) {
         uint cw = ld(chan == 1 ? 0x30 : 0x34);
         if (((cw >> 3) & 0x3C) != 0) { uint c = ld(at(cw, v)); o.col = float4(c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF, c >> 24) / 255.0; }
     }
+    // INT1 (`vehmat`): the material colour of this vertex: entry u8(alpha) of
+    // mesh word 0x04's RGBA8 stream (format 6, as the title's mesh program
+    // takes it) in the draw's table in t2 at dword asuint(albedo.w) - 1.
+    o.vm = 0;
+    uint vt = asuint(albedo.w);
+    if (vt != 0) {
+        uint mw = ld(0x04);
+        if ((mw & 15) == 6 && ((mw >> 3) & 0x3C) != 0) {
+            uint c = ld(at(mw, v));
+            // NPC1 (layerFlags bit 11, vehmat::SLOD_FLAG): a far ped's k (vehmat::slod_k).
+            uint e = (vt - 1 + ((layerFlags & 0x800) != 0 ? slodK(c, (layerFlags & 0x1000) != 0) : c >> 24)) * 4;
+            bool ok = e + 4 <= instBytes && e < 0x7FFFFFF0;
+            uint m = inst.Load(ok ? e : 0);
+            o.vm = ok ? m : 0;
+        }
+    }
+    // POL2 (`vehlivery=on`, layerFlags bit 9): the livery layer word of this
+    // vertex, as the title's mesh program makes attr1.x [V MS 42c87283
+    // 0xd38-0xe6c]: a = u8(alpha) of mesh word 0x04, u = u8(alpha) of mesh
+    // word 0x30 (RGBA8); none when bit a of the no-livery mask is set, else
+    // section word 8 + u. The UV sets the records pick: attr2.zw = mesh word
+    // 0x10, attr3.xy = mesh word 0x38 [V MS 0x388-0x478, 0x1114-0x1268;
+    // their constant transforms taken as identity, I].
+    o.lv = 0;
+    o.uv12 = float4(0, 0, 0, 0);
+    o.uvl = o.uv;
+    if (vt != 0 && (layerFlags & 0x200) != 0) {
+        uint s = vt - 1 + (layerTex >> 16);
+        uint mw = ld(0x04), cw = ld(0x30);
+        uint a = ld(at(mw, v)) >> 24, u = ld(at(cw, v)) >> 24;
+        o.lv = ((vmLoad(s + (a >> 5)) >> (a & 31)) & 1) != 0 ? 0 : vmLoad(s + 8 + u);
+        o.uv12 = float4(uvAt(0x10, v), uvAt(0x38, v));
+        // POL3: the mesh program's UV transform (section dwords 264-270, vehmat::LIVERY_UVX).
+        if (vmLoad(s + 270) != 0) {
+            float3 xa = asfloat(uint3(vmLoad(s + 264), vmLoad(s + 265), vmLoad(s + 266)));
+            float3 xb = asfloat(uint3(vmLoad(s + 267), vmLoad(s + 268), vmLoad(s + 269)));
+            o.uvl = lvX(o.uv, xa, xb);
+            o.uv12 = float4(lvX(o.uv12.xy, xa, xb), lvX(o.uv12.zw, xa, xb));
+        }
+    }
     return o;
 }
 // A row drawn from the title's mesh program (`bridgems`): t0 is the
@@ -1005,6 +1406,10 @@ VsOut vs_rec(uint id : SV_VertexID) {
     o.uv = (instBytes >> 24) != 0 ? rrow(a, (instBytes >> 8) & 0xFF, (instBytes >> 16) & 3).xy : float2(0, 0);
     o.normal = (remapAt >> 16) != 0 ? rrow(a, remapAt & 0xFF, (remapAt >> 8) & 3).xyz : float3(0, 0, 1);
     o.col = float4(0, 0, 0, 0);
+    o.vm = 0;
+    o.lv = 0;
+    o.uv12 = float4(0, 0, 0, 0);
+    o.uvl = float2(0, 0);
     return o;
 }
 #ifdef GBUF
@@ -1012,6 +1417,8 @@ VsOut vs_rec(uint id : SV_VertexID) {
 // its albedo (linear) and unit normal here.
 static float3 gbBase = 0;
 static float3 gbN = float3(0, 0, 1);
+// DEC2: a decal row's alpha (matFlags bit 4): its pipeline blends the albedo target by it.
+static float gbA = 0;
 // `ourlight=on` (ourlight.rs): the fog visibility of the pixel, kept in RT1.r
 // as 1 + 254 x it (0, the clear: no row of ours there).
 static float gbFog = 1;
@@ -1055,7 +1462,37 @@ float4 shade(VsOut i) {
         // sRGB view already decodes to linear): no re-encode; the final pow
         // 1/2.2 is the one conversion. `light=old` keeps the older re-encode.
         base = (!chain && (matFlags & 2) != 0) ? pow(saturate(t.rgb), 1.0 / 2.2) : t.rgb;
+        // Ped tint ([V ped PS 41c328e7 0x600..0x894]): c = Pal(D.g, r0); lerp to
+        // Pal(D.g, r1) by D.r when r1 is set and differs; then to Pal(D.g, r2) by D.b.
+        // matFlags bit 3; layerTex: palette entry (bits 0-11), rows (12-20), r0 (24-31);
+        // layerFlags: r1 (16-23), r2 (24-31) (never layered at once).
+        uint pi = layerTex & 0xFFF, rows = (layerTex >> 12) & 0x1FF, r0 = layerTex >> 24;
+        uint r1 = (layerFlags >> 16) & 0xFF, r2 = layerFlags >> 24;
+        if ((matFlags & 8) != 0 && pi != 0 && rows != 0 && r0 != 0xFF) {
+            float inv = 1.0 / rows;
+            float3 c = palRow(pi, t.g, r0, inv);
+            if (r1 != 0xFF && r1 != r0) c = lerp(c, palRow(pi, t.g, r1, inv), t.r);
+            if (r2 != 0xFF) c = lerp(c, palRow(pi, t.g, r2, inv), t.b);
+            base = c;
+        }
+        // Vehicle paint (stand-in): DiffuseTex x colour A (in albedo.rgb), matFlags bit 2.
+        if ((matFlags & 4) != 0) base *= albedo.rgb;
+        // INT1/PAL1: the title's material colour (T8+0x540 element 0): RGB8 / 255
+        // [V PS 0e9eff9d 0x3444-0x3460] when the record gives one, else its
+        // palette row at u = Tex0.g [V a8000c5c 0x29c4-0x2a20; v100 taken as 0];
+        // it replaces the texture (c += s18 * (Tex0 - c), s18 taken as 0
+        // [V 0x2c68-0x2c84]); kind 4 (`vehmat=mul`): RGB times the texture
+        // (INT1/INT2). A linear value: re-encoded where the view's base is.
+        uint vk = (i.vm >> 24) & 7;
+        float3 vc = float3(i.vm & 0xFF, (i.vm >> 8) & 0xFF, (i.vm >> 16) & 0xFF) / 255.0;
+        if (vk == 2 || vk == 3) vc = vmPal(i.vm & 0xFFFF, t.g, vk == 2);
+        if (vk == 4) base *= vc;
+        else if (vk != 0 && vk != 5) base = (!chain && (matFlags & 2) != 0) ? pow(saturate(vc), 1.0 / 2.2) : vc;
+        if ((layerFlags & 0x200) != 0 && asuint(albedo.w) != 0) base = vmLivery(i, base, !chain && (matFlags & 2) != 0);
     }
+    // NPC1 (vehmat::SLOD_SRGB, kind 5): a far ped's palette colour, the title's
+    // attr0 (sRGB-decoded RGB8; the rows have no texture): the linear albedo.
+    if (((i.vm >> 24) & 7) == 5) base = slodDecode(float3(i.vm & 0xFF, (i.vm >> 8) & 0xFF, (i.vm >> 16) & 0xFF) / 255.0);
     // First cut: w = (C.r, C.g, C.b, sat(1 - r - g - b)), normalised;
     // albedo = sum w_i * layer_i (mask texture, C.a mix and height terms later).
     if ((layerFlags & 1) != 0 && ((layerFlags >> 1) & 3) != 0) {
@@ -1077,6 +1514,13 @@ float4 shade(VsOut i) {
     // Linear albedo: the old path re-encoded an sRGB view's value (undone here).
     gbBase = (!chain && texIndex != 0 && (matFlags & 2) != 0) ? pow(saturate(base), 2.2) : base;
     gbN = n;
+    gbA = (matFlags & 16) != 0 ? a : 0;
+#ifdef CARSHADE
+    // CAR1/CAR1B (`carshade=on`, carshade.rs): a vehicle paint-class row's exterior paint slot (its material entry's
+    // bit 31, vehmat::COAT) leaves its gloss, 1 - the record's roughness nibble (bits 27-30) / 16, at least 1/255,
+    // in the albedo target's alpha for the lighting pass (0 on every other pixel: interiors, trims, other rows).
+    if ((matFlags & 48) == 32 && (i.vm >> 31) != 0) gbA = max(1 - ((i.vm >> 27) & 15) / 16.0, 1.0 / 255);
+#endif
     gbFog = fog.w > 0 ? exp(-i.pos.w * fog.w) : 1;
 #endif
 #ifdef OURLIGHT
@@ -1087,7 +1531,8 @@ float4 shade(VsOut i) {
     // The lab's view modes (xnw-lab prepends the define). Geometry first:
     // 1 shaded by normal, no textures; 2 bones per draw (grey: none; hue by count);
     // 3 draw class (static blue-grey, instanced green, skinned ped red, skinned other
-    // orange); 4 normals; 5 depth (reverse Z); 6 albedo only; 7 flat (no table entry).
+    // orange); 4 normals; 5 depth (reverse Z); 6 albedo only; 7 flat (no table entry);
+    // 8 nothing (no colour, no depth: the title's bridged rows alone, REFDIFF).
     float3 L = normalize(float3(0.4, -0.3, 0.866));
     float shade = 0.35 + 0.65 * abs(dot(n, L));
     if (LAB_VIEW == 1) return float4(shade.xxx * 0.85, 1);
@@ -1097,6 +1542,7 @@ float4 shade(VsOut i) {
     if (LAB_VIEW == 5) return float4(pow(saturate(i.pos.z * 256), 0.25).xxx, 1);
     if (LAB_VIEW == 6) return float4(base, 1);
     if (LAB_VIEW == 7) return texIndex == 0 ? float4(albedo.rgb, 1) : float4(0.25, 0.25, 0.25, 1);
+    if (LAB_VIEW == 8) discard;
 #endif
     // Alpha out: the texture's (decals blend with the title's state, SRC_ALPHA).
     if (chain) { float4 o = fogged(titleLit(base, n), i.pos.w); o.a = a; return o; }
@@ -1114,7 +1560,7 @@ float4 shade(VsOut i) {
 #ifdef GBUF
 struct GbufOut { float4 c : SV_Target0; float4 albedo : SV_Target1; float4 normal : SV_Target2; };
 [RootSignature(RS)]
-GbufOut ps(VsOut i) { GbufOut o; o.c = shade(i); o.albedo = float4(gbBase, 0); o.normal = gbufNormal(gbN); return o; }
+GbufOut ps(VsOut i) { GbufOut o; o.c = shade(i); o.albedo = float4(gbBase, gbA); o.normal = gbufNormal(gbN); return o; }
 #else
 [RootSignature(RS)]
 float4 ps(VsOut i) : SV_Target { return shade(i); }
@@ -1295,8 +1741,16 @@ fn filtered_count(main: usize, kept: usize) -> usize {
 /// What a [`Pass::draw`] did.
 #[derive(Debug, Default, Clone)]
 pub struct PassStats {
+    /// The draw loop (resolve and record, both passes), of it the
+    /// resolve, and the parallel runs (send, record on `precord_lists` lists, send).
+    pub loop_ms: f64,
+    pub resolve_ms: f64,
+    pub precord_ms: f64,
+    pub precord_lists: usize,
     /// HAIR6: strand pixels drawn over the picture (`hair=on`).
     pub hair: usize,
+    /// HAIR10: guide ribbon segments drawn (`hairribbon=on`).
+    pub hair_ribbons: usize,
     /// UI1: the UI layer was drawn over the picture.
     pub ui: bool,
     /// Geometry copies skipped (outside the page or the staging).
@@ -1336,6 +1790,9 @@ pub struct PassStats {
     pub palette_bytes: u64,
     pub record_ms: f64,
     pub gpu_ms: f64,
+    /// [`lag_on`]: the wait at this frame's start for the last frame's
+    /// fence (ms; `gpu_ms` is then this wait, not the frame's own GPU time).
+    pub lag_wait_ms: f64,
     /// The texture table's time in the record (reads, copies, views).
     pub tex_ms: f64,
     /// Slow frames: time in uploads and in new pipelines, the
@@ -1345,6 +1802,11 @@ pub struct PassStats {
     pub layered: usize,
     /// Draws with the title's sample mask (cross-fade).
     pub stippled: usize,
+    /// Ped draws tinted from their palette, vehicle draws painted.
+    pub tinted: usize,
+    pub painted: usize,
+    /// INT1: vehicle draws coloured from their material table.
+    pub vehmat: usize,
     /// Draws without geometry by reason: waiting for the frame's upload
     /// budget, waiting for device room, not delivered by the recorder; and
     /// geometries freed on the device this frame.
@@ -1437,6 +1899,11 @@ pub struct Pass {
     pub layers_debug: bool,
     /// Apply the title's sample mask (`stipple=off`).
     pub stipple: bool,
+    /// Ped tint and vehicle paint (`tint=off`, `paint=off`).
+    pub tint: bool,
+    pub paint: bool,
+    /// INT1: the title's per-material vehicle colour (`vehmat=off`).
+    pub vehmat: bool,
     /// This frame's Light buffer (the sky and water passes bind it too).
     light_va: u64,
     colour: ID3D12Resource,
@@ -1456,6 +1923,18 @@ pub struct Pass {
     /// the list is closed, sent and waited for every N draws, so no single
     /// submission can run near the driver's 2 s timeout on the card.
     pub chunk: u32,
+    /// `precord=on|N` (default off): lists of a parallel run of the
+    /// draw loop (0, 1: the pass's own list only); the pool of allocators and
+    /// lists (fence value of each one's last submission), this frame's next
+    /// entry, and the entries our list continued on (fenced at the frame's end).
+    pub precord: u32,
+    /// `bridgepar=on|off` (PERF3, default on): the bridged rows prepared
+    /// on a thread of their own from the frame's start ([`precord::BridgePrep`]).
+    pub bridgepar: bool,
+    bridge_prep: Option<precord::BridgePrep>,
+    prec_pool: Vec<(ID3D12CommandAllocator, ID3D12GraphicsCommandList, u64)>,
+    prec_next: usize,
+    prec_cont: Vec<usize>,
     /// A pair of timestamps per submission (query heap, readback), made at the first frame.
     stamps: Option<(ID3D12QueryHeap, ID3D12Resource)>,
     pub width: u32,
@@ -1546,6 +2025,8 @@ pub struct Pass {
     /// The bridged rows' device objects (heaps, kept inputs, uploads), kept across frames.
     pub bridge_gpu: bridged::Gpu,
     bridge_keep: Vec<windows::core::IUnknown>,
+    /// [`lag_on`]: the frame sent and not yet waited for.
+    lag: Option<Lag>,
     bridge_grey: Option<ID3D12Resource>,
     /// The stand-ins of the other shapes: six slices, 3D, 1D.
     bridge_grey_shapes: Vec<ID3D12Resource>,
@@ -1558,6 +2039,15 @@ pub struct Pass {
     /// The picture shown (a copy of `colour` from the last frame that was
     /// complete enough) and the cut watch (`hold=off`: `colour` is shown).
     shown: ID3D12Resource,
+    /// [`lag_on`]: the second shown picture: the frame in flight
+    /// copies into it, and it becomes `shown` once that frame's fence is
+    /// reached (`shown_flip`), so the presenter's queue (another queue of
+    /// the device) never reads a picture our queue still writes.
+    shown_back: Option<ID3D12Resource>,
+    shown_flip: bool,
+    /// PASS1: the lag decision the pass thread took for the next frame
+    /// (None: [`lag_on`] read in the frame, as before).
+    lag_frame: Option<bool>,
     pub cuts: cuts::CutWatch,
     /// The ped pre-skin compute pass (made at its first item).
     preskin: preskin_gpu::GpuPreskin,
@@ -1572,6 +2062,29 @@ pub struct Pass {
     gbuf: Option<gbuf::Targets>,
     /// `ourlight=on`: the lighting pass after the opaque rows.
     ourlight: Option<ourlight::Lit>,
+    /// `sunshadow=on` (with `ourlight`): the cascade atlas and the screen term.
+    sunshadow: Option<sunshadow::Sun>,
+    /// `lights=on`: the light sum's scale (`lightscale=`) and the frames of the pass so far.
+    lamp_scale: f32,
+    lamp_tick: u64,
+    /// FLK2 `lightkeep`: the last frame's lights for the selection.
+    lamp_keep: lamps::Keep,
+    /// FLK2: what the frame drawn last was made of (the flicker counter's
+    /// named frames), the one being drawn, and the second picture's (it
+    /// flips with the picture at [`Pass::retire`]).
+    note: xnw_core::live::Shown,
+    note_next: xnw_core::live::Shown,
+    note_shown: xnw_core::live::Shown,
+    note_back: xnw_core::live::Shown,
+    /// `post=on|key`: where E comes from (post.rs), this frame's composite constants (None: the pass tone-maps itself).
+    post_mode: u32,
+    post_k: Option<[f32; 12]>,
+    post_tick: u64,
+    /// `post=on` (POST3): the adapted EV (None: the next frame starts at its target), when it was
+    /// last stepped (the step's fallback), and a camera cut seen since (the next frame starts again).
+    post_ev: Option<f32>,
+    post_at: Option<std::time::Instant>,
+    post_cut: bool,
     rec_pso: Option<ID3D12PipelineState>,
     rec_slot: Option<u32>,
     /// The instance cull on the device (made at its first batch).
@@ -1596,6 +2109,15 @@ enum Bound {
 // SAFETY: the mapped palette pointers are only used under the owner's
 // `&mut self`; D3D12 objects are free-threaded.
 unsafe impl Send for Pass {}
+
+/// [`lag_on`]: a frame in flight ends before what it reads goes.
+impl Drop for Pass {
+    fn drop(&mut self) {
+        if let Some(l) = &self.lag {
+            let _ = self.wait_value(l.value, l.sent, l.frame);
+        }
+    }
+}
 
 fn blob_bytes(b: &ID3DBlob) -> &[u8] {
     // SAFETY: the blob's own buffer, alive with it.
@@ -1682,12 +2204,18 @@ fn pipeline_with(device: &ID3D12Device, root: &ID3D12RootSignature, vs: &ID3DBlo
 /// the D3D12 enum ranges fall back to ours (depth GREATER with write, no blend).
 /// `plain`: with `gbuf=on`, the pixel entry without the G-buffer outputs,
 /// for states that blend with source 1 ([`gbuf::pixel_for`]).
+/// A decal state's G-buffer targets blend the title's way ([`gbuf::decal_layout`]).
 fn pipeline_state(device: &ID3D12Device, root: &ID3D12RootSignature, vs: &ID3DBlob, ps: &ID3DBlob, plain: Option<&ID3DBlob>, s: &RenderState) -> Result<ID3D12PipelineState> {
-    pipeline_state_with(device, root, vs, gbuf::pixel_for(ps, plain, &s.blend), s, &[])
+    pipeline_state_at(device, root, vs, gbuf::pixel_for(ps, plain, &s.blend), s, &[], true)
 }
 
 /// [`pipeline_state`] with an input layout (empty: none).
 fn pipeline_state_with(device: &ID3D12Device, root: &ID3D12RootSignature, vs: &ID3DBlob, ps: &ID3DBlob, s: &RenderState, elements: &[D3D12_INPUT_ELEMENT_DESC]) -> Result<ID3D12PipelineState> {
+    pipeline_state_at(device, root, vs, ps, s, elements, false)
+}
+
+/// `raw`: the world pass's own shader (its decal states take [`gbuf::decal_layout`]).
+fn pipeline_state_at(device: &ID3D12Device, root: &ID3D12RootSignature, vs: &ID3DBlob, ps: &ID3DBlob, s: &RenderState, elements: &[D3D12_INPUT_ELEMENT_DESC], raw: bool) -> Result<ID3D12PipelineState> {
     let func = if (1..=8).contains(&s.depth_func) { D3D12_COMPARISON_FUNC(i32::from(s.depth_func)) } else { D3D12_COMPARISON_FUNC_GREATER };
     let b = s.blend;
     let blend_ok = b[0] != 0 && [b[1], b[2], b[4], b[5]].iter().all(|v| (1..=19).contains(v)) && [b[3], b[6]].iter().all(|v| (1..=5).contains(v));
@@ -1734,6 +2262,9 @@ fn pipeline_state_with(device: &ID3D12Device, root: &ID3D12RootSignature, vs: &I
         (rt.SrcBlendAlpha, rt.DestBlendAlpha, rt.BlendOpAlpha) = (D3D12_BLEND(i32::from(b[4])), D3D12_BLEND(i32::from(b[5])), D3D12_BLEND_OP(i32::from(b[6])));
     }
     gbuf::layout(&mut desc, blob_bytes(ps));
+    if raw {
+        gbuf::decal_layout(&mut desc, &b);
+    }
     // SAFETY: the description and what it points at outlive the call.
     let pso = unsafe { device.CreateGraphicsPipelineState::<ID3D12PipelineState>(&desc) };
     drop(ManuallyDrop::into_inner(desc.pRootSignature));
@@ -1799,7 +2330,11 @@ impl Pass {
         // `ourlight=on` turns the G-buffer on (it reads the normals).
         let switches = std::env::var("XNW_WORLD_RENDER").unwrap_or_default();
         ourlight::set(ourlight::parse_switch(&switches));
+        ourlight::set_normals(ourlight::parse_normals(&switches));
+        ourlight::set_emissive(ourlight::parse_emissive(&switches));
         gbuf::set(gbuf::parse_switch(&switches) || ourlight::on());
+        // CAR1: `carshade=on` with `ourlight=metal` (the term needs the pass's camera rays).
+        carshade::set(carshade::parse_switch(&switches) && ourlight::metal());
         let raw_source = gbuf::source(RAW_SHADER);
         let (vs, ps) = (compile(c"vs", c"vs_5_1")?, compile(c"ps", c"ps_5_1")?);
         let (rvs, rps) = (compile_source(&raw_source, c"vs", c"vs_5_1")?, compile_source(&raw_source, c"ps", c"ps_5_1")?);
@@ -1843,6 +2378,7 @@ impl Pass {
             };
             let colour = texture(COLOUR, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_CLEAR_VALUE { Format: COLOUR, Anonymous: D3D12_CLEAR_VALUE_0 { Color: [0.09, 0.09, 0.1, 1.0] } }).map_err(e)?;
             let shown = texture(COLOUR, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_CLEAR_VALUE { Format: COLOUR, Anonymous: D3D12_CLEAR_VALUE_0 { Color: [0.09, 0.09, 0.1, 1.0] } }).map_err(e)?;
+            let shown_back = if lag_on() { Some(texture(COLOUR, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_CLEAR_VALUE { Format: COLOUR, Anonymous: D3D12_CLEAR_VALUE_0 { Color: [0.09, 0.09, 0.1, 1.0] } }).map_err(e)?) } else { None };
             let depth = texture(DEPTH, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_CLEAR_VALUE { Format: DEPTH, Anonymous: D3D12_CLEAR_VALUE_0 { DepthStencil: D3D12_DEPTH_STENCIL_VALUE { Depth: 0.0, Stencil: 0 } } }).map_err(e)?;
             let small = |kind, n| device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC { Type: kind, NumDescriptors: n, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE, NodeMask: 0 });
             let rtv = small(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 3).map_err(e)?;
@@ -1864,14 +2400,26 @@ impl Pass {
                 None
             };
             device.CreateDepthStencilView(&depth, None, dsv.GetCPUDescriptorHandleForHeapStart());
-            // `ourlight=on`: its two views at heap slots 4 and 5 (the frame's buffers hold 0-3).
-            let lit = match (&gbuf_targets, ourlight::on()) {
+            // `ourlight=on`: its two views at heap slots 4 and 5 (the frame's buffers hold 0-3); `metal`: 6 too; `ournormals=title`: 7.
+            // `sunshadow=on`: the term's view follows the lighting pass's (one table), then the term pass's two.
+            let lit_views = if ourlight::title_normals() { 4 } else if ourlight::metal() { 3 } else { 2 };
+            let (lit, sun) = match (&gbuf_targets, ourlight::on()) {
                 (Some(t), true) => {
                     let base = heap.GetCPUDescriptorHandleForHeapStart().ptr;
                     let cpu = |slot: u32| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: base + (slot * heap_step) as usize };
-                    Some(ourlight::Lit::new(&device, &t.normal, COLOUR, width, height, 4, &cpu)?)
+                    // `lights=on` (with metal): our depth's view after the term's, before the term pass's two.
+                    let lamps = ourlight::metal() && lamps::parse_switch(&switches);
+                    // `post=on`: the scene-linear target's view after those.
+                    let posted = post::parse_switch(&switches) != post::OFF;
+                    // `emissive=on` (with metal, LGT1): the emissive target's view after the depth copy's, at the lights' scale.
+                    let emissive = ourlight::emissive().then(|| lamps::parse_scale(&switches));
+                    let sun = if sunshadow::parse_switch(&switches) != sunshadow::OFF { Some(sunshadow::Sun::new(&device, &raw_source, &raw_root, width, height, 4 + lit_views + 1 + u32::from(lamps) + u32::from(emissive.is_some()) + u32::from(posted), &cpu)?) } else { None };
+                    let mut lit = ourlight::Lit::new(&device, &t.normal, COLOUR, width, height, 4, ourlight::metal(), ourlight::title_normals(), sun.as_ref().map(sunshadow::Sun::term), lamps, emissive, posted, &cpu)?;
+                    // CAR1 `carshade=on`: the albedo target's view in the slot after the sun term pass's two.
+                    lit.set_car(&device, &t.albedo, 4 + lit_views + if sun.is_some() { 3 } else { 0 } + u32::from(lamps) + u32::from(emissive.is_some()) + u32::from(posted), &cpu);
+                    (Some(lit), sun)
                 }
-                _ => None,
+                _ => (None, None),
             };
             let readback = host.buffer(u64::from(width) * 4 * u64::from(height), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST).map_err(e)?;
             let alloc: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
@@ -1891,7 +2439,7 @@ impl Pass {
                 wire_pso,
                 heap,
                 heap_step,
-                next_slot: if lit.is_some() { 6 } else { 4 },
+                next_slot: if let Some(l) = &lit { 4 + lit_views + if sun.is_some() { 3 } else { 0 } + u32::from(l.has_lamps()) + u32::from(l.has_emissive()) + u32::from(l.has_post()) + u32::from(l.has_car()) } else { 4 },
                 free_slots: Vec::new(),
                 zc_geoms: Default::default(),
                 palettes: [None, None],
@@ -1901,6 +2449,9 @@ impl Pass {
                 layers: 2,
                 layers_debug: false,
                 stipple: true,
+                tint: true,
+                paint: true,
+                vehmat: true,
                 light_va: 0,
                 palette_turn: 0,
                 colour,
@@ -1915,6 +2466,12 @@ impl Pass {
                 fence,
                 fence_value: 0,
                 chunk: 0,
+                precord: 0,
+                bridgepar: true,
+                bridge_prep: None,
+                prec_pool: Vec::new(),
+                prec_next: 0,
+                prec_cont: Vec::new(),
                 stamps: None,
                 width,
                 height,
@@ -1962,12 +2519,16 @@ impl Pass {
                 bridge_warm: false,
                 bridge_gpu: bridged::Gpu::default(),
                 bridge_keep: Vec::new(),
+                lag: None,
                 bridge_grey: None,
                 bridge_grey_shapes: Vec::new(),
                 bridge_words: None,
                 hair: None,
                 ui: None,
                 shown,
+                shown_back,
+                shown_flip: false,
+                lag_frame: None,
                 cuts: cuts::CutWatch::new(false),
                 preskin: preskin_gpu::GpuPreskin::default(),
                 bridge_ms: None,
@@ -1975,6 +2536,20 @@ impl Pass {
                 rec_pso: None,
                 gbuf: gbuf_targets,
                 ourlight: lit,
+                sunshadow: sun,
+                lamp_scale: lamps::parse_scale(&switches),
+                lamp_tick: 0,
+                lamp_keep: lamps::Keep::default(),
+                note: xnw_core::live::Shown::default(),
+                note_next: xnw_core::live::Shown::default(),
+                note_shown: xnw_core::live::Shown::default(),
+                note_back: xnw_core::live::Shown::default(),
+                post_mode: post::parse_switch(&switches),
+                post_k: None,
+                post_tick: 0,
+                post_ev: None,
+                post_at: None,
+                post_cut: false,
                 rec_slot: None,
                 cull: gpucull::GpuCull::default(),
             })
@@ -1989,6 +2564,13 @@ impl Pass {
     /// The colour target (render-target state between draws).
     pub fn colour(&self) -> &ID3D12Resource {
         &self.colour
+    }
+
+    /// FLK2: the note of the picture [`Pass::shown`] gives: with hold the
+    /// note that went with the last copy into it (flipped with the second
+    /// picture), else the frame drawn last's.
+    pub(crate) fn note_shown(&self) -> xnw_core::live::Shown {
+        if self.cuts.hold { self.note_shown } else { self.note }
     }
 
     /// What the presenter shows: the last picture complete enough (hold
@@ -2115,6 +2697,7 @@ impl Pass {
     /// and read again. Their number.
     fn zc_changes(&mut self) -> usize {
         let c = xnw_gpu::shared::world_changes();
+        self.bridge_gpu.zc_changed(&c);
         if self.zc_geoms.is_empty() || c.gone.is_empty() && c.remapped.is_empty() && !c.overflow {
             return 0;
         }
@@ -2259,6 +2842,10 @@ impl Pass {
         let batch = self.bridge_ms.take();
         let r = self.draw_with(list, decode, readback, batch.as_ref().filter(|b| !b.is_empty()));
         self.bridge_ms = batch;
+        // FLK2: the frame's note (the lights and E were noted while drawing).
+        if let Ok(st) = &r {
+            self.note = xnw_core::live::Shown { world: list.frame, rows: st.draws as u32, bridged: st.bridged as u32, ..self.note_next };
+        }
         r
     }
 
@@ -2288,14 +2875,50 @@ impl Pass {
         let frame = list.frame;
         let at = |what: String| move |e: windows::core::Error| format!("frame {frame}: {what}: {e}");
         let cam = *list.main_camera().ok_or("no camera")?;
+        // `ourlight=metal`: the lighting pass's view rays.
+        let clip_to_world = invert(&cam.view_proj_relative()).unwrap_or([0.0; 16]);
         let mut st = PassStats::default();
+        // `lights=on`: the frame's kept lights for the lighting pass (live `lights=0`: none), and the probe line.
+        if let Some(lit) = self.ourlight.as_mut().filter(|l| l.has_lamps()) {
+            let on = lamps::live_on();
+            let arr = list.lamps.as_ref().map_or(&[][..], |v| v.as_slice());
+            // FLK2 `lightkeep` (live): the kept set held at the cap, cap entries faded in.
+            let (recs, ls) = if lamps::keep_on() {
+                lamps::select_keep(arr, camera_pos(&cam.view), self.lamp_scale, &mut self.lamp_keep)
+            } else {
+                self.lamp_keep = lamps::Keep::default();
+                lamps::select(arr, camera_pos(&cam.view), self.lamp_scale)
+            };
+            lit.set_lamps(&lamps::constants(if on { &recs } else { &[] }));
+            let k = ls.keep.unwrap_or_default();
+            (self.note_next.lights, self.note_next.entered, self.note_next.left, self.note_next.energy) = if on { (ls.kept, k.entered, k.left, ls.energy) } else { (0, 0, 0, 0.0) };
+            self.lamp_tick += 1;
+            if self.lamp_tick <= 2 || self.lamp_tick % 60 == 0 {
+                xnw_core::info!("world render: frame {frame}: {}{}", ls.line(), if !on { " (live lights=0: none drawn)" } else if list.lamps.is_none() { " (not read)" } else { "" });
+            }
+        }
+        // [`lag_on`]: the last frame's fence first; then what it used goes.
+        st.lag_wait_ms = self.retire()?;
+        // SW1: the live switch taken once for the frame (PASS1: the pass thread's, when it took it).
+        let lag = self.lag_frame.take().unwrap_or_else(lag_on);
+        // LIVE1: a GPU UI layer is composed in this frame: our queue waits for its submission.
+        if let Some(u) = list.ui.as_deref() {
+            u.wait_on(&self.queue).map_err(|x| format!("frame {frame}: ui wait: {x}"))?;
+        }
         // `XNW_ZEROCOPY` (ZC2): no window heap is released from here to the
         // fence; one released or remapped since the last frame is dropped first.
-        let _in_flight = xnw_gpu::shared::world_frame();
+        let in_flight = xnw_gpu::shared::world_frame();
         st.in_place_dropped = self.zc_changes();
         let t0 = std::time::Instant::now();
+        let mut lap = recprof::Lap::new();
+        // PERF3 `bridgepar`: the bridged rows' preparation starts (the last frame's fence was reached above).
+        self.bridge_prep_start(list)?;
+        lap.mark(recprof::BRIDGEPS);
         let now = cuts::now_ms();
+        let was_camera = self.cuts.cut.is_some_and(|c| c.camera);
         self.cuts.camera(list.frame, &cam, now);
+        // `post=on`: a camera cut restarts the adapted exposure at its target (the title resets on a cut, I).
+        self.post_cut |= !was_camera && self.cuts.cut.is_some_and(|c| c.camera);
         let mut new_psos = 0usize;
         let only = self.only_stage;
         let peds = self.peds;
@@ -2308,6 +2931,11 @@ impl Pass {
         // Rows the pre-skin gives positions are drawn with `peds` and `skinned` off too.
         let pre_rows = list.preskin.rows();
         let pre_row = |r: &DrawRecord| !pre_rows.is_empty() && pre_rows.contains(&(((r as *const DrawRecord as usize).wrapping_sub(list.draws.as_ptr() as usize) / std::mem::size_of::<DrawRecord>()) as u32));
+        let row_of = |r: &DrawRecord| (r as *const DrawRecord as usize).wrapping_sub(list.draws.as_ptr() as usize) / std::mem::size_of::<DrawRecord>();
+        if std::env::var("XNW_PEDSKIP_LOG").is_ok_and(|v| v == "on") {
+            let s: Vec<String> = draws.iter().filter(|r| !(peds || !r.ped || pre_row(r))).map(|r| format!("{}:s{}{}", row_of(r), r.stage, if r.material.alpha_clip { "c" } else { "" })).collect();
+            xnw_core::info!("world render: frame {frame}: peds skipped rows (row:stage, c alpha clip): {}", s.join(" "));
+        }
         let draws: Vec<&DrawRecord> = draws.into_iter().filter(|r| peds || !r.ped || pre_row(r)).collect();
         st.peds_skipped = before - draws.len();
         let before = draws.len();
@@ -2316,6 +2944,8 @@ impl Pass {
         let lifted = |r: &DrawRecord| skin_lifted(list, r, rules);
         let mut draws: Vec<&DrawRecord> = draws.into_iter().filter(|r| skinned || r.ped || r.palette == NO_PALETTE || r.bone_count <= 1 || lifted(r) || pre_row(r)).collect();
         st.skinned_skipped = before - draws.len();
+        // HAIR10b: the ped rows this pass draws (geometry, camera-relative world origin): ribbons only near them.
+        let ped_rows: Vec<(GeomKey, [f32; 3])> = if list.hair_ribbons.is_some() { draws.iter().filter(|r| r.ped).map(|r| (r.geom, [r.world[12], r.world[13], r.world[14]])).collect() } else { Vec::new() };
         // The title submits some stage-74 decals on alternate frames only
         // (standard_decal 0xd6385a01c3119400 in 111 of 325 frames in a test run),
         // leaving its TAA to blend them; we draw the union of this list's
@@ -2343,6 +2973,7 @@ impl Pass {
         if self.pso_async && self.states {
             self.pipelines_ahead(list, &mut st);
         }
+        lap.mark(recprof::FILTER);
         // Geometry through the policy: arrivals queued, then the frame's
         // plan (evictions, uploads by priority under the budgets).
         let tu = std::time::Instant::now();
@@ -2353,7 +2984,9 @@ impl Pass {
         for (key, g) in &list.new_geoms {
             self.geom.offer(known, *key, g.clone(), list.frame);
         }
-        for r in &draws {
+        // `sunshadow`: the title's cascade rows' geometry is asked for with the main view's.
+        let shadow_rows: Vec<&DrawRecord> = if matches!(self.sunshadow_mode(), sunshadow::AUTO | sunshadow::TITLE) { sunshadow::title_rows(list).collect() } else { Vec::new() };
+        for r in draws.iter().chain(&shadow_rows) {
             if !self.geom.is_resident(&r.geom)
                 && !self.geom.is_pending(&r.geom)
                 && let Some(g) = decode(&r.geom)
@@ -2361,7 +2994,7 @@ impl Pass {
                 self.geom.offer(known, r.geom, g, list.frame);
             }
         }
-        let refs: Vec<(GeomKey, f32)> = draws.iter().map(|r| (r.geom, r.world[12] * r.world[12] + r.world[13] * r.world[13] + r.world[14] * r.world[14])).collect();
+        let refs: Vec<(GeomKey, f32)> = draws.iter().chain(&shadow_rows).map(|r| (r.geom, r.world[12] * r.world[12] + r.world[13] * r.world[13] + r.world[14] * r.world[14])).collect();
         // 3: the frame's upload budget from time: the measured ms per
         // upload and per MiB (each taken as if it were the whole cost, so
         // either bound alone keeps the frame under the time).
@@ -2428,6 +3061,7 @@ impl Pass {
         st.pending = self.geom.pending_count();
         st.in_place_geoms = self.zc_geoms.len();
         st.upload_ms = tu.elapsed().as_secs_f64() * 1e3;
+        lap.mark(recprof::GEOMETRY);
         let (n, b) = (st.uploaded_geometries - before.0, st.uploaded_bytes - before.1);
         if n >= 4 {
             // `cutfast=on`: without page and staging creation (a one-off at a cut's first frame).
@@ -2464,7 +3098,32 @@ impl Pass {
             unsafe { b.Map(0, None, Some(&mut p)) }.map_err(at("light buffer Map".into()))?;
             self.light_cb[turn] = Some((b, p.cast::<u8>()));
         }
-        let lc = list.light.map_or([0f32; 28], |l| l.constants(self.light_old));
+        let mut lc = list.light.map_or([0f32; 28], |l| l.constants(self.light_old));
+        // `post=on`: the frame's E and the composite's constants. The rows after the lighting pass take the same E
+        // from the Light buffer; the sky stand-in's scale is its inverse there, so the sky's picture does not move.
+        self.post_k = None;
+        if let Some(light) = list.light.filter(|_| self.ourlight.as_ref().is_some_and(|l| l.has_post()) && !self.id_mode && ourlight::live_on() && post::live_on()) {
+            // `post=on` (POST3): adapted over the game's step (0x14ABBEF4C, 0 when paused), else the time
+            // since the last adapted frame; at most post::STEP_MAX. A cut starts again at the target.
+            let at = std::time::Instant::now();
+            let dt = list.step.unwrap_or_else(|| self.post_at.map_or(0.0, |t| at.duration_since(t).as_secs_f32())).clamp(0.0, post::STEP_MAX);
+            let prev = if std::mem::take(&mut self.post_cut) { None } else { self.post_ev };
+            let (e, ev, source) = post::exposure(&light, self.post_mode, post::live_exposure(), prev, dt);
+            (self.post_ev, self.post_at) = (ev, ev.map(|_| at));
+            lc[24] *= lc[7] / e;
+            lc[7] = e;
+            self.note_next.e = e;
+            self.post_k = Some(post::params(&light, e, frame));
+            self.post_tick += 1;
+            let started = prev.is_none() && ev.is_some();
+            if self.post_tick <= 8 || self.post_tick % 60 == 0 || started {
+                xnw_core::info!("world render: frame {frame}: {}{}", post::line(&light, e, source, dt), if started { " (adaptation starts at its target)" } else { "" });
+            }
+        } else {
+            // `post` off (live) or no light: the next adapted frame starts at its target.
+            (self.post_ev, self.post_at) = (None, None);
+            self.note_next.e = 0.0;
+        }
         let (light_buf, light_map) = self.light_cb[turn].as_ref().expect("made above");
         // SAFETY: 112 bytes into the 256-byte mapping.
         unsafe { std::ptr::copy_nonoverlapping(lc.as_ptr().cast::<u8>(), *light_map, 112) };
@@ -2508,6 +3167,7 @@ impl Pass {
         self.raw_view(&ibuf, ineed as u64, 2 + turn as u32);
         let inst_bytes = (list.instances.len() * 4) as u32;
         let inst_total = (list.instances.len() / 12) as u32;
+        lap.mark(recprof::PALETTES);
         // SAFETY: recording on our own list and objects; every pointer passed outlives its call.
         unsafe {
             // An earlier frame that failed after sending its first part
@@ -2528,7 +3188,7 @@ impl Pass {
             let l = &list_com;
             // One timestamp pair per submission; `chunk`: the frame in several.
             self.stamps_ready()?;
-            let (mut sub_k, mut chunk_from, mut chunk_wait) = (0u32, 0usize, 0f64);
+            let (mut sub_k, mut chunk_wait) = (0u32, 0f64);
             self.stamp_open(l, sub_k);
             let (rtv, dsv) = (self.rtv.GetCPUDescriptorHandleForHeapStart(), self.dsv.GetCPUDescriptorHandleForHeapStart());
             l.ClearRenderTargetView(rtv, &[0.09, 0.09, 0.1, 1.0], None);
@@ -2543,6 +3203,9 @@ impl Pass {
             } else {
                 1
             };
+            if let Some(lit) = &self.ourlight {
+                lit.clear(l);
+            }
             l.OMSetRenderTargets(targets, Some(&rtv), true, Some(&dsv));
             l.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: self.width as f32, Height: self.height as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
             l.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: self.width as i32, bottom: self.height as i32 }]);
@@ -2571,7 +3234,9 @@ impl Pass {
                 }
             }
             // The ped pre-skin: draw index -> its vertex-buffer copy (slot, bytes).
+            lap.mark(recprof::LIST_START);
             let pre = self.preskin_record(list, l);
+            lap.mark(recprof::PRESKIN);
             // every bridged row's mesh program, then one barrier; the
             // record ring's raw view for `vs_rec`.
             if let Some(b) = ms_rows {
@@ -2581,10 +3246,12 @@ impl Pass {
                     self.raw_view(ring, bytes, slot);
                 }
             }
+            lap.mark(recprof::MESH);
             // The device cull of the instanced rows (`gpucull=on`): per list draw its argument slot.
             let culled = self.cull_record(list, l);
             // Rows whose instances the device tests: their worlds are not in the list.
             let device_rows: std::collections::HashSet<u32> = list.cull.rows.iter().map(|c| c.0).collect();
+            lap.mark(recprof::CULL);
             // This frame's albedo table (uploads recorded on this list first).
             let (heap_cpu, step) = (self.heap.GetCPUDescriptorHandleForHeapStart().ptr, self.heap_step as usize);
             let cpu = |slot: u32| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: heap_cpu + slot as usize * step };
@@ -2596,9 +3263,13 @@ impl Pass {
             self.tex.opts.frame_ms = self.cuts.tex_ms(tex_base);
             // The bridged rows' textures last (our rows' come first in the table).
             let bridged = list.bridged.as_deref().filter(|_| self.bridge_on || self.bridge_warm);
-            self.tex.prepare(&self.device, l, &mut draws.iter().flat_map(|r| r.material.layers), &mut draws.iter().map(|r| r.material.albedo_desc).chain(bridged.into_iter().flat_map(|f| f.rows.iter().flat_map(|r| r.1.handles()))), &cpu);
+            self.tex.prepare(&self.device, l, &mut draws.iter().flat_map(|r| r.material.layers.into_iter().chain(r.material.livery)), &mut draws.iter().map(|r| r.material.albedo_desc).chain(draws.iter().map(|r| r.material.tint_palette).filter(|s| *s != 0)).chain(bridged.into_iter().flat_map(|f| f.rows.iter().flat_map(|r| r.1.handles()))), &cpu);
             self.tex.opts.frame_ms = tex_base;
             st.tex_ms = tt.elapsed().as_secs_f64() * 1e3;
+            lap.mark(recprof::TEXTURES);
+            // PERF3 `bridgepar`: the rows' textures as the table has them now.
+            self.bridge_prep_textures();
+            lap.mark(recprof::BRIDGEPS);
             let tex_table = self.gpu_slot(self.tex.base());
             if let Some(s) = list.sky.filter(|_| self.sky)
                 && let Some(inv) = invert(&cam.view_proj_relative())
@@ -2620,367 +3291,58 @@ impl Pass {
                 st.terrain = self.terrain.record(&self.device, l, list, &cam);
                 l.SetDescriptorHeaps(&[Some(self.heap.clone())]);
             }
+            lap.mark(recprof::SKY);
             // Imposter cards (opaque, depth; root constants only); `show`: after the draws.
             if list.imposters.is_some() && self.imposters.opts.on && !self.imposters.opts.show {
                 self.imposters.record(l, list, &cam);
             }
+            lap.mark(recprof::IMPOSTERS);
             let passes: &[bool] = if self.wire { &[false, true] } else { &[false] };
             // `gbuf=on`: targets bound (3; 1 for transparent rows and dual-source states).
-            let (mut rts, mut gbuf_done) = (if self.gbuf.is_some() { 3u32 } else { 1 }, false);
             // `ourlight=on`: the rows before its pass leave their albedo (flags bit 3).
-            let mut lit_done = self.ourlight.is_none() || self.id_mode;
+            // Each pass resolved into packets, then recorded (`precord`: long runs on parallel lists).
+            let mut walk = precord::Walk { rts: if self.gbuf.is_some() { 3u32 } else { 1 }, gbuf_done: false, lit_done: self.ourlight.is_none() || self.id_mode || !ourlight::live_on(), bridged_done: false, chunk_from: 0, chunk_wait, sub_k };
+            self.prec_next = 0;
+            self.prec_cont.clear();
+            // `sunshadow`: the cascades before the rows (the term pass runs with our lighting).
+            if self.sunshadow.is_some() {
+                let fr = precord::Frame { list, cam: &cam, culled: culled.as_ref(), pre: &pre, device_rows: &device_rows, first: &first, pal_bytes, inst_bytes, inst_total, turn, tex_table, light_va, clip_to_world: &clip_to_world, ms_rows };
+                self.record_sunshadow(l, &fr, &draws, walk.rts);
+                lap.mark(recprof::IMPOSTERS);
+            }
             for &wire in passes {
-                let mut raw_bound: Option<bool> = None;
-                // Table 3 holds the cull's output (a device-culled row) rather than the frame's instances.
-                let mut inst_cull_bound = false;
-                let mut indirect: Option<u32> = None;
-                let mut bound = Bound::Raw;
-                let mut water_done = wire;
-                for r in &draws {
-                    // `chunk`: every N draws the list so far is sent and waited for; the new
-                    // list gets the frame's targets, viewport and heap again, the rest at the next draw.
-                    if self.chunk > 0 && st.draws + st.bridged >= chunk_from + self.chunk as usize {
-                        chunk_from = st.draws + st.bridged;
-                        self.stamp_close(l, sub_k);
-                        l.Close().map_err(at(format!("chunk list Close after {chunk_from} draws")))?;
-                        let (w, g) = self.send_wait(l, sub_k, "pass chunk", frame)?;
-                        (chunk_wait, st.submits, sub_k) = (chunk_wait + w, st.submits + 1, sub_k + 1);
-                        (st.submit_wait_ms, st.submit_gpu_ms) = (st.submit_wait_ms.max(w), st.submit_gpu_ms.max(g.unwrap_or(0.0)));
-                        self.alloc.Reset().map_err(at("chunk allocator Reset".into()))?;
-                        self.list.Reset(&self.alloc, &self.pso).map_err(at("chunk list Reset".into()))?;
-                        self.stamp_open(l, sub_k);
-                        let (rtv, dsv) = (self.rtv.GetCPUDescriptorHandleForHeapStart(), self.dsv.GetCPUDescriptorHandleForHeapStart());
-                        l.OMSetRenderTargets(rts, Some(&rtv), true, Some(&dsv));
-                        l.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: self.width as f32, Height: self.height as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
-                        l.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: self.width as i32, bottom: self.height as i32 }]);
-                        l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-                        l.SetDescriptorHeaps(&[Some(self.heap.clone())]);
-                        raw_bound = None;
-                        inst_cull_bound = false;
-                    }
-                    // Water after opaque and decals, before transparent (14).
-                    if !water_done && TRANSPARENT_STAGES.contains(&r.stage) {
-                        water_done = true;
-                        // `ourlight=on`: the opaque rows lit, before the water and the transparent rows.
-                        if !lit_done {
-                            self.record_ourlight(l, light_va, rts);
-                            lit_done = true;
-                        }
-                        st.water = self.record_water(list, &cam).map_err(at("water grid upload".into()))?;
-                        raw_bound = None;
-                        // `gbuf=on`: transparent rows come after the title's G-buffer.
-                        gbuf_done = true;
-                    }
-                    // a bridged row draws from its records, not our geometry.
-                    let idx = ((*r as *const DrawRecord as usize).wrapping_sub(list.draws.as_ptr() as usize) / std::mem::size_of::<DrawRecord>()) as u32;
-                    if let Some(b) = ms_rows.filter(|_| !wire && (idx as usize) < list.draws.len())
-                        && let Some(it) = b.item(idx)
-                    {
-                        let pr = b.prog(it.prog);
-                        if pr.title_ps {
-                            b.record_title(l, it);
-                            l.SetDescriptorHeaps(&[Some(self.heap.clone())]);
-                            st.bridged_title_ps += 1;
-                        } else if let (Some(pso), Some(slot), Some(j), Some((ibv, n)), Some((_, ring_bytes))) = (&self.rec_pso, self.rec_slot, pr.join, b.indices(it), b.records()) {
-                            let c = draw_constants(r, &cam);
-                            let mut k = [0u32; 58];
-                            for (i, v) in c.iter().enumerate() {
-                                k[i] = v.to_bits();
-                            }
-                            let (ti, srgb) = self.tex.lookup(r.material.albedo_desc);
-                            k[48] = ti.min(TEX_SLOTS - 1);
-                            k[49] = u32::from(r.material.alpha_clip) | u32::from(srgb) << 1;
-                            self.tex.count_draw(r.material.albedo_desc);
-                            let jc = j.constants(&pr.p.layout);
-                            (k[32], k[33], k[36], k[37], k[39], k[56]) = (ring_bytes.min(u64::from(u32::MAX)) as u32, b.record_at(it) as u32, pr.p.layout.record_bytes(), jc[0], jc[1], jc[2]);
-                            k[35] = u32::from(r.ped) << 1 | u32::from(self.id_mode) << 2 | if lit_done { 0 } else { ourlight::DEFERRED };
-                            k[57] = idx + 1;
-                            if let Some(s) = list.sun {
-                                for (j, v) in s.iter().enumerate() {
-                                    k[40 + j] = v.to_bits();
-                                }
-                            }
-                            if let Some(s) = list.sky.filter(|_| self.sky) {
-                                for (j, v) in s.fog.iter().enumerate() {
-                                    k[52 + j] = v.to_bits();
-                                }
-                            }
-                            l.SetGraphicsRootSignature(&self.raw_root);
-                            l.SetPipelineState(pso);
-                            l.SetGraphicsRootDescriptorTable(1, self.gpu_slot(slot));
-                            l.SetGraphicsRootDescriptorTable(2, self.gpu_slot(turn as u32));
-                            l.SetGraphicsRootDescriptorTable(3, self.gpu_slot(2 + turn as u32));
-                            l.SetGraphicsRootDescriptorTable(4, tex_table);
-                            l.SetGraphicsRootConstantBufferView(5, light_va);
-                            l.SetGraphicsRoot32BitConstants(0, 58, k.as_ptr().cast(), 0);
-                            l.IASetIndexBuffer(Some(&ibv));
-                            l.DrawIndexedInstanced(n, 1, 0, 0, 0);
-                        } else {
-                            continue;
-                        }
-                        // Our root signature, heap tables and pipeline are bound again at the next raw draw.
-                        raw_bound = None;
-                        st.bridged += 1;
-                        continue;
-                    }
-                    let Some((ibv, vbv, indices, raw)) = self.cache.get_or_make(r.geom, list.frame, || None).map(|g| (g.ibv, g.vbv, g.indices, g.raw)) else {
-                        if !wire {
-                            st.skipped += 1;
-                            // Why, per draw.
-                            st.missing[match self.geom.missing(&r.geom) {
-                                Some(geometry::Missing::Waiting) => 0,
-                                Some(geometry::Missing::Full) => 1,
-                                _ => 2,
-                            }] += 1;
-                        }
-                        continue;
-                    };
-                    if indices == 0 || (wire && raw.is_none()) {
-                        continue;
-                    }
-                    let c = draw_constants(r, &cam);
-                    let mut instances = 1u32;
-                    // The title's state for this draw (raw path, solid
-                    // pass); without one, the decal pipeline for stage 74.
-                    let want = if wire {
-                        Bound::Wire
-                    } else if self.id_mode {
-                        Bound::Raw
-                    } else if let Some(s) = effective_state(self.face_cull, list, r, device_rows.contains(&(((*r as *const DrawRecord as usize).wrapping_sub(list.draws.as_ptr() as usize) / std::mem::size_of::<DrawRecord>()) as u32))).filter(|_| self.states && raw.is_some()) {
-                        st.culled_faces += usize::from(s.cull != 0);
-                        // New pipelines within the frame's budget; the rest draw with
-                        // our defaults until a later frame makes them.
-                        if !self.pso_async && !self.state_psos.contains_key(&s) && self.state_psos.len() < MAX_STATE_PSOS && new_psos < self.pso_budget {
-                            let tp = std::time::Instant::now();
-                            new_psos += 1;
-                            match pipeline_state(&self.device, &self.raw_root, &self.raw_shaders.0, &self.raw_shaders.1, self.raw_plain_ps.as_ref(), &s) {
-                                Ok(p) => {
-                                    self.state_psos.insert(s, p);
-                                }
-                                Err(err) => xnw_core::warn!("world render: state pipeline {s:?} failed: {err}"),
-                            }
-                            st.pso_ms += tp.elapsed().as_secs_f64() * 1e3;
-                        }
-                        if self.state_psos.contains_key(&s) {
-                            st.stated += 1;
-                            Bound::State(s)
-                        } else if DECAL_STAGES.contains(&r.stage) {
-                            Bound::Decal
-                        } else {
-                            Bound::Raw
-                        }
-                    } else if raw.is_some() && DECAL_STAGES.contains(&r.stage) {
-                        Bound::Decal
-                    } else {
-                        Bound::Raw
-                    };
-                    if raw_bound == Some(true) && want != bound {
-                        match want {
-                            Bound::Raw => l.SetPipelineState(&self.raw_pso),
-                            Bound::Wire => l.SetPipelineState(&self.wire_pso),
-                            Bound::Decal => l.SetPipelineState(&self.decal_pso),
-                            Bound::State(s) => l.SetPipelineState(&self.state_psos[&s]),
-                        }
-                        bound = want;
-                    }
-                    // A dual-source state blends into one target only (bound with three, WARP drew it wrong).
-                    if self.gbuf.is_some() {
-                        let n = if gbuf_done || matches!(want, Bound::State(s) if gbuf::dual_source(&s.blend)) { 1 } else { 3 };
-                        if n != rts {
-                            let (rtv, dsv) = (self.rtv.GetCPUDescriptorHandleForHeapStart(), self.dsv.GetCPUDescriptorHandleForHeapStart());
-                            l.OMSetRenderTargets(n, Some(&rtv), true, Some(&dsv));
-                            rts = n;
-                        }
-                    }
-                    l.IASetIndexBuffer(Some(&ibv));
-                    match raw {
-                        Some((slot, vb_bytes)) => {
-                            if raw_bound != Some(true) {
-                                l.SetGraphicsRootSignature(&self.raw_root);
-                                match want {
-                                    Bound::Raw => l.SetPipelineState(&self.raw_pso),
-                                    Bound::Wire => l.SetPipelineState(&self.wire_pso),
-                                    Bound::Decal => l.SetPipelineState(&self.decal_pso),
-                                    Bound::State(s) => l.SetPipelineState(&self.state_psos[&s]),
-                                }
-                                bound = want;
-                                l.SetGraphicsRootDescriptorTable(2, self.gpu_slot(turn as u32));
-                                l.SetGraphicsRootDescriptorTable(3, self.gpu_slot(2 + turn as u32));
-                                inst_cull_bound = false;
-                                l.SetGraphicsRootDescriptorTable(4, tex_table);
-                                l.SetGraphicsRootConstantBufferView(5, light_va);
-                                raw_bound = Some(true);
-                            }
-                            let (pf, pb) = match list.palettes.get(r.palette as usize) {
-                                Some(p) if r.palette != NO_PALETTE && self.skin => match r.bone_count {
-                                    0 => (first[r.palette as usize], (p.len() / 12) as u32),
-                                    // Bone k of the draw is palette entry curIndex + k (bounded by palBytes in the shader).
-                                    n => (first[r.palette as usize] + 3 * r.bone_first, n),
-                                },
-                                _ => (0, 0),
-                            };
-                            st.skinned += usize::from(pb > 0 && !wire);
-                            let mut k = [0u32; 58];
-                            for (i, v) in c.iter().enumerate() {
-                                k[i] = v.to_bits();
-                            }
-                            // The albedo entry of our table (0: flat) and the material flags.
-                            let (ti, srgb) = self.tex.lookup(r.material.albedo_desc);
-                            k[48] = ti.min(TEX_SLOTS - 1);
-                            k[49] = u32::from(r.material.alpha_clip) | u32::from(srgb) << 1;
-                            // Layer entries (each checked < 256 by the table) and flags.
-                            let has_layers = r.material.layers.iter().any(|s| *s != 0);
-                            let debug = self.layers_debug && !has_layers && LAYER_DEBUG_STAGES.contains(&r.stage);
-                            if self.layers != 0 && (has_layers || debug) {
-                                k[50] = r.material.layers.iter().enumerate().map(|(j, s)| textures::layer_entry(self.tex.lookup(*s).0) << (8 * j)).fold(0, |a, b| a | b);
-                                k[51] = 1 | (self.layers & 3) << 1 | u32::from(debug) << 3;
-                                st.layered += usize::from(!wire);
-                            }
-                            // The sample mask: lanes kept in bits 4-7, bit 8 on.
-                            if self.stipple && r.material.stipple != 0 {
-                                k[51] |= 0x100 | u32::from(r.material.stipple & 0xF) << 4;
-                                st.stippled += usize::from(!wire);
-                            }
-                            if !wire {
-                                self.tex.count_draw(r.material.albedo_desc);
-                            }
-                            k[32] = vb_bytes;
-                            k[33] = pf;
-                            k[34] = pb;
-                            k[35] = u32::from(wire) | u32::from(r.ped) << 1 | u32::from(self.id_mode) << 2 | (self.skin_rules & 0xFF) << 8 | if lit_done || wire { 0 } else { ourlight::DEFERRED };
-                            // The draw's index in the list + 1 (ID mode).
-                            k[57] = ((*r as *const DrawRecord as usize).wrapping_sub(list.draws.as_ptr() as usize) / std::mem::size_of::<DrawRecord>()) as u32 + 1;
-                            // The remap's dword index in t1 (relative to the draw's palette floats).
-                            k[56] = match list.palettes.get(r.palette as usize) {
-                                Some(_) if r.remap != NO_REMAP && pb > 0 => 4 * first[r.palette as usize] + r.remap,
-                                _ => u32::MAX,
-                            };
-                            st.remapped += usize::from(k[56] != u32::MAX && !wire);
-                            k[36] = pal_bytes;
-                            // Instances: clamped to what this frame's buffer holds.
-                            let first = r.inst_first.min(inst_total);
-                            let count = r.inst_count.min(inst_total - first).min(MAX_INSTANCES);
-                            k[37] = first;
-                            k[38] = count;
-                            k[39] = inst_bytes;
-                            // A device-culled row reads the cull's output: its reserved run, the survivors drawn indirectly.
-                            let cull_slot = culled.as_ref().and_then(|c| c.slot_of(k[57].wrapping_sub(1)));
-                            if let (Some(c), Some(_)) = (&culled, cull_slot) {
-                                k[37] = r.inst_first;
-                                k[38] = r.inst_count.min(MAX_INSTANCES);
-                                k[39] = c.out_bytes.min(u64::from(u32::MAX)) as u32;
-                            }
-                            if cull_slot.is_some() != inst_cull_bound {
-                                inst_cull_bound = cull_slot.is_some();
-                                l.SetGraphicsRootDescriptorTable(3, match (&culled, inst_cull_bound) {
-                                    (Some(c), true) => self.gpu_slot(c.view_slot),
-                                    _ => self.gpu_slot(2 + turn as u32),
-                                });
-                            }
-                            indirect = cull_slot;
-                            if let Some(s) = list.sun {
-                                for (j, v) in s.iter().enumerate() {
-                                    k[40 + j] = v.to_bits();
-                                }
-                            }
-                            instances = count.max(1);
-                            st.instanced += usize::from((count > 0 || indirect.is_some()) && !wire);
-                            st.instances += u64::from(count) * u64::from(!wire && indirect.is_none());
-                            if let Some(s) = list.sky.filter(|_| self.sky) {
-                                for (j, v) in s.fog.iter().enumerate() {
-                                    k[52 + j] = v.to_bits();
-                                }
-                            }
-                            // A pre-skinned draw reads its copy: positions already skinned, no palette.
-                            let slot = match pre.get(&k[57].wrapping_sub(1)) {
-                                Some(&(s, bytes)) => {
-                                    (k[32], k[34], k[56]) = (bytes, 0, u32::MAX);
-                                    s
-                                }
-                                None => slot,
-                            };
-                            l.SetGraphicsRoot32BitConstants(0, 58, k.as_ptr().cast(), 0);
-                            l.SetGraphicsRootDescriptorTable(1, self.gpu_slot(slot));
-                        }
-                        None => {
-                            if raw_bound != Some(false) {
-                                l.SetGraphicsRootSignature(&self.root);
-                                l.SetPipelineState(&self.pso);
-                                raw_bound = Some(false);
-                            }
-                            l.SetGraphicsRoot32BitConstants(0, 32, c.as_ptr().cast(), 0);
-                            l.IASetVertexBuffers(0, Some(&[vbv]));
-                        }
-                    }
-                    match (indirect.take(), &culled) {
-                        (Some(slot), Some(c)) => l.ExecuteIndirect(&c.signature, 1, &c.args, u64::from(slot) * u64::from(gpucull::ARG_BYTES), None, 0),
-                        _ => l.DrawIndexedInstanced(indices, instances, 0, 0, 0),
-                    }
-                    if !wire {
-                        st.draws += 1;
-                        st.triangles += u64::from(indices / 3);
-                    }
+                let tl = std::time::Instant::now();
+                let fr = precord::Frame { list, cam: &cam, culled: culled.as_ref(), pre: &pre, device_rows: &device_rows, first: &first, pal_bytes, inst_bytes, inst_total, turn, tex_table, light_va, clip_to_world: &clip_to_world, ms_rows };
+                let resolved = self.resolve(&fr, &draws, wire, &mut walk, &mut st, &mut new_psos);
+                st.resolve_ms += tl.elapsed().as_secs_f64() * 1e3;
+                lap.mark(recprof::RESOLVE);
+                let bps = recprof::get(recprof::BRIDGEPS);
+                self.record_resolved(l, &resolved, &fr, &mut walk, &mut st, frame)?;
+                lap.mark_less(recprof::RECORD, recprof::get(recprof::BRIDGEPS) - bps);
+                let bps = recprof::get(recprof::BRIDGEPS);
+                if !wire && !walk.lit_done {
+                    self.lit_after_bridged(l, list, frame, &mut walk, &mut st, light_va, &clip_to_world)?;
                 }
-                if !wire && !lit_done {
-                    self.record_ourlight(l, light_va, rts);
-                    lit_done = true;
-                }
-                if !water_done {
+                if !resolved.water_done {
                     st.water = self.record_water(list, &cam).map_err(at("water grid upload".into()))?;
                 }
+                lap.mark_less(recprof::LIT, recprof::get(recprof::BRIDGEPS) - bps);
+                st.loop_ms += tl.elapsed().as_secs_f64() * 1e3;
             }
+            let bridged_done = walk.bridged_done;
+            (chunk_wait, sub_k) = (walk.chunk_wait, walk.sub_k);
+            // The tail's own: bridgeps (unless `ourlight=metal` drew them) and chunk waits are not.
+            let (bps, cw_tail) = (recprof::get(recprof::BRIDGEPS), chunk_wait);
             if list.imposters.is_some() && self.imposters.opts.show {
                 self.imposters.record(l, list, &cam);
             }
-            // The title's own pixel programs on the bridged rows, over ours.
-            if self.bridge_on
-                && let Some(f) = list.bridged.as_deref()
-            {
-                if self.chunk > 0 && !f.rows.is_empty() {
-                    // `chunk`: our draws so far sent first, then the title's
-                    // rows N to a submission, each waited for before the next is
-                    // recorded (each record is a frame of the bridge's own: its
-                    // heap and records are rewritten only after the last one ran).
-                    let mut all = bridged::Stats::default();
-                    for (n, part) in f.rows.chunks(self.chunk as usize).enumerate() {
-                        self.stamp_close(l, sub_k);
-                        l.Close().map_err(at(format!("bridgeps chunk list Close before {} rows", n * self.chunk as usize)))?;
-                        let (w, g) = self.send_wait(l, sub_k, if n == 0 { "pass chunk" } else { "bridgeps chunk" }, frame)?;
-                        (chunk_wait, st.submits, sub_k) = (chunk_wait + w, st.submits + 1, sub_k + 1);
-                        (st.submit_wait_ms, st.submit_gpu_ms) = (st.submit_wait_ms.max(w), st.submit_gpu_ms.max(g.unwrap_or(0.0)));
-                        self.alloc.Reset().map_err(at("bridgeps chunk allocator Reset".into()))?;
-                        self.list.Reset(&self.alloc, &self.pso).map_err(at("bridgeps chunk list Reset".into()))?;
-                        self.stamp_open(l, sub_k);
-                        let (rtv, dsv) = (self.rtv.GetCPUDescriptorHandleForHeapStart(), self.dsv.GetCPUDescriptorHandleForHeapStart());
-                        l.OMSetRenderTargets(1, Some(&rtv), true, Some(&dsv));
-                        l.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: self.width as f32, Height: self.height as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
-                        l.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: self.width as i32, bottom: self.height as i32 }]);
-                        let sub = bridged::Frame::new(part.to_vec());
-                        all.add(&self.record_bridged(l, &sub).map_err(|x| format!("frame {frame}: bridgeps rows {}..: {x}", n * self.chunk as usize))?);
-                    }
-                    self.bridge_stats = all;
-                } else {
-                    if split_on() && !f.rows.is_empty() {
-                        // Our draws go to the card before the title's rows
-                        // are recorded (not waited for: the card draws them while
-                        // the CPU records the rows; the frame's last fence covers both).
-                        self.stamp_close(l, sub_k);
-                        l.Close().map_err(at("list Close before the bridged rows".into()))?;
-                        self.send(l, frame)?;
-                        (st.submits, sub_k) = (st.submits + 1, sub_k + 1);
-                        self.alloc_split.Reset().map_err(at("bridgeps allocator Reset".into()))?;
-                        self.list.Reset(&self.alloc_split, &self.pso).map_err(at("bridgeps list Reset".into()))?;
-                        self.stamp_open(l, sub_k);
-                        let (rtv, dsv) = (self.rtv.GetCPUDescriptorHandleForHeapStart(), self.dsv.GetCPUDescriptorHandleForHeapStart());
-                        l.OMSetRenderTargets(1, Some(&rtv), true, Some(&dsv));
-                        l.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: self.width as f32, Height: self.height as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
-                        l.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: self.width as i32, bottom: self.height as i32 }]);
-                    }
-                    self.bridge_stats = self.record_bridged(l, f).map_err(|x| format!("frame {frame}: bridgeps: {x}"))?;
-                }
+            // The title's own pixel programs on the bridged rows, over ours (`ourlight=metal`: done before its pass).
+            if !bridged_done {
+                self.record_bridgeps(l, list, frame, &mut st, &mut sub_k, &mut chunk_wait)?;
             }
-            // HAIR6: the title's strand pixels over ours, under our depth.
-            if let Some(px) = list.hair.as_deref().filter(|p| !p.is_empty()) {
+            // HAIR6: the title's strand pixels over ours, under our depth (HAIR7: or its depth on the device).
+            let strand_depth = list.hair_depth.as_ref().filter(|d| (d.width, d.height) == (self.width, self.height));
+            if let Some(px) = list.hair.as_deref().map(|p| &p[..]).filter(|p| !p.is_empty()).or(strand_depth.map(|_| &[][..])) {
                 if self.hair.is_none() {
                     match hair::HairPass::new(&self.device) {
                         Ok(h) => self.hair = Some(h),
@@ -2992,12 +3354,42 @@ impl Pass {
                     l.OMSetRenderTargets(1, Some(&rtv), true, Some(&dsv));
                     l.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: self.width as f32, Height: self.height as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
                     l.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: self.width as i32, bottom: self.height as i32 }]);
-                    h.record(&self.device, l, px, (self.width, self.height)).map_err(|x| format!("frame {frame}: hair: {x}"))?;
+                    match strand_depth {
+                        Some(d) => h.record_depth(l, d),
+                        None => h.record(&self.device, l, px, (self.width, self.height)).map_err(|x| format!("frame {frame}: hair: {x}"))?,
+                    }
                     st.hair = h.drawn;
                 }
             }
+            // HAIR10: our guide ribbons, under our depth, with our camera.
+            if let Some(r) = list.hair_ribbons.as_deref().filter(|r| r.points.len() > 1) {
+                if self.hair.is_none() {
+                    match hair::HairPass::new(&self.device) {
+                        Ok(h) => self.hair = Some(h),
+                        Err(x) => xnw_core::warn!("world render: hair pass: {x}"),
+                    }
+                }
+                if let Some(h) = self.hair.as_mut() {
+                    let (rtv, dsv) = (self.rtv.GetCPUDescriptorHandleForHeapStart(), self.dsv.GetCPUDescriptorHandleForHeapStart());
+                    l.OMSetRenderTargets(1, Some(&rtv), true, Some(&dsv));
+                    l.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: self.width as f32, Height: self.height as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
+                    l.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: self.width as i32, bottom: self.height as i32 }]);
+                    // HAIR10b: only the groups whose ped this pass draws (no hair in the air over a ped left out):
+                    // its rows passed the ped filters and their geometry is on the device this frame (a row
+                    // still waiting for its upload draws nothing: pk8a f1027, the burst's first frame).
+                    let ped_at: Vec<[f32; 3]> = ped_rows.iter().filter(|(g, _)| self.cache.contains(g)).map(|(_, o)| *o).collect();
+                    let mut kept = std::mem::take(&mut h.kept);
+                    let (k, d, near) = hair::ribbons_near(r, &ped_at, hair::ribbon_reach(), &mut kept);
+                    if std::env::var("XNW_HAIR_RIBBON_LOG").is_ok_and(|v| v == "on") {
+                        xnw_core::info!("world render: frame {frame}: hair ribbons in the pass: {k} groups kept, {d} dropped (no drawn ped row within {:.2} m; {} of {} ped rows with geometry); nearest row per group {:.2?}", hair::ribbon_reach(), ped_at.len(), ped_rows.len(), near);
+                    }
+                    h.record_ribbons(&self.device, l, &kept, &cam.view_proj_relative()).map_err(|x| format!("frame {frame}: hair ribbons: {x}"))?;
+                    h.kept = kept;
+                    st.hair_ribbons = h.ribbons;
+                }
+            }
             // UI1: the title's UI layer over everything, with the plane blend.
-            if let Some(layer) = list.ui.as_deref().filter(|u| (u.0, u.1) == (self.width, self.height)) {
+            if let Some(layer) = list.ui.as_deref().filter(|u| u.size() == (self.width, self.height)) {
                 if self.ui.is_none() {
                     match ui::UiPass::new(&self.device) {
                         Ok(u) => self.ui = Some(u),
@@ -3009,16 +3401,27 @@ impl Pass {
                     l.OMSetRenderTargets(1, Some(&rtv), true, Some(&dsv));
                     l.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: self.width as f32, Height: self.height as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
                     l.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: self.width as i32, bottom: self.height as i32 }]);
-                    u.record(&self.device, l, &layer.2, (self.width, self.height)).map_err(|x| format!("frame {frame}: ui: {x}"))?;
+                    u.record_layer(&self.device, l, layer).map_err(|x| format!("frame {frame}: ui: {x}"))?;
                     st.ui = true;
                 }
             }
             // A frame complete enough becomes the shown picture.
             if self.cuts.hold && !st.held {
+                // [`lag_on`]: into the second picture, shown once this frame's fence is reached.
+                let lagged = lag && self.chunk == 0 && self.shown_back.is_some();
+                let to = if lagged { self.shown_back.clone().expect("checked") } else { self.shown.clone() };
+                self.shown_flip = lagged;
+                // FLK2: the note goes with the copy (and flips with the second picture).
+                let note = xnw_core::live::Shown { world: frame, rows: st.draws as u32, bridged: st.bridged as u32, ..self.note_next };
+                if lagged {
+                    self.note_back = note;
+                } else {
+                    self.note_shown = note;
+                }
                 transition(l, &self.colour, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
-                transition(l, &self.shown, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
-                l.CopyResource(&self.shown, &self.colour);
-                transition(l, &self.shown, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                transition(l, &to, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
+                l.CopyResource(&to, &self.colour);
+                transition(l, &to, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
                 transition(l, &self.colour, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
             }
             if readback {
@@ -3043,8 +3446,30 @@ impl Pass {
                 self.terrain.opts.on
             )))?;
             st.record_ms = t0.elapsed().as_secs_f64() * 1e3 - chunk_wait;
+            lap.mark_less(recprof::TAIL, recprof::get(recprof::BRIDGEPS) - bps + (chunk_wait - cw_tail));
+            lap.flush();
+            if let Some(line) = recprof::frame_end(frame, st.record_ms) {
+                xnw_core::info!("{line}");
+            }
+            if lag && self.chunk == 0 && self.shown_back.is_some() {
+                // Sent; the next frame (or a readback) waits for it.
+                let sent = self.send_only(l, "pass", frame)?;
+                // The watchdog times the card to this fence, not to the next frame's wait.
+                xnw_gpu::gpuwatch::fence(&self.fence, self.fence_value);
+                st.submits += 1;
+                self.lag = Some(Lag { value: self.fence_value, sent, k: sub_k, frame, _keep: std::mem::take(&mut self.bridge_keep), _copies: std::mem::take(&mut self.copies), _world: in_flight });
+                st.gpu_ms = st.lag_wait_ms + chunk_wait;
+                st.new_psos += new_psos;
+                self.cuts.parts([st.upload_ms, st.tex_ms, (st.record_ms - st.upload_ms - st.tex_ms).max(0.0), st.gpu_ms]);
+                self.cuts.end(t0.elapsed().as_secs_f64() * 1e3, cuts::now_ms());
+                return Ok(st);
+            }
             let (w, g) = self.send_wait(l, sub_k, "pass", frame)?;
             st.submits += 1;
+            // `precord`: our list's allocators after a parallel run ended with this submission.
+            for i in self.prec_cont.drain(..) {
+                self.prec_pool[i].2 = self.fence_value;
+            }
             (st.submit_wait_ms, st.submit_gpu_ms) = (st.submit_wait_ms.max(w), st.submit_gpu_ms.max(g.unwrap_or(0.0)));
             // The copies ran: the staging space is free again (and a large
             // one made for a big offline frame goes).
@@ -3056,6 +3481,7 @@ impl Pass {
             self.tex.finished();
             self.terrain.finished();
             st.gpu_ms = w + chunk_wait;
+            drop(in_flight);
         }
         st.new_psos += new_psos;
         self.cuts.parts([st.upload_ms, st.tex_ms, (st.record_ms - st.upload_ms - st.tex_ms).max(0.0), st.gpu_ms]);
@@ -3063,13 +3489,143 @@ impl Pass {
         Ok(st)
     }
 
+    /// FLK1: the bridged rows' viewport shift (the title's TAA jitter
+    /// taken out), the list rows left out (sorted; `bridgecam=1`), and
+    /// with `bridgecam=2` a copy of the frame with their cameras set.
+    fn bridge_aim(&self, list: &FrameList, f: &bridged::Frame) -> (Option<bridged::Frame>, [f32; 2], Vec<u32>) {
+        // FLK1: the title's programs project with its TAA jitter; ours do not.
+        let shift = list.main_camera().map_or([0.0; 2], |c| unjitter_px(&c.proj, self.width, self.height));
+        // FLK1: rows whose view constants are not the camera our depth was laid with.
+        let (mode, mut skip, mut fix) = (bridge_cam(), Vec::new(), Vec::new());
+        if let Some(c) = list.main_camera() {
+            use std::sync::atomic::Ordering::Relaxed;
+            let (mut dv, mut dp) = (0f32, 0f32);
+            for (i, (k, o)) in f.rows.iter().enumerate() {
+                let Some(d) = bridge_cam_delta(o, c) else { continue };
+                (dv, dp) = (dv.max(d.0), dp.max(d.1));
+                if d.0 > CAM_OFF.0 || d.1 > CAM_OFF.1 {
+                    skip.push(*k);
+                }
+                if mode == 2 && (d.0 > CAM_SAME.0 || d.1 > CAM_SAME.1) {
+                    fix.push(i);
+                }
+            }
+            CAM_SEEN[0].fetch_add(f.rows.len() as u32, Relaxed);
+            CAM_SEEN[1].fetch_add(skip.len() as u32, Relaxed);
+            CAM_SEEN[2].fetch_add(u32::from(!skip.is_empty()), Relaxed);
+            CAM_SEEN[3].fetch_add(fix.len() as u32, Relaxed);
+            CAM_SEEN[4].fetch_max(dv.to_bits(), Relaxed);
+            CAM_SEEN[5].fetch_max(dp.to_bits(), Relaxed);
+        }
+        skip.sort_unstable();
+        if mode != 1 {
+            skip.clear();
+        }
+        let fixed = list.main_camera().filter(|_| !fix.is_empty()).map(|c| {
+            let mut g = bridged::Frame::new(f.rows.clone());
+            (g.not_ready, g.unread) = (f.not_ready, f.unread);
+            for &i in &fix {
+                bridge_cam_set(&mut g.rows[i].1, c);
+            }
+            g
+        });
+        (fixed, shift, skip)
+    }
+
+    /// The title's own pixel programs on the frame's bridged rows (`bridgeps`)
+    /// on the open list `l` (with `chunk`: our draws so far sent first, then N
+    /// rows a submission); `ourlight=metal` calls it before its pass.
+    fn record_bridgeps(&mut self, l: &ID3D12GraphicsCommandList, list: &FrameList, frame: u64, st: &mut PassStats, sub_k: &mut u32, chunk_wait: &mut f64) -> std::result::Result<(), String> {
+        let at = |what: String| move |e: windows::core::Error| format!("frame {frame}: {what}: {e}");
+        let tprof = recprof::on().then(|| (std::time::Instant::now(), *chunk_wait));
+        // SAFETY: our open list and objects; every pointer passed outlives its call.
+        // PERF3 `bridgepar`: the rows prepared on their thread since the frame's start.
+        let mut prep = self.bridge_prep.take();
+        unsafe {
+            if self.bridge_on
+                && let Some(f) = list.bridged.as_deref()
+            {
+                let (fixed, shift, skip) = if prep.is_some() { (None, [0.0; 2], Vec::new()) } else { self.bridge_aim(list, f) };
+                let f = fixed.as_ref().unwrap_or(f);
+                // `preskinbind=on`: rows reading the title's pre-skin output read ours (not prepared off-thread).
+                let bound = if prep.is_none() { self.preskin_bind_rows(list, f) } else { None };
+                let f = bound.as_ref().unwrap_or(f);
+                let aim = (shift, bridge_bias(), &skip[..]);
+                if self.chunk > 0 && !f.rows.is_empty() {
+                    if let Some(p) = prep.take() {
+                        self.bridge_prep_drop(p);
+                    }
+                    // `chunk`: our draws so far sent first, then the title's
+                    // rows N to a submission, each waited for before the next is
+                    // recorded (each record is a frame of the bridge's own: its
+                    // heap and records are rewritten only after the last one ran).
+                    let mut all = bridged::Stats::default();
+                    for (n, part) in f.rows.chunks(self.chunk as usize).enumerate() {
+                        self.stamp_close(l, *sub_k);
+                        l.Close().map_err(at(format!("bridgeps chunk list Close before {} rows", n * self.chunk as usize)))?;
+                        let (w, g) = self.send_wait(l, *sub_k, if n == 0 { "pass chunk" } else { "bridgeps chunk" }, frame)?;
+                        (*chunk_wait, st.submits, *sub_k) = (*chunk_wait + w, st.submits + 1, *sub_k + 1);
+                        (st.submit_wait_ms, st.submit_gpu_ms) = (st.submit_wait_ms.max(w), st.submit_gpu_ms.max(g.unwrap_or(0.0)));
+                        self.alloc.Reset().map_err(at("bridgeps chunk allocator Reset".into()))?;
+                        self.list.Reset(&self.alloc, &self.pso).map_err(at("bridgeps chunk list Reset".into()))?;
+                        self.stamp_open(l, *sub_k);
+                        let (rtv, dsv) = (self.rtv.GetCPUDescriptorHandleForHeapStart(), self.dsv.GetCPUDescriptorHandleForHeapStart());
+                        l.OMSetRenderTargets(1, Some(&rtv), true, Some(&dsv));
+                        l.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: self.width as f32, Height: self.height as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
+                        l.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: self.width as i32, bottom: self.height as i32 }]);
+                        let sub = bridged::Frame::new(part.to_vec());
+                        all.add(&self.record_bridged(l, &sub, aim).map_err(|x| format!("frame {frame}: bridgeps rows {}..: {x}", n * self.chunk as usize))?);
+                    }
+                    self.bridge_stats = all;
+                } else {
+                    if split_on() && !f.rows.is_empty() {
+                        // Our draws go to the card before the title's rows
+                        // are recorded (not waited for: the card draws them while
+                        // the CPU records the rows; the frame's last fence covers both).
+                        self.stamp_close(l, *sub_k);
+                        l.Close().map_err(at("list Close before the bridged rows".into()))?;
+                        self.send(l, frame)?;
+                        (st.submits, *sub_k) = (st.submits + 1, *sub_k + 1);
+                        self.alloc_split.Reset().map_err(at("bridgeps allocator Reset".into()))?;
+                        self.list.Reset(&self.alloc_split, &self.pso).map_err(at("bridgeps list Reset".into()))?;
+                        self.stamp_open(l, *sub_k);
+                        let (rtv, dsv) = (self.rtv.GetCPUDescriptorHandleForHeapStart(), self.dsv.GetCPUDescriptorHandleForHeapStart());
+                        l.OMSetRenderTargets(1, Some(&rtv), true, Some(&dsv));
+                        l.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: self.width as f32, Height: self.height as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
+                        l.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: self.width as i32, bottom: self.height as i32 }]);
+                    }
+                    self.bridge_stats = match prep.take() {
+                        Some(p) => self.bridge_prep_finish(p, l),
+                        None => self.record_bridged(l, f, aim),
+                    }
+                    // CLOTH3: a record that fails on a removed device logs the removal data (DRED: the last bridged row's marker).
+                    .map_err(|x| match xnw_gpu::d3d12x::host::removal_report(&self.device) {
+                        Some(r) => format!("frame {frame}: bridgeps: {x}; {r}"),
+                        None => format!("frame {frame}: bridgeps: {x}"),
+                    })?;
+                }
+            }
+        }
+        if let Some(p) = prep {
+            self.bridge_prep_drop(p);
+        }
+        if let Some((t, cw)) = tprof {
+            recprof::add(recprof::BRIDGEPS, t.elapsed().as_secs_f64() * 1e3 - (*chunk_wait - cw));
+        }
+        Ok(())
+    }
+
     /// `ourlight=on`: its pass on the open list, then the frame's `rts`
     /// targets and the depth bound again (the caller binds its root again).
-    fn record_ourlight(&self, l: &ID3D12GraphicsCommandList, light_va: u64, rts: u32) {
+    fn record_ourlight(&self, l: &ID3D12GraphicsCommandList, light_va: u64, rts: u32, clip_to_world: &Mat) {
         if let (Some(lit), Some(g)) = (&self.ourlight, &self.gbuf) {
             // SAFETY: our heaps; an open list.
             let (rtv, dsv) = unsafe { (self.rtv.GetCPUDescriptorHandleForHeapStart(), self.dsv.GetCPUDescriptorHandleForHeapStart()) };
-            lit.record(l, &self.colour, &g.normal, rtv, light_va, self.gpu_slot(lit.slot));
+            // `sunshadow`: the screen term first (our depth as the opaque rows left it).
+            if let Some(s) = &self.sunshadow {
+                s.record_term(l, &self._depth, self.gpu_slot(s.slot));
+            }
+            lit.record(l, &self.colour, &g.normal, rtv, light_va, self.gpu_slot(lit.slot), clip_to_world, &self._depth, self.post_k.as_ref().map(|k| (k, self.gpu_slot(lit.post_slot()))));
             // SAFETY: as above.
             unsafe { l.OMSetRenderTargets(rts, Some(&rtv), true, Some(&dsv)) };
         }
@@ -3125,15 +3681,123 @@ impl Pass {
     }
 
     fn send_wait(&mut self, l: &ID3D12GraphicsCommandList, k: u32, label: &'static str, frame: u64) -> std::result::Result<(f64, Option<f64>), String> {
+        let sent = self.send_only(l, label, frame)?;
+        self.wait_sent(self.fence_value, sent, k, label, frame)
+    }
+
+    /// Sends the closed list `l` under the GPU watchdog and signals the
+    /// next fence value (`fence_value`); when it was sent.
+    fn send_only(&mut self, l: &ID3D12GraphicsCommandList, label: &'static str, frame: u64) -> std::result::Result<std::time::Instant, String> {
         let at = |what: &'static str| move |e: windows::core::Error| format!("frame {frame}: {label}: {what}: {e}");
-        // SAFETY: our queue, fence and a closed list of ours; the event is closed here.
-        let wait = unsafe {
+        // SAFETY: our queue, fence and a closed list of ours.
+        unsafe {
             self.queue.ExecuteCommandLists(&[Some(l.cast().map_err(at("list cast"))?)]);
             let sent = xnw_gpu::gpuwatch::begin(label);
             self.fence_value += 1;
             self.queue.Signal(&self.fence, self.fence_value).map_err(at("queue Signal"))?;
+            Ok(sent)
+        }
+    }
+
+    /// LIVE1 front end: a frame without a world list (logos, legal cards,
+    /// menus: no geometry draw reached the hook) shows the title's UI layer
+    /// `rgba` (the pass's size) over black, composed by [`ui::UiPass`] as
+    /// the world frames compose it, and becomes the shown picture.
+    pub fn ui_frame(&mut self, frame: u64, layer: &ui::UiLayer) -> std::result::Result<(), String> {
+        let at = |what: &'static str| move |e: windows::core::Error| format!("frame {frame}: ui frame: {what}: {e}");
+        self.retire()?;
+        layer.wait_on(&self.queue)?;
+        if self.ui.is_none() {
+            self.ui = Some(ui::UiPass::new(&self.device)?);
+        }
+        // SAFETY: recording on our own list and objects; the last frame's work
+        // ended (each frame waits for its fence, or `retire` above did).
+        unsafe {
+            self.alloc.Reset().map_err(at("allocator Reset"))?;
+            self.list.Reset(&self.alloc, &self.pso).map_err(at("list Reset"))?;
+            let list_com = self.list.clone();
+            let l = &list_com;
+            let rtv = self.rtv.GetCPUDescriptorHandleForHeapStart();
+            l.ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 1.0], None);
+            l.OMSetRenderTargets(1, Some(&rtv), true, None);
+            l.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: self.width as f32, Height: self.height as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
+            l.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: self.width as i32, bottom: self.height as i32 }]);
+            if let Some(u) = self.ui.as_mut() {
+                u.record_layer(&self.device, l, layer).map_err(|x| format!("frame {frame}: ui frame: {x}"))?;
+            }
+            transition(l, &self.colour, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            transition(l, &self.shown, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
+            l.CopyResource(&self.shown, &self.colour);
+            transition(l, &self.shown, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            transition(l, &self.colour, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            l.Close().map_err(at("list Close"))?;
+            self.send_wait(l, 0, "ui frame", frame)?;
+        }
+        Ok(())
+    }
+
+    /// [`lag_on`]: the frame in flight waited for, then what it held
+    /// let go (as after [`Pass::send_wait`] at a frame's end); the ms waited.
+    pub fn retire(&mut self) -> std::result::Result<f64, String> {
+        let Some(lag) = self.lag.take() else { return Ok(0.0) };
+        let t = std::time::Instant::now();
+        let r = self.wait_sent(lag.value, lag.sent, lag.k, "pass", lag.frame);
+        drop(lag);
+        if self.shown_flip
+            && let Some(b) = self.shown_back.as_mut()
+        {
+            std::mem::swap(&mut self.shown, b);
+            self.shown_flip = false;
+            self.note_shown = self.note_back;
+        }
+        self.bridge_keep.clear();
+        if self.staging.as_ref().is_some_and(|s| s.2 > 256 << 20) {
+            self.staging = None;
+        }
+        self.tex.finished();
+        self.terrain.finished();
+        r.map(|_| t.elapsed().as_secs_f64() * 1e3)
+    }
+
+    /// [`lag_on`]: [`Pass::retire`] when the frame in flight has
+    /// reached its fence already (no wait): a present without a new list.
+    pub fn retire_if_done(&mut self) -> std::result::Result<(), String> {
+        // SAFETY: a plain query on our fence.
+        if self.lag.as_ref().is_some_and(|l| unsafe { self.fence.GetCompletedValue() } >= l.value) {
+            self.retire()?;
+        }
+        Ok(())
+    }
+
+    /// Waits for fence `value` (sent at `sent`; given up as the watchdog
+    /// gives a submission up), not counted as a submission's wait.
+    fn wait_value(&self, value: u64, sent: std::time::Instant, frame: u64) -> std::result::Result<(), String> {
+        // SAFETY: our fence; the event is closed here.
+        unsafe {
+            if self.fence.GetCompletedValue() >= value {
+                return Ok(());
+            }
+            let event: HANDLE = CreateEventW(None, false, false, None).map_err(|e| format!("frame {frame}: CreateEvent: {e}"))?;
+            self.fence.SetEventOnCompletion(value, event).map_err(|e| format!("frame {frame}: SetEventOnCompletion: {e}"))?;
+            while WaitForSingleObject(event, 1000) == WAIT_TIMEOUT {
+                if xnw_gpu::gpuwatch::overdue("pass", sent) {
+                    let _ = CloseHandle(event);
+                    return Err(format!("frame {frame}: the frame in flight was given up"));
+                }
+            }
+            let _ = CloseHandle(event);
+        }
+        Ok(())
+    }
+
+    /// Waits for fence `value` (sent at `sent`) under the GPU watchdog; its
+    /// fence wait and submission `k`'s timestamped GPU ms.
+    fn wait_sent(&self, value: u64, sent: std::time::Instant, k: u32, label: &'static str, frame: u64) -> std::result::Result<(f64, Option<f64>), String> {
+        let at = |what: &'static str| move |e: windows::core::Error| format!("frame {frame}: {label}: {what}: {e}");
+        // SAFETY: our fence; the event is closed here.
+        let wait = unsafe {
             let event: HANDLE = CreateEventW(None, false, false, None).map_err(at("CreateEvent"))?;
-            self.fence.SetEventOnCompletion(self.fence_value, event).map_err(at("SetEventOnCompletion"))?;
+            self.fence.SetEventOnCompletion(value, event).map_err(at("SetEventOnCompletion"))?;
             // In turns of a second, so a submission that never ends is given up.
             while WaitForSingleObject(event, 1000) == WAIT_TIMEOUT {
                 if xnw_gpu::gpuwatch::overdue(label, sent) {
@@ -3168,30 +3832,16 @@ impl Pass {
         Some(t[1].saturating_sub(t[0]) as f64 * 1e3 / f.max(1) as f64)
     }
 
-    /// Records the frame's water (uploading its grid when it changed):
-    /// whether it was drawn.
-    /// [`bridged::record`] on our open list `l`, into our colour and depth;
-    /// the grey stand-in made on first use.
-    fn record_bridged(&mut self, l: &ID3D12GraphicsCommandList, f: &bridged::Frame) -> std::result::Result<bridged::Stats, String> {
+    /// The bridged rows' words buffer for a frame whose words end at
+    /// `words_end`: grown to it (at most 256 MiB; the old one to the
+    /// frame's fence), kept; mapped.
+    pub(crate) fn bridge_words_for(&mut self, words_end: u64) -> std::result::Result<(ID3D12Resource, *mut u8, u64), String> {
         let e = |x: windows::core::Error| x.message().to_string();
-        // SAFETY: our device and open list; the upload goes to the fence with `bridge_keep`.
+        // SAFETY: our device; the old buffer goes to the fence with `bridge_keep`.
         unsafe {
-            // The grey stand-ins, once: one 2D texel, and the other shapes
-            // a title view can have (six slices for cube views, 3D, 1D).
-            if self.bridge_grey.is_none() {
-                let mut made = Vec::new();
-                for dim in [bridged::DIM_2D, 9, 8, 2] {
-                    let (t, up) = bridged::grey_texture(&self.device, l, dim)?;
-                    self.bridge_keep.push(windows::core::Interface::cast(&up).map_err(e)?);
-                    made.push(t);
-                }
-                let mut made = made.into_iter();
-                self.bridge_grey = made.next();
-                self.bridge_grey_shapes = made.collect();
-            }
             // The words buffer: grown to the frame's largest offset (at most
             // 256 MiB), kept; each frame writes only its rows' words.
-            let want = f.words_end.next_multiple_of(1 << 20).min(256 << 20);
+            let want = words_end.next_multiple_of(1 << 20).min(256 << 20);
             if self.bridge_words.as_ref().is_none_or(|w| w.2 < want) {
                 if let Some((old, _, _)) = self.bridge_words.take() {
                     old.Unmap(0, None);
@@ -3205,14 +3855,41 @@ impl Pass {
                 r.Map(0, None, Some(&mut at)).map_err(e)?;
                 self.bridge_words = Some((r, at.cast::<u8>(), want.max(1 << 20)));
             }
-            let (words, wp, wlen) = self.bridge_words.clone().ok_or("no words buffer")?;
+        }
+        self.bridge_words.clone().ok_or_else(|| "no words buffer".into())
+    }
+
+    /// Records the frame's water (uploading its grid when it changed):
+    /// whether it was drawn.
+    /// [`bridged::record`] on our open list `l`, into our colour and depth;
+    /// the grey stand-in made on first use.
+    fn record_bridged(&mut self, l: &ID3D12GraphicsCommandList, f: &bridged::Frame, (shift, bias, skip): ([f32; 2], f32, &[u32])) -> std::result::Result<bridged::Stats, String> {
+        let e = |x: windows::core::Error| x.message().to_string();
+        // SAFETY: our device and open list; the upload goes to the fence with `bridge_keep`.
+        unsafe {
+            // The grey stand-ins, once: one 2D texel, and the other shapes
+            // a title view can have (six slices for cube views, 3D, 1D);
+            // then the zero ones, 2D and 3D (`bridged::ZERO`).
+            if self.bridge_grey.is_none() {
+                let mut made = Vec::new();
+                for dim in [bridged::DIM_2D, 9, 8, 2, bridged::DIM_2D | bridged::ZERO, 8 | bridged::ZERO] {
+                    let (t, up) = bridged::grey_texture(&self.device, l, dim)?;
+                    self.bridge_keep.push(windows::core::Interface::cast(&up).map_err(e)?);
+                    made.push(t);
+                }
+                let mut made = made.into_iter();
+                self.bridge_grey = made.next();
+                self.bridge_grey_shapes = made.collect();
+            }
+            let (words, wp, wlen) = self.bridge_words_for(f.words_end)?;
             let grey = self.bridge_grey.clone().ok_or("no grey texture")?;
             let shapes = self.bridge_grey_shapes.clone();
-            let [cube, volume, line] = &shapes[..] else { return Err("no grey stand-ins of the other shapes".into()) };
+            let [cube, volume, line, zero, zero3] = &shapes[..] else { return Err("no grey stand-ins of the other shapes".into()) };
             let tex = &self.tex;
             let texture = |h: u64| tex.host_view(h);
             let flat = |h: u64| tex.flat_reason(h) as usize;
-            let t = bridged::Target { rtv: self.rtv.GetCPUDescriptorHandleForHeapStart(), dsv: self.dsv.GetCPUDescriptorHandleForHeapStart(), width: self.width, height: self.height, texture: &texture, flat: &flat, grey: &grey, grey_shapes: [cube, volume, line], words: (&words, wlen, wp) };
+            let pre = self.preskin.target();
+            let t = bridged::Target { rtv: self.rtv.GetCPUDescriptorHandleForHeapStart(), dsv: self.dsv.GetCPUDescriptorHandleForHeapStart(), width: self.width, height: self.height, shift, bias, skip, texture: &texture, flat: &flat, grey: &grey, grey_shapes: [cube, volume, line, zero, zero3], words: (&words, wlen, wp), metal: self.ourlight.as_ref().and_then(|x| x.metal_rtv()), normal: self.ourlight.as_ref().and_then(|x| x.normal_rtv()), emissive: self.ourlight.as_ref().and_then(|x| x.emissive_rtv()), preskin: pre.as_ref().map(|p| (p.0, &p.1[..])) };
             self.bridge_gpu.record(&self.device, l, f, &t, &mut self.bridge_keep)
         }
     }
@@ -3272,6 +3949,20 @@ impl Pass {
         Some(gbuf::read(&self.device, &self.queue, t, &self._depth, self.width, self.height))
     }
 
+    /// `ourlight=metal`: the metal target and (`ournormals=title`) the
+    /// title normal target read back as RGBA8 rows (after a [`Pass::draw`]).
+    pub fn read_lit(&self) -> Option<std::result::Result<(Vec<u8>, Option<Vec<u8>>), String>> {
+        let (metal, normal) = self.ourlight.as_ref()?.targets();
+        let metal = metal?;
+        let rt = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        let mut want = vec![(metal, ourlight::METAL, rt)];
+        want.extend(normal.map(|n| (n, ourlight::TITLE_NORMAL, rt)));
+        Some(gbuf::read_targets(&self.device, &self.queue, &want, self.width, self.height).map(|mut v| {
+            let n = if v.len() > 1 { v.pop() } else { None };
+            (v.pop().unwrap_or_default(), n)
+        }))
+    }
+
     /// The validation layer's stored messages on the pass's device
     /// ([`bridge::layer_messages`]; `XNW_GPU_DEBUG=layer`).
     pub fn layer_messages(&self) -> Vec<String> {
@@ -3279,6 +3970,10 @@ impl Pass {
     }
 
     pub fn read_rgba(&self) -> std::result::Result<Vec<u8>, String> {
+        // [`lag_on`]: the frame's copy is done first.
+        if let Some(l) = &self.lag {
+            self.wait_value(l.value, l.sent, l.frame)?;
+        }
         let n = (self.width * 4 * self.height) as usize;
         let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
         // SAFETY: the readback buffer is `n` bytes; mapped and unmapped here.
@@ -3307,6 +4002,9 @@ pub struct ScreenOptions {
     pub water: bool,
     /// `decalhold=off`: no two-list decal union.
     pub decal_hold: bool,
+    /// `decals=off` (DEC1; default on, the last one wins): no stage-74
+    /// decal rows in the main view (`Pass::decals`), for an A/B of their pixels.
+    pub decals: bool,
     /// `peds=on` draws ped skin draws (skipped by default until
     /// skinning is right: broken humans threw polygons across the picture).
     pub peds: bool,
@@ -3317,7 +4015,7 @@ pub fn parse_screen(v: &str) -> Option<ScreenOptions> {
     if parts.next() != Some("screen") {
         return None;
     }
-    let mut o = ScreenOptions { wire: false, stage: None, skin: true, states: true, sky: true, water: true, peds: false, decal_hold: true };
+    let mut o = ScreenOptions { wire: false, stage: None, skin: true, states: true, sky: true, water: true, peds: false, decal_hold: true, decals: true };
     for p in parts {
         match p {
             "wire" => o.wire = true,
@@ -3327,6 +4025,8 @@ pub fn parse_screen(v: &str) -> Option<ScreenOptions> {
             "water=off" => o.water = false,
             "peds=on" => o.peds = true,
             "decalhold=off" => o.decal_hold = false,
+            "decals=off" => o.decals = false,
+            "decals=on" => o.decals = true,
             _ => o.stage = p.strip_prefix("pass=").and_then(|s| s.parse().ok()).or(o.stage),
         }
     }
@@ -3344,12 +4044,18 @@ pub fn parse_skin_rules(v: &str) -> u32 {
 /// The texture switches of `XNW_WORLD_RENDER=screen,...`: `tex=off`
 /// (flat colours), `tex=<n>` (table entries, at most [`TEX_SLOTS`]),
 /// `texn=<uploads per frame>`, `texmb=<upload MiB per frame>`, `texms=<ms>`
-/// (new reads stop after that much of the frame's table; 0: none); textures on
-/// (live) by default.
+/// (new reads stop after that much of the frame's table; 0: none; only with
+/// `texasync=off`); textures on (live) by default.
 pub fn parse_screen_tex(v: &str) -> TexOptions {
-    // Texture reads off the frame only with `texasync=on` (test runs had
-    // black regions and missing crowns with it on, and none before it).
-    let mut o = TexOptions { mode: TexMode::Live, async_reads: v.split(',').any(|p| p.trim() == "texasync=on"), ..Default::default() };
+    // Texture reads are off the frame (PERF2) unless `texasync=off`. It was
+    // opt-in: test runs had black regions and missing crowns with it on. A
+    // read marked its copy complete when the reader had read it, and the
+    // upload then waited for the same resource to ask again; a slot that
+    // asked meanwhile, or through another resource of the copy, sampled a
+    // texture nothing had been copied into and never fetched the upload.
+    // Now every finished upload is recorded at the frame's start and a copy
+    // in flight is answered as it was before its read (d3d12x/texture.rs).
+    let mut o = TexOptions { mode: TexMode::Live, async_reads: !v.split(',').any(|p| p.trim() == "texasync=off"), ..Default::default() };
     for p in v.split(',').map(str::trim) {
         if p == "tex=off" {
             o.mode = TexMode::Off;
@@ -3462,6 +4168,26 @@ pub fn parse_layers(v: &str) -> u32 {
     m
 }
 
+/// `tint=off`, `paint=off`: (ped tint on, vehicle paint on).
+pub fn parse_tint_paint(v: &str) -> (bool, bool) {
+    let off = |s: &str| v.split(',').any(|p| p.trim() == s);
+    (!off("tint=off"), !off("paint=off"))
+}
+
+/// The root constants of a tinted or painted draw, or None when
+/// neither applies: ped tint (palette `entry` of our table, never with
+/// layers) goes to layerTex = entry | rows << 12 | r0 << 24 and layerFlags
+/// |= r1 << 16 | r2 << 24, matFlags bit 3; paint puts colour A in
+/// albedo.rgb, matFlags bit 2. Returns ((k[50], k[51] bits) of the tint,
+/// colour A of the paint).
+pub fn tint_paint_constants(m: &Material, entry: u32, layered: bool, tint: bool, paint: bool) -> (Option<(u32, u32)>, Option<[f32; 3]>) {
+    let rows = if m.tint_inv > 0.0 { (1.0 / m.tint_inv).round().clamp(0.0, 256.0) as u32 } else { 0 };
+    let t = (tint && !layered && m.tint_palette != 0 && entry != 0 && entry < 4096 && rows != 0 && m.tint_rows[0] != 0xFF)
+        .then(|| (entry | rows << 12 | u32::from(m.tint_rows[0]) << 24, u32::from(m.tint_rows[1]) << 16 | u32::from(m.tint_rows[2]) << 24));
+    let p = (paint && m.paint_on).then(|| [m.paint[0], m.paint[1], m.paint[2]]);
+    (t, p)
+}
+
 /// The screen options when `XNW_WORLD_RENDER` asks for the picture on screen.
 pub fn screen_mode() -> Option<ScreenOptions> {
     static MODE: std::sync::OnceLock<Option<ScreenOptions>> = std::sync::OnceLock::new();
@@ -3473,6 +4199,7 @@ pub fn screen_mode() -> Option<ScreenOptions> {
 pub fn install_screen() {
     if screen_mode().is_some() {
         xnw_gpu::d3d12x::set_screen_source(screen_frame);
+        xnw_gpu::d3d12x::set_screen_shown(picture_shown);
     }
 }
 
@@ -3499,9 +4226,26 @@ pub(crate) fn screen_frame() -> Option<ID3D12Resource> {
             xnw_core::warn!("world render: pass panicked at frame {} ({what}); off", SCREEN_FRAME.load(std::sync::atomic::Ordering::Relaxed));
             *SCREEN.lock().unwrap_or_else(|e| e.into_inner()) = None;
             SCREEN.clear_poison();
+            picture_clear();
             None
         }
     }
+}
+
+/// LIVE1 front end: where a present without a world list asks for the
+/// title's UI layer (frame, (width, height, RGBA)); None registered or None
+/// given: the last picture again, as before.
+pub type UiSource = fn() -> Option<(u64, std::sync::Arc<ui::UiLayer>)>;
+static UI_SOURCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_ui_source(f: Option<UiSource>) {
+    UI_SOURCE.store(f.map_or(0, |f| f as usize), std::sync::atomic::Ordering::Release);
+}
+
+fn ui_source() -> Option<UiSource> {
+    let f = UI_SOURCE.load(std::sync::atomic::Ordering::Acquire);
+    // SAFETY: only `set_ui_source` stores, a `UiSource` or 0.
+    (f != 0).then(|| unsafe { std::mem::transmute::<usize, UiSource>(f) })
 }
 
 /// The pass panicked once: off for the rest of the run.
@@ -3521,11 +4265,57 @@ fn screen_frame_inner() -> Option<ID3D12Resource> {
     // The only place the pass is made: never without `XNW_WORLD_RENDER=screen..`
     // (`capture` and `1` record and dump only; no device work of ours).
     screen_mode()?;
+    // PASS1: the pass on a thread of ours; this present takes its picture.
+    if pass_thread_on() {
+        return picture_take();
+    }
     let list = lists().take();
     if let Some(l) = &list {
         SCREEN_FRAME.store(l.frame, std::sync::atomic::Ordering::Relaxed);
     }
     let mut guard = SCREEN.lock().ok()?;
+    let pass = pass_made(&mut guard)?;
+    let list = in_order(list);
+    // PASS1: the last compose may be sent without a wait (`showwait=off`): it
+    // has run before this frame writes a picture it read.
+    xnw_gpu::d3d12x::host::wait_shown();
+    // LIVE1 front end: no world list: the UI layer alone, when there is one.
+    if list.is_none()
+        && let Some((frame, layer)) = ui_source().and_then(|f| f())
+        && layer.size() == (pass.width, pass.height)
+    {
+        if let Err(e) = pass.ui_frame(frame, &layer) {
+            xnw_core::warn!("world render: ui frame failed: {e}; off");
+            *guard = None;
+            return None;
+        }
+        return Some(pass.shown().clone());
+    }
+    if let Some(list) = list
+        && let Err(e) = screen_draw(pass, list, false)
+    {
+        xnw_core::warn!("world render: pass failed: {e}; off");
+        *guard = None;
+        return None;
+    }
+    // [`lag_on`]: the presenter's queue is not ours: it reads `shown`,
+    // the last frame whose fence was reached (the frame in flight writes the
+    // second picture); without the hold it would read `colour`, so the
+    // frame is waited for first.
+    // A present without a new list lets a finished frame go (and shows it).
+    let r = if lag_on() && !pass.cuts.hold { pass.retire().map(|ms| xnw_core::framewall::add_ms(xnw_core::framewall::PASS_FENCE, ms)) } else { pass.retire_if_done() };
+    if let Err(e) = r {
+        xnw_core::warn!("world render: pass failed: {e}; off");
+        *guard = None;
+        return None;
+    }
+    let shown = pass.shown().clone();
+    xnw_core::live::note_shown(xnw_core::live::Shown { pic: shown.as_raw() as u16, ..pass.note_shown() });
+    Some(shown)
+}
+
+/// The pass, made at its first use on the host device (a warning once if it cannot be).
+fn pass_made(guard: &mut Option<Pass>) -> Option<&mut Pass> {
     if guard.is_none() {
         let host = xnw_gpu::d3d12x::host::host_device()?;
         match screen_pass(host) {
@@ -3537,13 +4327,16 @@ fn screen_frame_inner() -> Option<ID3D12Resource> {
             }
         }
     }
-    let pass = guard.as_mut()?;
-    // A test run's "lists 4150 published, 193 replaced": the recorder finished two
-    // frames between presents; the older was dropped and the newer drawn (one
-    // slot, one recorder thread: never an older list after a newer one). A
-    // present without a new list shows the last picture again. Guard the order.
+    guard.as_mut()
+}
+
+/// A test run's "lists 4150 published, 193 replaced": the recorder finished two
+/// frames between presents; the older was dropped and the newer drawn (one
+/// slot, one recorder thread: never an older list after a newer one). A
+/// present without a new list shows the last picture again. Guard the order.
+fn in_order(list: Option<FrameList>) -> Option<FrameList> {
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let list = list.filter(|l| {
+    list.filter(|l| {
         let last = LAST.load(std::sync::atomic::Ordering::Relaxed);
         if l.frame <= last && last != 0 {
             xnw_core::warn!("world render: list of frame {} after frame {last}: not drawn", l.frame);
@@ -3551,15 +4344,267 @@ fn screen_frame_inner() -> Option<ID3D12Resource> {
         }
         LAST.store(l.frame, std::sync::atomic::Ordering::Relaxed);
         true
+    })
+}
+
+// ---- PASS1: the pass on a thread of ours ----
+//
+// The pass thread waits on [`Lists`] (a publish wakes it), draws the newest
+// list with [`screen_draw`] and retires it as the present did, and puts the
+// finished picture in [`PICTURE`]; PresentX takes the picture there and
+// never draws. The picture rules, so that the presenter's queue never reads
+// a picture our queue writes:
+// - with the second picture (`XNW_PASS_LAG=on`, hold, no chunks: main.env)
+//   a frame copies into `shown_back`, never into the picture put up; a flip
+//   ([`Pass::retire`]) is followed by [`picture_put`] before any later
+//   submission, and the put waits until no present composes the picture
+//   before (`presenting`) and its compose has run on the GPU
+//   (`xnw_gpu::d3d12x::host::wait_shown`): the presenter never waits;
+// - else the frame writes the picture put up in place: it is drawn with
+//   `writing` set, and a present waits for it (the old cost, those modes only).
+// Locks: the pass thread holds SCREEN for a step and PICTURE only to put or
+// to mark; PresentX takes PICTURE only (SCREEN by try_lock, LIVE1 UI-only
+// frames); neither holds PICTURE while it waits on the other's GPU work.
+
+/// `XNW_WORLD_RENDER=screen,...,passthread=on|off` (PASS1, default on; off:
+/// the pass in PresentX, as before).
+pub fn pass_thread_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| parse_pass_thread(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default()))
+}
+
+/// `passthread=off` (or `=0`) turns it off; the last one wins.
+pub fn parse_pass_thread(v: &str) -> bool {
+    !v.split(',').filter_map(|p| p.trim().strip_prefix("passthread=")).last().is_some_and(|v| matches!(v.trim(), "off" | "0"))
+}
+
+/// The pass thread's picture for the presenter.
+struct Picture {
+    shown: Option<SendBox<ID3D12Resource>>,
+    /// FLK2: what it was made of (the present notes it at the take).
+    note: xnw_core::live::Shown,
+    /// A present composes `shown` (from its take to [`picture_shown`]).
+    presenting: bool,
+    /// The pass writes `shown` in place: a present waits.
+    writing: bool,
+}
+
+static PICTURE: Mutex<Picture> = Mutex::new(Picture { shown: None, note: xnw_core::live::Shown { world: 0, pic: 0, rows: 0, bridged: 0, lights: 0, entered: 0, left: 0, energy: 0.0, e: 0.0, ui: 0, movie: 0, plane: 0 }, presenting: false, writing: false });
+static PICTURE_CV: std::sync::Condvar = std::sync::Condvar::new();
+
+fn picture() -> std::sync::MutexGuard<'static, Picture> {
+    PICTURE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// No present composes the picture put up, and the last compose ran on the
+/// GPU (waited for without PICTURE held: a present meanwhile only takes it).
+fn picture_free() -> std::sync::MutexGuard<'static, Picture> {
+    loop {
+        let mut p = picture();
+        while p.presenting {
+            p = PICTURE_CV.wait(p).unwrap_or_else(|e| e.into_inner());
+        }
+        if xnw_gpu::d3d12x::host::shown_done() {
+            return p;
+        }
+        drop(p);
+        xnw_gpu::d3d12x::host::wait_shown();
+    }
+}
+
+/// Puts `shown` up (the pass thread). The same picture again: nothing to do.
+fn picture_put(shown: &ID3D12Resource, note: xnw_core::live::Shown) {
+    if picture().shown.as_ref().is_some_and(|s| s.0.as_raw() == shown.as_raw()) {
+        return;
+    }
+    let t = std::time::Instant::now();
+    let mut p = picture_free();
+    p.shown = Some(SendBox(shown.clone()));
+    p.note = note;
+    drop(p);
+    xnw_core::framewall::add(xnw_core::framewall::PASS_PUT, t.elapsed().as_nanos() as u64);
+}
+
+/// The frame writes the picture put up in place: presents wait from here
+/// until [`picture_written`].
+fn picture_writing() {
+    let t = std::time::Instant::now();
+    picture_free().writing = true;
+    xnw_core::framewall::add(xnw_core::framewall::PASS_PUT, t.elapsed().as_nanos() as u64);
+}
+
+fn picture_written(shown: Option<&ID3D12Resource>, note: xnw_core::live::Shown) {
+    let mut p = picture();
+    p.shown = shown.map(|s| SendBox(s.clone()));
+    p.note = note;
+    p.writing = false;
+    drop(p);
+    PICTURE_CV.notify_all();
+}
+
+/// The pass went: no picture.
+fn picture_clear() {
+    picture_written(None, xnw_core::live::Shown::default());
+}
+
+/// PresentX: the picture put up (marked composed until [`picture_shown`]),
+/// the pass thread started at the first. Waits only while a frame writes it
+/// in place.
+fn picture_take() -> Option<ID3D12Resource> {
+    static START: std::sync::Once = std::sync::Once::new();
+    START.call_once(|| match std::thread::Builder::new().name("xnw world pass".into()).spawn(pass_thread) {
+        Ok(_) => xnw_core::info!("world render: pass thread on: our pass draws each list off the title's PresentX, which shows the last finished picture (passthread=off: in PresentX as before)"),
+        Err(e) => xnw_core::warn!("world render: no pass thread: {e}"),
     });
-    if let Some(list) = list
-        && let Err(e) = screen_draw(pass, list, false)
-    {
+    ui_alone_frame();
+    let mut p = picture();
+    while p.writing {
+        p = PICTURE_CV.wait(p).unwrap_or_else(|e| e.into_inner());
+    }
+    let r = p.shown.as_ref()?.0.clone();
+    p.presenting = true;
+    // FLK2: the flicker counter's note of this present's picture.
+    xnw_core::live::note_shown(xnw_core::live::Shown { pic: r.as_raw() as u16, ..p.note });
+    Some(r)
+}
+
+/// The present is done with the picture (xnw-gpu's `Shown`; its compose is sent).
+fn picture_shown() {
+    picture().presenting = false;
+    PICTURE_CV.notify_all();
+}
+
+/// LIVE1 front end with the pass thread: no world list waiting and the pass
+/// idle: the UI layer alone, drawn here (this thread is the only composer,
+/// and the pass thread is held off by SCREEN), as the present did before.
+fn ui_alone_frame() {
+    let Some(source) = ui_source() else { return };
+    if lists().has_ready() {
+        return;
+    }
+    let Ok(mut guard) = SCREEN.try_lock() else { return };
+    let Some((frame, layer)) = source() else { return };
+    let Some(pass) = pass_made(&mut guard) else { return };
+    if layer.size() != (pass.width, pass.height) {
+        return;
+    }
+    // It writes `shown` in place: the last compose of it has run.
+    xnw_gpu::d3d12x::host::wait_shown();
+    match pass.ui_frame(frame, &layer) {
+        Ok(()) => picture_written(Some(pass.shown()), xnw_core::live::Shown { world: frame, ..Default::default() }),
+        Err(e) => {
+            xnw_core::warn!("world render: ui frame failed: {e}; off");
+            *guard = None;
+            picture_clear();
+        }
+    }
+}
+
+/// The pass thread: the pass made at once, then a list (or 2 ms, to let a
+/// finished frame go) and a step; a panic turns the pass off for the run,
+/// as in PresentX.
+fn pass_thread() {
+    if let Err(p) = pass_loop(lists(), pass_start, pass_step, || SCREEN_PANICKED.load(std::sync::atomic::Ordering::Relaxed)) {
+        SCREEN_PANICKED.store(true, std::sync::atomic::Ordering::Relaxed);
+        let what = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_default();
+        xnw_core::warn!("world render: pass panicked at frame {} ({what}); off", SCREEN_FRAME.load(std::sync::atomic::Ordering::Relaxed));
+        *SCREEN.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        SCREEN.clear_poison();
+        picture_clear();
+    }
+}
+
+/// The pass thread's loop over `lists`: `start` once, then `step` with each
+/// list taken (None after 2 ms without one) until `off`; a panic in either
+/// ends it with its payload.
+fn pass_loop(lists: &Lists, start: impl FnOnce(), mut step: impl FnMut(Option<FrameList>), off: impl Fn() -> bool) -> std::thread::Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    use xnw_core::framewall as fw;
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(start))?;
+    // PERF4: the slot has a drawer while this loop runs (a panic ends it too).
+    struct Drawer<'a>(&'a Lists);
+    impl Drop for Drawer<'_> {
+        fn drop(&mut self) {
+            self.0.drawer.store(false, Relaxed);
+            self.0.busy_since.store(0, Relaxed);
+        }
+    }
+    lists.drawer.store(true, Relaxed);
+    let _drawer = Drawer(lists);
+    while !off() {
+        let idle = std::time::Instant::now();
+        let list = lists.wait_take(std::time::Duration::from_millis(2));
+        fw::add(fw::PASS_IDLE, idle.elapsed().as_nanos() as u64);
+        let took = list.is_some().then(capskip::clock_ns);
+        if let Some(t) = took {
+            lists.busy_since.store(t, Relaxed);
+        }
+        let busy = std::time::Instant::now();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| step(list)))?;
+        fw::add(fw::PASS_THREAD, busy.elapsed().as_nanos() as u64);
+        if let Some(t) = took {
+            lists.step.store(capskip::mean(lists.step.load(Relaxed), capskip::clock_ns() - t), Relaxed);
+            lists.busy_since.store(0, Relaxed);
+        }
+    }
+    Ok(())
+}
+
+/// PASS1 fix: the pass is made when the thread starts, i.e. at the
+/// first present that asks for our picture, as the PresentX path made it
+/// 'our pass on' at 8.4 s, the first list at 45 s); made at the
+/// first list, its start lines (pre-skin program, budgets) came only then.
+fn pass_start() {
+    let mut guard = SCREEN.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = pass_made(&mut guard);
+}
+
+/// One step of the pass thread: the frame in flight let go when done (or
+/// waited for before a new list), the picture put up, the list drawn.
+fn pass_step(list: Option<FrameList>) {
+    use xnw_core::framewall as fw;
+    if let Some(l) = &list {
+        SCREEN_FRAME.store(l.frame, std::sync::atomic::Ordering::Relaxed);
+    }
+    let mut guard = SCREEN.lock().unwrap_or_else(|e| e.into_inner());
+    let list = in_order(list);
+    if list.is_none() && guard.as_ref().is_none_or(|p| p.lag.is_none()) {
+        return;
+    }
+    let Some(pass) = pass_made(&mut guard) else { return };
+    let failed = |guard: &mut Option<Pass>, e: String| {
         xnw_core::warn!("world render: pass failed: {e}; off");
         *guard = None;
-        return None;
+        picture_clear();
+    };
+    // The frame in flight first (as `Pass::draw` does at its start); after a
+    // flip the new picture goes up before anything writes the one before.
+    let r = if list.is_some() { pass.retire().map(|ms| fw::add_ms(fw::PASS_FENCE, ms)) } else { pass.retire_if_done() };
+    if let Err(e) = r {
+        return failed(&mut guard, e);
     }
-    Some(pass.shown().clone())
+    picture_put(pass.shown(), pass.note_shown());
+    let Some(list) = list else { return };
+    let lag = lag_on();
+    pass.lag_frame = Some(lag);
+    let in_place = !(lag && pass.cuts.hold && pass.chunk == 0 && pass.shown_back.is_some());
+    if in_place {
+        picture_writing();
+    }
+    let (frame, at) = (list.frame, std::time::Instant::now());
+    // As the present did: with the second picture the frame is not waited for.
+    let r = screen_draw(pass, list, false).and_then(|_| if lag && !pass.cuts.hold { pass.retire().map(|ms| fw::add_ms(fw::PASS_FENCE, ms)) } else { pass.retire_if_done() });
+    fw::picture();
+    if let Err(e) = r {
+        return failed(&mut guard, e);
+    }
+    static FIRST: std::sync::Once = std::sync::Once::new();
+    FIRST.call_once(|| xnw_core::info!("world render: pass thread: first list drawn (frame {frame}, {:.1} ms, {} picture)", at.elapsed().as_secs_f64() * 1e3, if in_place { "in place" } else { "second" }));
+    if in_place {
+        picture_written(Some(pass.shown()), pass.note_shown());
+    } else {
+        picture_put(pass.shown(), pass.note_shown());
+    }
 }
 
 /// The screen pass as the live path makes it: 1920x1080 on `host`, every
@@ -3568,10 +4613,33 @@ pub fn screen_pass(host: &xnw_gpu::host::Host) -> std::result::Result<Pass, Stri
     // Parsed again, not `screen_mode()`: `xnw burst` sets the variable after main read it.
     let opts = parse_screen(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default()).ok_or("XNW_WORLD_RENDER does not ask for the screen")?;
     let mut p = Pass::new(host, 1920, 1080)?;
+    if p.ourlight.as_ref().is_some_and(|l| l.has_lamps()) {
+        xnw_core::info!("world render: lights on: the title's scene lights in our lighting pass, at most {} a frame in one {}-byte constant buffer, the light sum x {:.3} (lightscale=); live switch lights", lamps::MAX, lamps::CB_BYTES, p.lamp_scale);
+    } else if lamps::asked() {
+        xnw_core::warn!("world render: lights asked without ourlight=metal: off");
+    }
+    if p.ourlight.as_ref().is_some_and(|l| l.has_emissive()) {
+        xnw_core::info!("world render: emissive on: the bridged rows' target 5 (the title's RT5 word) into an RGBA8 target of ours, decoded and added to their lit colour x {:.3} (lightscale=)", p.lamp_scale);
+    } else if ourlight::parse_emissive(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default()) {
+        xnw_core::warn!("world render: emissive asked without ourlight=metal: off");
+    }
+    if p.ourlight.as_ref().is_some_and(|l| l.has_post()) {
+        xnw_core::info!("world render: post on: our lighting pass writes scene-linear RGBA16F, one composite of ours to the 8-bit target (E from {}, the title's curve from the timecycle, sRGB OETF, ordered dither); live switches post, exposure (n / 100)", if p.post_mode == post::KEY { "our key (post=key)" } else { "our key adapted in the timecycle's EV range at the title's rate (post=on, POST3)" });
+    } else if post::asked() != post::OFF {
+        xnw_core::warn!("world render: post asked without ourlight=on|metal: off");
+    }
+    if p.sunshadow.is_some() {
+        xnw_core::info!("world render: sunshadow on: {0} x {0} depth atlas of ours (4 tiles of {1}), the title's cascade rows (stages 23-26) with their viewports' views, a screen term for our lighting pass; live switch sunshadow", 2 * sunshadow::TILE, sunshadow::TILE);
+    } else if sunshadow::asked() != sunshadow::OFF {
+        xnw_core::warn!("world render: sunshadow asked without ourlight=on|metal: off");
+    }
     if p.ourlight.is_some() {
         xnw_core::info!("world render: ourlight on: our lighting pass (our HLSL) after the opaque rows over the G-buffer's normals (gbuf on); light from the timecycle (Lighting::ours)");
+        if ourlight::title_normals() {
+            xnw_core::info!("world render: ournormals=title: the bridged rows' target 1 into our title normal target; the lighting pass takes their normal and roughness there");
+        }
     }
-    (p.wire, p.only_stage, p.skin, p.states, p.sky, p.water, p.peds, p.decal_hold) = (opts.wire, opts.stage, opts.skin, opts.states, opts.sky, opts.water, opts.peds, opts.decal_hold);
+    (p.wire, p.only_stage, p.skin, p.states, p.sky, p.water, p.peds, p.decal_hold, p.decals) = (opts.wire, opts.stage, opts.skin, opts.states, opts.sky, opts.water, opts.peds, opts.decal_hold, opts.decals);
     // Skinned non-ped draws only with `skinned=on`.
     p.skinned = std::env::var("XNW_WORLD_RENDER").is_ok_and(|v| v.split(',').any(|s| s.trim() == "skinned=on"));
     // `skinrules=<hex>` (default 0: the default maths and skips).
@@ -3580,6 +4648,13 @@ pub fn screen_pass(host: &xnw_gpu::host::Host) -> std::result::Result<Pass, Stri
     p.face_cull = parse_face_cull(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default());
     if p.face_cull != FaceCull::Off {
         xnw_core::info!("world render: face cull {:?}: stated rows with their cull mode; mirrored rows the other face; instances that disagree or are tested on the device both faces", p.face_cull);
+    }
+    // `precord=on|N` (default off): the draw loop's long runs recorded on N lists in parallel.
+    p.precord = precord::parse_switch(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default());
+    // `bridgepar=on|off` (PERF3, default on): the bridged rows prepared off the pass's thread.
+    p.bridgepar = precord::parse_bridgepar(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default());
+    if p.precord > 1 {
+        xnw_core::info!("world render: precord on: draw runs of {}+ recorded on up to {} lists in parallel", 2 * precord::MIN_RANGE, p.precord);
     }
     p.pso_budget = SCREEN_PSO_BUDGET;
     p.pso_async = true;
@@ -3599,7 +4674,10 @@ pub fn screen_pass(host: &xnw_gpu::host::Host) -> std::result::Result<Pass, Stri
         p.bridge_on = host.caps.software || hw;
         // On the card the per-submission GPU watchdog exits the title before the
         // driver's 2 s timeout (`XNW_GPU_WATCH_MS`, default 500), its line every 60 frames.
-        if p.bridge_on && !host.caps.software {
+        // SKIN2: under `XNW_REDUCE` with `XNW_GPU_WATCH_MS` set, on the software adapter too
+        // (a submission that never reaches its fence is named; the step ends with code 3).
+        let reduce_watch = host.caps.software && crate::reduce::get().is_some() && std::env::var("XNW_GPU_WATCH_MS").is_ok();
+        if p.bridge_on && (!host.caps.software || reduce_watch) {
             let ms = std::env::var("XNW_GPU_WATCH_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(500u64);
             xnw_gpu::gpuwatch::start(std::time::Duration::from_millis(ms));
             xnw_core::info!("world render: bridgeps on {}: GPU watchdog {ms} ms per submission", host.caps.adapter);
@@ -3638,11 +4716,21 @@ pub fn screen_pass(host: &xnw_gpu::host::Host) -> std::result::Result<Pass, Stri
             Ok(ms) => xnw_core::info!("world render: pre-skin on (our compute pass; program made in {ms:.0} ms)"),
             Err(e) => xnw_core::warn!("world render: pre-skin program failed: {e}"),
         }
+        // `preskinbind=on` (default off): bridged PreSkinD rows read our pre-skin output as the title's range.
+        p.preskin.bind = preskin_gpu::bind_switch(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default());
+        p.preskin.deny = preskin_gpu::bind_deny(&std::env::var("XNW_BRIDGE_ALLOW").unwrap_or_default());
+        if p.preskin.bind {
+            xnw_core::info!("world render: preskinbind on: bridged rows reading the title's pre-skin range (frame table slots 33/84, record word +0x54) read our pass's (float3, extra blocks; no previous frame); left unbound: {:x?}", p.preskin.deny);
+        }
     }
     // `light=old` keeps the earlier lighting.
     p.light_old = std::env::var("XNW_WORLD_RENDER").is_ok_and(|v| v.split(',').any(|s| s.trim() == "light=old"));
     // `layers=c0|c1|off` (default c1).
     p.layers = parse_layers(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default());
+    // `tint=off`, `paint=off` (both on by default).
+    (p.tint, p.paint) = parse_tint_paint(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default());
+    // `vehmat=off` (INT1; on by default).
+    p.vehmat = vehmat::parse_switch(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default());
     // Hold partial pictures at cuts (`hold=off`: show every frame as drawn).
     p.cuts = cuts::CutWatch::new(!std::env::var("XNW_WORLD_RENDER").is_ok_and(|v| v.split(',').any(|s| s.trim() == "hold=off")));
     // `cutfast=on` (off by default, CUT1): a camera cut's queue drained in 2 frames, its texture reads capped.
@@ -3654,6 +4742,36 @@ pub fn screen_pass(host: &xnw_gpu::host::Host) -> std::result::Result<Pass, Stri
     // `stipple=off` draws cross-fading LODs solid (bisecting).
     p.stipple = !std::env::var("XNW_WORLD_RENDER").is_ok_and(|v| v.split(',').any(|s| s.trim() == "stipple=off"));
     Ok(p)
+}
+
+/// `XNW_PASS_LAG=on` (default off; not with `chunk`): the pass sends
+/// its frame without waiting for it; the next frame waits for that fence at
+/// its start, before it writes any memory the GPU reads, and only then lets
+/// go of what the frame used (geometry copies and staging, the bridged
+/// rows' objects, the texture tables' uploads, the in-place windows' hold):
+/// frame-lag retirement with one frame in flight (UE 5.9's rule:
+/// memory returns by fence, never by a wait on the frame path). What runs
+/// between two frames (the title, or a burst's list side) runs while the
+/// GPU draws. More frames in flight need per-frame copies of the memory the
+/// pass rewrites in place (small inputs, words, strides, the frame upload
+/// arena, staging, the texture tables' entries).
+/// Live (SW1 `lag`, capped: the second picture is made at start): the
+/// pass takes it once a frame ([`Pass::draw`]).
+pub fn lag_on() -> bool {
+    xnw_core::live::on(xnw_core::live::LAG, || u32::from(matches!(std::env::var("XNW_PASS_LAG").as_deref().map(str::trim), Ok("on" | "1"))))
+}
+
+/// A frame sent and not yet waited for ([`lag_on`]): its fence value, when
+/// it was sent, its last submission's timestamp pair, its frame, and what
+/// it holds to its fence.
+struct Lag {
+    value: u64,
+    sent: std::time::Instant,
+    k: u32,
+    frame: u64,
+    _keep: Vec<windows::core::IUnknown>,
+    _copies: Vec<(ID3D12Resource, ID3D12Resource, u64, u64, u64)>,
+    _world: xnw_gpu::shared::WorldFrame,
 }
 
 /// With bridged rows, our draws are sent before the rows are recorded
@@ -3699,6 +4817,13 @@ pub fn screen_draw(pass: &mut Pass, mut list: FrameList, readback: bool) -> std:
     pass.log_geometry(list.frame, &st);
     let total = t.elapsed().as_secs_f64() * 1e3;
     cost_pass(total, st.upload_ms, st.pso_ms);
+    // WALL1: the pass on the presenting thread: record, fence waits (the frame in flight's, chunks', or its own), the rest.
+    {
+        use xnw_core::framewall as fw;
+        fw::add_ms(fw::PASS_RECORD, st.record_ms);
+        fw::add_ms(fw::PASS_FENCE, st.gpu_ms);
+        fw::add_ms(fw::PASS_SUBMIT, total - st.record_ms - st.gpu_ms);
+    }
     if total > 50.0 {
         let steps = [("upload", st.upload_ms), ("pipelines", st.pso_ms), ("textures", st.tex_ms), ("record", st.record_ms - st.upload_ms - st.pso_ms - st.tex_ms), ("GPU", st.gpu_ms)];
         let worst = steps.iter().copied().fold(("-", 0.0), |a, b| if b.1 > a.1 { b } else { a });
@@ -3736,7 +4861,7 @@ pub fn screen_draw(pass: &mut Pass, mut list: FrameList, readback: bool) -> std:
     }
     if list.frame % 60 == 0 && pass.bridge_on {
         let none = bridged::Frame::default();
-        xnw_core::info!("{}", bridged::line(list.frame, list.bridged.as_deref().unwrap_or(&none), &pass.bridge_stats));
+        xnw_core::info!("{}{}", bridged::line(list.frame, list.bridged.as_deref().unwrap_or(&none), &pass.bridge_stats), bridge_cam_text());
         if xnw_gpu::gpuwatch::budget().is_some() {
             xnw_core::info!("world render: frame {}: {}", list.frame, xnw_gpu::gpuwatch::summary("the last 60 frames", &xnw_gpu::gpuwatch::take()));
         }
@@ -3760,13 +4885,14 @@ pub fn screen_draw(pass: &mut Pass, mut list: FrameList, readback: bool) -> std:
     };
     if list.frame % 60 == 0 {
         xnw_core::info!(
-            "world render: frame {}: {} draws (skinned {} of {} hooked, {} with the ped remap, {} peds skipped, {} skinned skipped, {} decals held, {} without geometry, {} filtered, {} with the title's state ({} one-sided), {} state pipelines), {} triangles; {} geometries uploaded ({} replaced, {} indices clamped) ({} KiB), palettes {} B; record {:.1} ms (textures {:.1} ms), GPU {:.1} ms, total {:.1} ms; means of the last {} frames: record {:.1} ms (textures {:.1}, bridged {:.1}), GPU {:.1} ms, total {:.1} ms",
+            "world render: frame {}: {} draws (skinned {} of {} hooked, {} with the ped remap, {} peds skipped, {} peds held, {} skinned skipped, {} decals held, {} without geometry, {} filtered, {} with the title's state ({} one-sided), {} state pipelines), {} triangles; {} geometries uploaded ({} replaced, {} indices clamped) ({} KiB), palettes {} B; record {:.1} ms (textures {:.1} ms), GPU {:.1} ms, total {:.1} ms; means of the last {} frames: record {:.1} ms (textures {:.1}, bridged {:.1}), GPU {:.1} ms, total {:.1} ms",
             list.frame,
             st.draws,
             st.skinned,
             list.skin_hooked,
             st.remapped,
             st.peds_skipped,
+            list.preskin.held,
             st.skinned_skipped,
             st.decals_held,
             st.skipped,
@@ -4136,6 +5262,48 @@ mod tests {
         assert!(px[(18 * 64 + 33) * 4 + 1] > 150, "stipple off: solid");
     }
 
+    /// 360 overlapping draws (two runs: opaque, then stage 14 past the
+    /// water event) give the same picture recorded on one list and on four.
+    #[test]
+    fn precord_same_picture_on_warp() {
+        assert_eq!((precord::parse_switch("screen,precord=on"), precord::parse_switch("screen"), precord::parse_switch("screen,precord=3,precord=off")), (precord::DEFAULT_LISTS, 0, 0));
+        if !xnw_gpu::host::device_allowed() {
+            return;
+        }
+        let (_gpu, host) = warp_host();
+        let word = |stride: u32, offset: u32, format: u32| (stride / 4) << 5 | (offset / 4) << 9 | format;
+        let mut vb = vec![0u8; 0x80];
+        vb[0..4].copy_from_slice(&word(12, 0x80, 3).to_le_bytes());
+        for v in [[-0.4f32, -0.4, -3.0], [0.4, -0.4, -3.0], [0.0, 0.4, -3.0]] {
+            for x in v {
+                vb.extend(x.to_le_bytes());
+            }
+        }
+        let geom = GeomKey { mesh_at: 11, ..Default::default() };
+        let draws: Vec<DrawRecord> = (0..360u32)
+            .map(|i| {
+                let mut world: Mat = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+                (world[12], world[13]) = ((i % 19) as f32 * 0.1 - 0.9, (i % 7) as f32 * 0.1 - 0.3);
+                let stage = if i < 200 { 0 } else { 14 };
+                DrawRecord { geom, world, viewport: 1, effect: u64::from(i) * 0x9E37_79B9, albedo: Albedo::Flat([0.0; 3]), palette: NO_PALETTE, stage, inst_first: 0, inst_count: 0, bone_first: 0, bone_count: 0, material: Material::default(), state: None, remap: NO_REMAP, ped: false }
+            })
+            .collect();
+        let id: Mat = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        let picture = |lists: u32| {
+            let mut pass = Pass::new(&host, 64, 36).unwrap();
+            pass.precord = lists;
+            pass.id_mode = true;
+            let g = HostGeometry { vertices: Vec::new(), indices: vec![0, 1, 2], raw_vb: Some(vb.clone()), vb_place: 0 };
+            let list = FrameList { frame: 1, draws: draws.clone(), cameras: vec![Camera { viewport: 1, view: id, proj: PROJ }], main: Some(1), new_geoms: vec![(geom, g)], ..Default::default() };
+            let st = pass.draw(&list, &mut |_| None, true).unwrap();
+            (st.draws, st.precord_lists, pass.read_rgba().unwrap())
+        };
+        let (one, four) = (picture(0), picture(4));
+        assert_eq!((one.0, one.1, four.0, four.1), (360, 0, 360, 3 + 2));
+        assert!(one.2.chunks_exact(4).filter(|p| p[..3] != [0; 3]).count() > 100, "drawn");
+        assert!(one.2 == four.2, "the same picture on one list and on four");
+    }
+
     fn textured_list(slot: u64, mesh: u64, clip: bool) -> FrameList {
         let word = |stride: u32, offset: u32, format: u32| (stride / 4) << 5 | (offset / 4) << 9 | format;
         let mut vb = vec![0u8; 0x80];
@@ -4235,6 +5403,79 @@ mod tests {
         drop(mem);
     }
 
+    /// The tint and paint root constants: rows from 1/rows, r0 none
+    /// (0xFF) or a layered draw gives no tint; switches off give neither.
+    #[test]
+    fn tint_paint_constants_pack() {
+        let m = Material { tint_palette: 0x10, tint_rows: [1, 3, 0xFF], tint_inv: 0.25, paint: [0.8, 0.1, 0.1, 0.0, 0.0, 0.0], paint_on: true, ..Default::default() };
+        assert_eq!(tint_paint_constants(&m, 7, false, true, true), (Some((7 | 4 << 12 | 1 << 24, 3 << 16 | 0xFF << 24)), Some([0.8, 0.1, 0.1])));
+        assert_eq!(tint_paint_constants(&m, 7, true, true, true).0, None, "layered: no tint");
+        assert_eq!(tint_paint_constants(&m, 0, false, true, true).0, None, "palette not in the table");
+        assert_eq!(tint_paint_constants(&Material { tint_rows: [0xFF; 3], ..m }, 7, false, true, true).0, None, "r0 none");
+        assert_eq!(tint_paint_constants(&Material { tint_inv: 1.0 / 256.0, ..m }, 7, false, true, true).0.map(|t| (t.0 >> 12) & 0x1FF), Some(256));
+        assert_eq!(tint_paint_constants(&m, 7, false, false, false), (None, None), "tint=off, paint=off");
+        assert_eq!(parse_tint_paint("screen,tint=off"), (false, true));
+        assert_eq!(parse_tint_paint("screen, paint=off"), (true, false));
+        assert_eq!(parse_tint_paint(""), (true, true));
+    }
+
+    /// on WARP, through the live texture path: a diffuse D = (1, 0.5, 0)
+    /// and a 64x4 palette (rows black, red, green, blue). Tint rows (1, 3,
+    /// none): Pal(r0 = red) lerped to Pal(r1 = blue) by D.r = 1: blue. Rows
+    /// (1, none, none): red. Paint A = (0, 1, 0) on D: (0, 0.5, 0): green;
+    /// `paint=off`: D's red.
+    #[test]
+    fn tint_and_paint_on_warp() {
+        if !xnw_gpu::host::device_allowed() {
+            return;
+        }
+        let _gpu = warp_host();
+        let Some(host) = xnw_gpu::d3d12x::host::host_device() else { return };
+        let place = |w: u32, h: u32, fill: &dyn Fn(&mut [u8])| {
+            let mem = xnw_gpu::d3d12x::resource::Memory::zeroed(64 << 10, 64 << 10).unwrap();
+            // SAFETY: our own 64 KiB.
+            fill(unsafe { std::slice::from_raw_parts_mut(mem.address() as *mut u8, 64 << 10) });
+            let resource: [u32; 14] = [3, 0, 0, 0, w, 0, h, 0x0001_0001, DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32, 1, 0, 0x100, 0, 0];
+            let mut desc = [0u32; 16];
+            desc[..6].copy_from_slice(&[DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32, 4, 0x1688, 0, 0, 1]);
+            (desc[10], desc[11]) = (mem.address() as u32, (mem.address() >> 32) as u32);
+            let slot = Box::leak(Box::new([0u64; 8])).as_ptr() as u64;
+            xnw_gpu::d3d12x::descriptor::create_placed_srv(std::ptr::null(), &resource, &desc, slot);
+            (slot, mem)
+        };
+        let (d_slot, _d) = place(16, 16, &|m| m.chunks_exact_mut(4).for_each(|p| p.copy_from_slice(&[255, 128, 0, 255])));
+        let rows: [[u8; 4]; 4] = [[0, 0, 0, 255], [255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]];
+        let (p_slot, _p) = place(64, 4, &|m| (0..4).for_each(|r| m[r * 256..r * 256 + 256].chunks_exact_mut(4).for_each(|p| p.copy_from_slice(&rows[r]))));
+        let mut pass = Pass::new(host, 64, 36).unwrap();
+        pass.tex.opts.mode = TexMode::Live;
+        let mut list = textured_list(d_slot, 23, false);
+        let m = &mut list.draws[0].material;
+        (m.tint_palette, m.tint_rows, m.tint_inv) = (p_slot, [1, 3, 0xFF], 0.25);
+        let shot = |pass: &mut Pass, list: &mut FrameList| {
+            let st = pass.draw(list, &mut |_| None, true).unwrap();
+            list.new_geoms.clear();
+            list.frame += 1;
+            (centre(&pass.read_rgba().unwrap()), st)
+        };
+        let (c, st) = shot(&mut pass, &mut list);
+        assert_eq!(st.tinted, 1);
+        assert!(c[2] > 150 && c[0] < 40 && c[1] < 40, "r0 red lerped to r1 blue by D.r = 1: {c:?}");
+        list.draws[0].material.tint_rows = [1, 0xFF, 0xFF];
+        let (c, _) = shot(&mut pass, &mut list);
+        assert!(c[0] > 150 && c[1] < 40 && c[2] < 40, "r0 alone: red: {c:?}");
+        pass.tint = false;
+        let (c, st) = shot(&mut pass, &mut list);
+        assert!(st.tinted == 0 && c[0] > 150 && c[1] > 60, "tint=off: D itself (1, 0.5, 0): {c:?}");
+        let m = &mut list.draws[0].material;
+        (m.tint_palette, m.paint, m.paint_on) = (0, [0.0, 1.0, 0.0, 0.0, 0.0, 0.0], true);
+        let (c, st) = shot(&mut pass, &mut list);
+        assert_eq!(st.painted, 1);
+        assert!(c[1] > 80 && c[0] < 30 && c[2] < 30, "D x paint A (0, 1, 0) = (0, 0.5, 0): {c:?}");
+        pass.paint = false;
+        let (c, _) = shot(&mut pass, &mut list);
+        assert!(c[0] > 150, "paint=off: D's red: {c:?}");
+    }
+
     /// A test run had a cold pack read of 154 ms inside our record step. With
     /// `async_reads` the frame never reads: the first frame draws flat and
     /// queues the read; a later frame takes the finished upload and samples it.
@@ -4280,12 +5521,64 @@ mod tests {
         assert_eq!(pass.tex.stats.uploads, 1);
         let (_, _, reads, _) = xnw_gpu::d3d12x::texture::pass_reader_counts();
         assert!(reads >= 1);
+        // It stays: the table's own answer from here on, no second upload.
+        for f in 60..64 {
+            list.frame = f;
+            pass.draw(&list, &mut |_| None, true).unwrap();
+            assert!(centre(&pass.read_rgba().unwrap())[0] > 150, "frame {f}");
+        }
+        assert_eq!((pass.tex.stats.uploads, pass.tex.stats.waiting), (1, 0));
+    }
+
+    /// PERF2: `async_reads` with a provider (the replay's textures): the
+    /// slot is flat on the frame that asks, the table's thread reads and
+    /// makes the texture, a later frame takes it; with `settle` the asking
+    /// frame waits for its reads.
+    #[test]
+    fn async_provided_read_on_warp() {
+        if !xnw_gpu::host::device_allowed() {
+            return;
+        }
+        let (_gpu, host) = warp_host();
+        let mut pass = Pass::new(&host, 64, 36).unwrap();
+        pass.tex.opts.mode = TexMode::Provided;
+        pass.tex.opts.async_reads = true;
+        let texels = |slot: u64| {
+            let c = if slot == 0x5000 { [255u8, 0, 0, 255] } else { [0, 0, 255, 255] };
+            Some(textures::Provided { width: 4, height: 4, format: DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32, rows: c.repeat(16), row_bytes: 16, row_count: 4, dim: textures::TEX_2D, depth: 1, mips: 1 })
+        };
+        pass.tex.set_provider(Some(Box::new(texels)));
+        let mut list = textured_list(0x5000, 41, false);
+        pass.draw(&list, &mut |_| None, true).unwrap();
+        let s = pass.tex.stats;
+        assert_eq!((s.uploads, s.bound_draws, s.flat_draws, s.waiting), (0, 0, 1, 1), "frame 1: asked, drawn flat: {s:?}");
+        assert!(centre(&pass.read_rgba().unwrap())[1] > 150, "flat green");
+        list.new_geoms.clear();
+        let mut red = false;
+        for f in 2..200 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            list.frame = f;
+            pass.draw(&list, &mut |_| None, true).unwrap();
+            if centre(&pass.read_rgba().unwrap())[0] > 150 {
+                red = true;
+                break;
+            }
+        }
+        assert!(red, "the read landed and was sampled");
+        assert_eq!((pass.tex.stats.uploads, pass.tex.stats.waiting), (1, 0));
+        // `settle`: a slot new on this frame is read before the frame is drawn.
+        pass.tex.settle = true;
+        let mut other = textured_list(0x6000, 42, false);
+        other.frame = 300;
+        pass.draw(&other, &mut |_| None, true).unwrap();
+        assert!(centre(&pass.read_rgba().unwrap())[2] > 150, "blue on the frame that asked");
+        assert_eq!((pass.tex.stats.uploads, pass.tex.stats.waiting), (2, 0));
     }
 
     #[test]
     fn screen_texture_switches() {
         assert_eq!(parse_screen_tex("screen").mode, TexMode::Live);
-        assert!(!parse_screen_tex("screen").async_reads && parse_screen_tex("screen,texasync=on").async_reads);
+        assert!(parse_screen_tex("screen").async_reads && parse_screen_tex("screen,texasync=on").async_reads && !parse_screen_tex("screen,texasync=off").async_reads);
         assert_eq!((parse_screen_tex("screen").frame_ms, parse_screen_tex("screen,texms=8").frame_ms), (0.0, 8.0));
         assert_eq!(parse_screen_tex("screen,tex=off").mode, TexMode::Off);
         let o = parse_screen_tex("screen,wire,tex=64,texn=8,texmb=16");
@@ -4315,6 +5608,80 @@ mod tests {
         assert!((kx - dx + 0.00107).abs() < 1e-5 && (ky - dy + 0.00096).abs() < 1e-5, "{kx} {dx} {ky} {dy}");
     }
 
+    /// FLK1: a bridged row's viewport origin puts a point drawn with the
+    /// jittered projection on the pixel our unjittered pass gives it, for
+    /// any depth; no jitter, no shift.
+    #[test]
+    fn bridged_viewport_takes_the_jitter_out() {
+        let (w, h) = (1920u32, 1080u32);
+        let mut p = PROJ;
+        (p[8], p[9]) = (0.00107, -0.00096);
+        let s = unjitter_px(&p, w, h);
+        assert!(s[0].abs() > 0.5 && s[1].abs() > 0.3, "about a pixel: {s:?}");
+        let pixel = |m: &Mat, v: [f32; 3], origin: [f32; 2]| {
+            let c: [f32; 4] = std::array::from_fn(|j| (0..3).map(|i| v[i] * m[4 * i + j]).sum::<f32>() + m[12 + j]);
+            (origin[0] + (c[0] / c[3] + 1.0) * 0.5 * w as f32, origin[1] + (1.0 - c[1] / c[3]) * 0.5 * h as f32, c[2] / c[3])
+        };
+        for v in [[0.3, -0.2, -1.5], [-4.0, 2.5, -40.0], [100.0, 30.0, -900.0]] {
+            let (ours, theirs) = (pixel(&unjittered(&p), v, [0.0; 2]), pixel(&p, v, s));
+            assert!((ours.0 - theirs.0).abs() < 2e-3 && (ours.1 - theirs.1).abs() < 2e-3, "{ours:?} {theirs:?}");
+            assert_eq!(ours.2, theirs.2, "depth is the same");
+        }
+        assert_eq!(unjitter_px(&PROJ, w, h), [0.0; 2]);
+    }
+
+    /// FLK1: a bridged row's view constants are measured against the list
+    /// camera (view-projection and position), another camera's are found,
+    /// and `bridge_cam_set` makes them the list camera's.
+    #[test]
+    fn bridged_view_constants_follow_the_list_camera() {
+        let mut p = PROJ;
+        (p[8], p[9]) = (0.00107, -0.00096);
+        let cam = Camera { viewport: 1, view: VIEW, proj: p };
+        // The same camera 0.5 m further along x, turned a little: last frame's.
+        let mut old = cam;
+        old.view[12] += 0.5;
+        let (sn, cs) = 2e-3f32.sin_cos();
+        for j in 0..3 {
+            (old.view[j], old.view[4 + j]) = (cs * cam.view[j] + sn * cam.view[4 + j], cs * cam.view[4 + j] - sn * cam.view[j]);
+        }
+        let row = |c: &Camera| {
+            let mut b = vec![0u8; VIEW_CB];
+            b[VIEW_CB_VP + 12..VIEW_CB_VP + 16].copy_from_slice(&1f32.to_le_bytes());
+            let mut o = bridged::Owned { roots: vec![bridged::ORoot::None, bridged::ORoot::Table(vec![(3, bridged::OSlot::Buffer(preskin::Kind::Cbv, std::sync::Arc::new(vec![7u8; 288]))), (5, bridged::OSlot::Buffer(preskin::Kind::Cbv, std::sync::Arc::new(b.clone())))]), bridged::ORoot::Table(vec![(0, bridged::OSlot::Buffer(preskin::Kind::Cbv, std::sync::Arc::new(b)))])], ..Default::default() };
+            bridge_cam_set(&mut o, c);
+            o
+        };
+        let mut o = row(&cam);
+        let d = bridge_cam_delta(&o, &cam).expect("view constants found by shape");
+        assert!(d.0 <= CAM_SAME.0 && d.1 <= CAM_SAME.1, "the same camera: {d:?}");
+        // The camera sits at the view's origin: pos * R + t = 0.
+        let at = camera_pos(&VIEW);
+        for j in 0..3 {
+            assert!((at[0] * VIEW[j] + at[1] * VIEW[4 + j] + at[2] * VIEW[8 + j] + VIEW[12 + j]).abs() < 1e-2, "{at:?}");
+        }
+        // The position round trip: cell and remainder.
+        let (pos, bridged::ORoot::Table(t)) = (camera_pos(&cam.view), &o.roots[1]) else { panic!() };
+        let bridged::OSlot::Buffer(_, b) = &t[1].1 else { panic!() };
+        let f = |at: usize| f32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+        let cell = i16::from_le_bytes([b[VIEW_CB_CAM + 12], b[VIEW_CB_CAM + 13]]);
+        assert!((0.0..32.0).contains(&f(VIEW_CB_CAM)) && (f32::from(cell) * 32.0 + f(VIEW_CB_CAM) - pos[0]).abs() < 1e-3, "{pos:?} {cell} {}", f(VIEW_CB_CAM));
+        assert_eq!((f(0x60), f(0x64)), (p[8], p[9]), "the jitter");
+        // Another camera's constants: found, then made ours.
+        o = row(&old);
+        let d = bridge_cam_delta(&o, &cam).expect("found");
+        assert!(d.0 > CAM_OFF.0 && d.1 > CAM_OFF.1, "last frame's camera: {d:?}");
+        bridge_cam_set(&mut o, &cam);
+        let d = bridge_cam_delta(&o, &cam).expect("found");
+        assert!(d.0 <= CAM_SAME.0 && d.1 <= CAM_SAME.1, "{d:?}");
+        // A buffer of the same length and shape in another root (a material's constants) is not the view's: left as it is.
+        let bridged::ORoot::Table(t) = &o.roots[2] else { panic!() };
+        let bridged::OSlot::Buffer(_, m) = &t[0].1 else { panic!() };
+        assert!(m.iter().enumerate().all(|(i, x)| *x == if i == VIEW_CB_VP + 14 { 0x80 } else if i == VIEW_CB_VP + 15 { 0x3f } else { 0 }), "untouched");
+        // A row without view constants (no table buffer of that shape): nothing to compare.
+        assert_eq!(bridge_cam_delta(&bridged::Owned::default(), &cam), None);
+    }
+
     /// A decal drawn in list 1, absent in list 2, present in list 3 is
     /// drawn in all three; one absent two lists running is dropped after one;
     /// a held decal keeps its world place when the camera moves.
@@ -4324,6 +5691,83 @@ mod tests {
     fn filtered_never_underflows() {
         assert_eq!(filtered_count(1, 3), 0);
         assert_eq!(filtered_count(5, 3), 2);
+    }
+
+    /// PASS1: the pass thread is on unless `passthread=off` (the last one wins).
+    #[test]
+    fn the_pass_thread_switch() {
+        assert!(parse_pass_thread("") && parse_pass_thread("screen,lag=on") && parse_pass_thread("screen,passthread=on"));
+        assert!(!parse_pass_thread("screen, passthread=off ,gbuf=on") && !parse_pass_thread("passthread=0"));
+        assert!(parse_pass_thread("passthread=off,passthread=on"));
+    }
+
+    /// PASS1: a publish wakes a waiting taker at once; with nothing
+    /// published the wait ends at its timeout, empty.
+    #[test]
+    fn a_publish_wakes_the_pass_thread() {
+        let lists = std::sync::Arc::new(Lists::default());
+        let t = std::time::Instant::now();
+        assert!(lists.wait_take(std::time::Duration::from_millis(20)).is_none() && t.elapsed() >= std::time::Duration::from_millis(19));
+        let l2 = lists.clone();
+        let waiter = std::thread::spawn(move || {
+            let t = std::time::Instant::now();
+            (l2.wait_take(std::time::Duration::from_secs(10)).map(|l| l.frame), t.elapsed())
+        });
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert!(!lists.has_ready());
+        lists.publish(FrameList { frame: 7, ..Default::default() });
+        let (frame, waited) = waiter.join().unwrap();
+        assert_eq!(frame, Some(7));
+        assert!(waited < std::time::Duration::from_secs(5), "woken by the publish, not the timeout: {waited:?}");
+        assert!(!lists.has_ready() && lists.counts() == (1, 0));
+    }
+
+    /// PASS1 fix: the pass thread makes its pass at start, with no
+    /// present and no list, then draws a published list; nothing of PresentX's
+    /// is needed (the real pass needs a device: `start` and `step` stand in).
+    #[test]
+    fn the_pass_thread_makes_its_pass_at_start_and_draws_a_published_list() {
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        let lists = std::sync::Arc::new(Lists::default());
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel::<u64>();
+        let thread = {
+            let (lists, stop, made, drawn) = (lists.clone(), stop.clone(), tx.clone(), tx);
+            std::thread::spawn(move || {
+                pass_loop(
+                    &lists,
+                    move || made.send(0).unwrap(),
+                    move |l: Option<FrameList>| {
+                        if let Some(l) = l {
+                            drawn.send(l.frame).unwrap();
+                        }
+                    },
+                    move || stop.load(Relaxed),
+                )
+            })
+        };
+        let wait = std::time::Duration::from_secs(5);
+        assert_eq!(rx.recv_timeout(wait), Ok(0), "the pass is made at the thread's start, before any list");
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(30)).is_err(), "nothing drawn without a list");
+        lists.publish(FrameList { frame: 9, ..Default::default() });
+        assert_eq!(rx.recv_timeout(wait), Ok(9), "the published list is drawn by the thread");
+        lists.publish(FrameList { frame: 10, ..Default::default() });
+        assert_eq!(rx.recv_timeout(wait), Ok(10));
+        // PERF4: the slot has a drawer; two lists drawn give a mean time per list.
+        let t = std::time::Instant::now();
+        while lists.pass_view().is_some_and(|p| p.step == 0 || p.busy_since.is_some()) && t.elapsed() < wait {
+            std::thread::yield_now();
+        }
+        let p = lists.pass_view().expect("a drawer while the loop runs");
+        assert!(p.step > 0 && p.busy_since.is_none() && !p.waiting, "{p:?}");
+        stop.store(true, Relaxed);
+        assert!(thread.join().unwrap().is_ok());
+        assert_eq!(lists.pass_view(), None, "no drawer after the loop");
+        // A panicking step ends the loop with its payload (the thread then turns the pass off).
+        let l = Lists::default();
+        l.publish(FrameList { frame: 1, ..Default::default() });
+        assert!(pass_loop(&l, || {}, |x: Option<FrameList>| assert!(x.is_none(), "step panics"), || false).is_err());
+        assert_eq!(l.pass_view(), None, "no drawer after a panic");
     }
 
     /// A panic inside the screen pass is caught at the PresentX
@@ -4672,7 +6116,7 @@ mod tests {
         let g = HostGeometry { vertices: Vec::new(), indices: vec![0, 1, 2], raw_vb: Some(vb), vb_place: 0 };
         let curve = [0.22, 0.3, 0.1, 0.2, 0.01, 0.3, 4.0];
         let pi = std::f32::consts::PI;
-        let light = lighting::Lighting { dir: [0.0, 0.0, 1.0], radiance: [pi; 3], mult: pi, amb_sky: [0.0; 3], amb_ground: [0.0; 3], exposure: 1.0, ev: 0.0, bias: 0.0, strength: 1.0, moon: false, sky_scale: 1.0, curve, fog: [0.0; 3] };
+        let light = lighting::Lighting { dir: [0.0, 0.0, 1.0], radiance: [pi; 3], mult: pi, amb_sky: [0.0; 3], amb_ground: [0.0; 3], exposure: 1.0, ev: 0.0, bias: 0.0, ev_range: [-32.0, 32.0], strength: 1.0, moon: false, sky_scale: 1.0, curve, curve_dark: curve, fog: [0.0; 3] };
         let mut list = FrameList { frame: 1, draws: vec![rec], cameras: vec![Camera { viewport: 1, view: id, proj: PROJ }], main: Some(1), new_geoms: vec![(geom, g)], light: Some(light), ..Default::default() };
         let grey = |pass: &mut Pass, list: &mut FrameList| -> i32 {
             pass.draw(list, &mut |_| None, true).unwrap();
@@ -4748,8 +6192,10 @@ mod tests {
     #[test]
     fn screen_switch() {
         assert_eq!(parse_screen("1"), None);
-        assert_eq!(parse_screen("screen"), Some(ScreenOptions { wire: false, stage: None, skin: true, states: true, sky: true, water: true, peds: false, decal_hold: true }));
+        assert_eq!(parse_screen("screen"), Some(ScreenOptions { wire: false, stage: None, skin: true, states: true, sky: true, water: true, peds: false, decal_hold: true, decals: true }));
         assert_eq!(parse_screen("screen,decalhold=off").map(|o| o.decal_hold), Some(false));
+        assert_eq!(parse_screen("screen,decals=off").map(|o| o.decals), Some(false));
+        assert_eq!(parse_screen("screen,decals=off,decals=on").map(|o| o.decals), Some(true));
         assert_eq!(parse_screen("screen,peds=on").map(|o| o.peds), Some(true));
         // Skinrules= is not a stage; default 0; hex; last wins; junk is 0.
         assert_eq!(parse_screen("screen,skinrules=b").map(|o| o.stage), Some(None));
@@ -4757,7 +6203,7 @@ mod tests {
         assert_eq!(parse_skin_rules("screen,skinrules=b"), 0xB);
         assert_eq!(parse_skin_rules("screen,skinrules=0x3, skinrules=9"), 9);
         assert_eq!(parse_skin_rules("screen,skinrules=zz"), 0);
-        assert_eq!(parse_screen("screen,wire,pass=67,skin=off"), Some(ScreenOptions { wire: true, stage: Some(67), skin: false, states: true, sky: true, water: true, peds: false, decal_hold: true }));
+        assert_eq!(parse_screen("screen,wire,pass=67,skin=off"), Some(ScreenOptions { wire: true, stage: Some(67), skin: false, states: true, sky: true, water: true, peds: false, decal_hold: true, decals: true }));
         assert_eq!(parse_screen("screen,water=off").map(|o| o.water), Some(false));
         assert_eq!(parse_screen("screen,sky=off").map(|o| o.sky), Some(false));
         assert_eq!(parse_screen("screen,state=off").map(|o| o.states), Some(false));

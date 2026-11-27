@@ -615,8 +615,8 @@ impl<'a> Lower<'a> {
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
-                let index = self.heap_index(*load, *first, sampler)?;
-                let h = self.s.heap_handle(self.cur, index, sampler, props);
+                let (index, own) = self.own_index(*load, *first, sampler, props)?;
+                let h = if own { self.s.heap_handle_own(self.cur, index, props) } else { self.s.heap_handle(self.cur, index, sampler, props) };
                 self.handles.insert(key, h);
                 Ok(h)
             }
@@ -684,9 +684,9 @@ impl<'a> Lower<'a> {
                     };
                     let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
                     let here = std::mem::replace(&mut self.cur, at);
-                    let index = self.heap_index(*load, *first, sampler);
+                    let index = self.own_index(*load, *first, sampler, props);
                     self.cur = here;
-                    incoming.push((index?, at));
+                    incoming.push((index?.0, at));
                 }
                 let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
                 let phi = self.s.m.phi(join, self.s.t.i32);
@@ -712,8 +712,10 @@ impl<'a> Lower<'a> {
     }
 
     pub(super) fn heap_slot(&mut self, src: &Source, sampler: bool) -> Result<V, Why> {
+        // A buffer's slot: confined as a raw buffer's handle is (BND1).
+        let props = (11, 0);
         match src {
-            Source::Loaded { load, first } => self.heap_index(*load, *first, sampler),
+            Source::Loaded { load, first } => Ok(self.own_index(*load, *first, sampler, props)?.0),
             Source::Phi { block, args } => {
                 let mut incoming = Vec::new();
                 for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
@@ -725,9 +727,9 @@ impl<'a> Lower<'a> {
                     };
                     let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
                     let here = std::mem::replace(&mut self.cur, at);
-                    let index = self.heap_index(*load, *first, sampler);
+                    let index = self.own_index(*load, *first, sampler, props);
                     self.cur = here;
-                    incoming.push((index?, at));
+                    incoming.push((index?.0, at));
                 }
                 let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
                 let phi = self.s.m.phi(join, self.s.t.i32);
@@ -827,6 +829,42 @@ impl<'a> Lower<'a> {
         let byte = self.s.m.bin(c, Bin::Add, element, off);
         let byte = self.s.m.bin(c, Bin::Add, byte, bias);
         Ok((self.s.heap_handle(c, raw, false, (props, 0)), byte))
+    }
+
+    /// [`Lower::heap_index`] as the draw's own ([`super::super::Options::confine`],
+    /// BND1); true when the index needs no bound any more. Off, or for a
+    /// sampler (the sampler heap is the draw's own list, whole): the
+    /// index as it is. On:
+    /// - a view picked from the heap by an index the program computed (a
+    ///   `ResourceHeap` parameter): [`super::super::shader::Shader::confined`];
+    /// - a table's descriptor: at a fixed slot the program's resource list
+    ///   names (the host's block of that table reaches past every one of
+    ///   them and holds a view or typed null of ours at each), the index
+    ///   as it is; at a fixed slot past them, the null of `props`' kind;
+    ///   at a computed offset, refused (no bridged program has one).
+    pub(super) fn own_index(&mut self, load: Site, first: u8, sampler: bool, props: (u32, u32)) -> Result<(V, bool), Why> {
+        let index = self.heap_index(load, first, sampler)?;
+        if sampler || !super::super::CONFINE.with(std::cell::Cell::get) {
+            return Ok((index, false));
+        }
+        let a = *self.scalar.get(&load).ok_or("an untracked descriptor load")?;
+        let Some(rp) = self.x.native.layout.get(a.param).copied() else {
+            return Ok((index, false));
+        };
+        match rp.root {
+            RootType::ResourceHeap => Ok((self.s.confined(self.cur, index, props), true)),
+            RootType::Table => {
+                let li: &Inst = &self.x.p.blocks[load.0].insts[load.1];
+                let fixed = matches!(&li.fields, Fields::Smem { soffset: Operand::Scalar { code: NULL, .. }, .. }) && a.dynamic.is_none() && a.rel.is_none();
+                if !fixed {
+                    return Err("a table descriptor at a computed offset (confined)");
+                }
+                let slot = a.offset.wrapping_add(4 * u32::from(first)) / 32;
+                let named = self.x.native.used.iter().filter(|u| u.root == RootType::Table && u.user_data == rp.user_data).map(|u| u.table_offset_dwords / 8 + 1).max().unwrap_or(0);
+                if slot < named { Ok((index, false)) } else { Ok((self.s.null_index(self.cur, props), true)) }
+            }
+            _ => Ok((index, false)),
+        }
     }
 
     /// The heap index of the descriptor at dword `first` of what the scalar

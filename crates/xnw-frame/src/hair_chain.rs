@@ -28,6 +28,8 @@ use xnw_formats::framepack::{self as fp, SlotView, kind, reason, view};
 use xnw_world::compute as cr;
 use xnw_world::preskin::{self as ps, Kind};
 
+use xnw_core::pair::fold;
+
 use crate::pack::Pack;
 
 /// Frame-table (root 0) slots the chain programs read beside the hair
@@ -43,7 +45,6 @@ pub const SIM_SLOT: u32 = 33;
 pub const SCALP_SLOT: u32 = 7;
 /// The collision shapes `CS_UpdatePosePosition` loops over (kind 59 spans).
 pub const SPAN_SLOT: u32 = 22;
-const GPU_ALIAS: u64 = 0x4_0000_0000;
 const BONE: usize = 48;
 
 /// A strand-input program of the chain, by its name. With
@@ -119,21 +120,25 @@ pub struct Chain {
     /// at its title address; empty without the sim.
     pub sim_at: u64,
     pub sim: Vec<u8>,
+    /// HAIR7 ([`run_on_device`]): the pool's length; it stays on the runner's
+    /// device at `pool_at` (`pool` is empty, nothing is read back).
+    pub pool_len: u64,
+    pub on_device: bool,
 }
 
 impl Chain {
     pub fn line(&self) -> String {
         let ok = self.steps.iter().filter(|s| s.error.is_none() && s.skipped.is_none()).count();
         format!(
-            "hair chain: {} of {} dispatches run (dropped {:?}{}), {:.2} s on the device, pool {} B at {:#x} ({} non-zero after)",
+            "hair chain: {} of {} dispatches run (dropped {:?}{}), {:.2} s on the device, pool {} B at {:#x} ({})",
             ok,
             self.steps.len(),
             self.dropped,
             if self.removed { "; the device failed, the chain ended" } else { "" },
             self.steps.iter().map(|s| s.seconds).sum::<f64>(),
-            self.pool.len(),
+            self.pool_len,
             self.pool_at,
-            self.pool.iter().filter(|b| **b != 0).count()
+            if self.on_device { "kept on the device".to_string() } else { format!("{} non-zero after", self.pool.iter().filter(|b| **b != 0).count()) }
         )
     }
 }
@@ -164,7 +169,7 @@ fn palette(p: &Pack, v: &SlotView, lacks: &mut BTreeSet<String>) -> Vec<u8> {
     let copied = b.len();
     let (mut spans, mut bones) = (0, 0);
     for r in p.data.refs.iter().filter(|r| r.owner & fp::HOOK != 0 && r.kind == kind::PALETTE) {
-        let off = (r.addr % GPU_ALIAS).wrapping_sub(v.addr % GPU_ALIAS);
+        let off = fold(r.addr).wrapping_sub(fold(v.addr));
         let Some(bytes) = p.bytes_of(r) else { continue };
         if off % BONE as u64 != 0 || off + bytes.len() as u64 > v.bytes {
             continue;
@@ -180,7 +185,7 @@ fn palette(p: &Pack, v: &SlotView, lacks: &mut BTreeSet<String>) -> Vec<u8> {
     // v2.9 kind 58: the bones each strand record names (from +0xe8 and +0xec).
     let (mut windows, mut wbones) = (0, 0);
     for r in p.data.refs.iter().filter(|r| r.kind == kind::STRAND_PALETTE) {
-        let off = (r.addr % GPU_ALIAS).wrapping_sub(v.addr % GPU_ALIAS);
+        let off = fold(r.addr).wrapping_sub(fold(v.addr));
         let Some(bytes) = p.bytes_of(r) else { continue };
         if off + bytes.len() as u64 > v.bytes {
             continue;
@@ -204,7 +209,7 @@ fn spans(p: &Pack, v: &SlotView, lacks: &mut BTreeSet<String>) -> Vec<u8> {
     let mut b = Vec::new();
     let mut n = 0;
     for r in p.data.refs.iter().filter(|r| r.kind == kind::STRAND_SPAN) {
-        let off = (r.addr % GPU_ALIAS).wrapping_sub(v.addr % GPU_ALIAS);
+        let off = fold(r.addr).wrapping_sub(fold(v.addr));
         let Some(bytes) = p.bytes_of(r).filter(|b| !b.is_empty()) else { continue };
         if off + bytes.len() as u64 > v.bytes {
             continue;
@@ -366,13 +371,24 @@ pub fn names_in(dir: &std::path::Path) -> Option<HashMap<u128, String>> {
 /// `names` and the translations in `programs` (filled as met); `cpu`:
 /// each PreSkinSimGuides step's pool read back against the CPU rule.
 pub fn run_on(p: &Pack, runner: &mut cr::Runner, names: &HashMap<u128, String>, programs: &mut Programs, cpu: bool) -> Result<Chain, String> {
+    run_with(p, runner, names, programs, cpu, true)
+}
+
+/// HAIR7: [`run_on`] leaving the pool on the runner's device (the live
+/// path: the strand draws read it there, `Runner::resource`): nothing is
+/// read back (47 MB a frame).
+pub fn run_on_device(p: &Pack, runner: &mut cr::Runner, names: &HashMap<u128, String>, programs: &mut Programs) -> Result<Chain, String> {
+    run_with(p, runner, names, programs, false, false)
+}
+
+fn run_with(p: &Pack, runner: &mut cr::Runner, names: &HashMap<u128, String>, programs: &mut Programs, cpu: bool, read_pool: bool) -> Result<Chain, String> {
     runner.forget();
     let names = names.clone();
     let list = dispatches(p, &names);
     let first = list.first().ok_or("hair chain: no strand-input dispatch in the frame")?.0;
     let table = |sink: u32| p.tables(sink).into_iter().find(|t| t.0 == 0).map(|t| t.2).unwrap_or_default();
     let pool_view = table(first).into_iter().find(|v| v.slot == POOL_SLOT).ok_or("hair chain: no pool view at slot 36")?;
-    let mut chain = Chain { pool_at: pool_view.addr, ..Chain::default() };
+    let mut chain = Chain { pool_at: pool_view.addr, pool_len: pool_view.bytes, on_device: !read_pool, ..Chain::default() };
     chain.lacks.insert(format!("the pool (slot 36, {} B at {:#x}): an unordered view, not captured: zeros (a first frame without history)", pool_view.bytes, pool_view.addr));
     let mut heap = strand_heap(p, &mut chain.lacks);
     // The runner's heap ends at its bound (card safety); the records name
@@ -581,6 +597,9 @@ pub fn run_on(p: &Pack, runner: &mut cr::Runner, names: &HashMap<u128, String>, 
         chain.sim = if runner.held(k).is_some() && !chain.removed { runner.read(k)? } else { Vec::new() };
         chain.sim.truncate(v.bytes as usize);
     }
+    if !read_pool {
+        return Ok(chain);
+    }
     chain.pool = if runner.held(pool_key).is_some() && !chain.removed { runner.read(pool_key)? } else { vec![0; pool_view.bytes as usize] };
     chain.pool.truncate(pool_view.bytes as usize);
     Ok(chain)
@@ -655,7 +674,7 @@ pub fn guides_against_cpu(records: &[u8], index: u32, heap: &[(u32, Named)], pal
 /// dispatch, the lacks and the census with the chain's pool.
 pub fn chain_cmd(dir: &std::path::Path) -> Result<Chain, String> {
     let p = Pack::open(dir)?.ok_or("no pack")?;
-    let host = xnw_gpu::host::Host::new(None).map_err(|e| format!("hair chain: device: {e}"))?;
+    let host = xnw_gpu::host::Host::new(crate::replay::hw_agility().as_deref()).map_err(|e| format!("hair chain: device: {e}"))?;
     println!("hair chain: adapter {}", host.caps.adapter);
     if let Some(line) = crate::head_graph::prepare(dir, &host) {
         println!("{line}");
@@ -705,10 +724,10 @@ pub fn chain_cmd(dir: &std::path::Path) -> Result<Chain, String> {
                 m.entry(g.pipeline).or_default().push(names.get(&g.container).cloned().unwrap_or_else(|| format!("{:08x}", g.container >> 96)));
                 m
             });
-            let (lo, hi) = (v7.addr % GPU_ALIAS, v7.addr % GPU_ALIAS + v7.bytes);
+            let (lo, hi) = (fold(v7.addr), fold(v7.addr) + v7.bytes);
             for s in &p.data.sinks {
                 for (root, _, views) in p.tables(s.index) {
-                    for v in views.iter().filter(|v| v.layout == view::UNORDERED && v.addr % GPU_ALIAS < hi && v.addr % GPU_ALIAS + v.bytes > lo) {
+                    for v in views.iter().filter(|v| v.layout == view::UNORDERED && fold(v.addr) < hi && fold(v.addr) + v.bytes > lo) {
                         println!("  slot 7 range: sink {} op {} root {root} slot {} {:#x}+{} {:?}", s.index, s.op, v.slot, v.addr, v.bytes, prog.get(&s.pipeline));
                     }
                 }

@@ -110,6 +110,13 @@ pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     S_OK
 }
 
+/// PASS1: a queue signal deferred behind a submission sent without a wait
+/// (`host::Host::signal_after` took a reference): made, and the reference let go.
+pub(crate) fn signal_held(this: This, value: u64) {
+    signal(this, value);
+    release(this);
+}
+
 extern "system" fn creation_flags(this: This) -> u32 {
     fence(this).flags
 }

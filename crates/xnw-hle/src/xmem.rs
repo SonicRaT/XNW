@@ -80,19 +80,26 @@ pub extern "system" fn XMemVirtualAlloc(base: *mut c_void, size: usize, kind: u3
     let started = xnw_core::perf::start();
     // SAFETY: the title's own arguments, cleaned of console bits; the
     // parameter points at `requirements`, which outlives the call.
-    let mut call = || unsafe {
+    let mut call = |len: usize| unsafe {
         virtual_alloc2()(
             GetCurrentProcess(),
             base,
-            size,
+            len,
             host_kind,
             protect,
             if constrained { &mut parameter } else { std::ptr::null_mut() },
             constrained.into(),
         )
     };
+    // GRP1: placement and pairing of reservations at an address of our
+    // choice, one at a time (the pair's two calls must meet nothing between).
+    let _placing = constrained.then(|| lock(&PLACING));
     // A commit inside one of the title's regions is counted there.
-    let at = if constrained { call() } else { tracked(base as usize, size, call) };
+    let at = if constrained {
+        place(size, kind, asked, placeholder, &mut call)
+    } else {
+        tracked(base as usize, size, || call(size))
+    };
     if !at.is_null() && !placeholder && constrained {
         let committed = if host_kind & MEM_COMMIT != 0 { committed_in(at as usize, at as usize + size) } else { 0 };
         lock(&REGIONS).insert(at as usize, (size, committed));
@@ -707,6 +714,56 @@ impl Pair {
 /// The last reservation at an address of our choice, if a CPU-view
 /// candidate: a 64 KiB-page placeholder the title asked to be accessible.
 static LAST_RESERVATION: std::sync::Mutex<Option<(usize, usize, u32)>> = std::sync::Mutex::new(None);
+/// Held across one reservation at an address of our choice ([`place`] and
+/// [`pair_reservation`]).
+static PLACING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// The placeholder reserved right above the last CPU-view candidate, same
+/// size and kind: (address, size, kind). Taken by the GPU-view request that
+/// follows the candidate, released by any other reservation.
+static PENDING_GPU: std::sync::Mutex<Option<(usize, usize, u32)>> = std::sync::Mutex::new(None);
+
+/// A reservation at an address of our choice, `call(len)` the host call.
+/// GRP1: the pair's two views were placed one call apart, each at the
+/// lowest free range; a host mapping made by another thread in between
+/// `paired reservation 0x100000000 <-> 0x667200000`, a test run
+/// `<-> 0x8df800000`, the next reservation then at 0x500000000) moved the
+/// GPU view off `cpu + len`, where the GPU side folded it (then a fixed
+/// 0x4_0000_0000 in xnw-frame and xnw-world, now `xnw_core::pair`): every bridged row lost its
+/// group count for the whole run. So the first CPU-view candidate takes
+/// twice its size in one call, the upper half split off and held for the
+/// GPU view.
+fn place(size: usize, kind: u32, protect: u32, placeholder: bool, call: &mut impl FnMut(usize) -> *mut c_void) -> *mut c_void {
+    let accessible = protect & 0xff != PAGE_NOACCESS;
+    let pending = lock(&PENDING_GPU).take();
+    if let Some((at, len, k)) = pending {
+        if placeholder && !accessible && len == size && k == kind {
+            return at as *mut c_void;
+        }
+        // SAFETY: our own placeholder, never handed out.
+        unsafe { VirtualFree(at as *mut c_void, 0, MEM_RELEASE) };
+    }
+    if !(placeholder && accessible) || with_physical(|p| p.pair.is_some()) {
+        return call(size);
+    }
+    let Some(twice) = size.checked_mul(2) else {
+        return call(size);
+    };
+    let at = call(twice);
+    if at.is_null() {
+        xnw_core::warn!("paired reservation: {twice:#x} bytes in one range failed ({}); the GPU view goes where the host puts it", last_error());
+        return call(size);
+    }
+    let upper = at as usize + size;
+    // SAFETY: splits the placeholder just reserved in two.
+    if unsafe { VirtualFree(upper as *mut c_void, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) } == 0 {
+        xnw_core::warn!("paired reservation: splitting {at:p} failed ({}); the GPU view goes where the host puts it", last_error());
+        // SAFETY: the placeholder just reserved, whole.
+        unsafe { VirtualFree(at, 0, MEM_RELEASE) };
+        return call(size);
+    }
+    *lock(&PENDING_GPU) = Some((upper, size, kind));
+    at
+}
 
 /// Called for every reservation at an address of our choice, `at` null if
 /// it failed; `protect` as the title asked.
@@ -729,6 +786,13 @@ fn pair_reservation(at: usize, size: usize, kind: u32, protect: u32, placeholder
             physical.pair = Some(Pair { cpu, gpu: at, len });
             xnw_gpu::d3d12x::use_pair(cpu, at, len);
             xnw_core::info!("paired reservation {cpu:#x} <-> {at:#x} ({len:#x} bytes, kind {cpu_kind:#x})");
+            if at != cpu + len {
+                xnw_core::warn!("paired reservation: the GPU view is not right above the CPU view (GRP1); the GPU side folds by the pair published");
+            }
+            // ALIAS1: the GPU side's folds (xnw-frame, xnw-world) read it from here.
+            if at > cpu && !xnw_core::pair::publish(xnw_core::pair::Pair { cpu: cpu as u64, gpu: at as u64, len: len as u64 }) {
+                xnw_core::warn!("paired reservation: a pair {:x?} was published before; it stays", xnw_core::pair::live());
+            }
         }
     });
 }
@@ -1206,12 +1270,23 @@ mod physical_tests {
         let pair = (0..8)
             .find_map(|_| {
                 let cpu = XMemVirtualAlloc(std::ptr::null_mut(), size, MEM_RESERVE | PAGES_64K, 0x21, PAGE_READWRITE) as usize;
+                // GRP1: a host reservation by another thread between the
+                // two, lowest fit in the same range: before, it took
+                // `cpu + size` and the GPU view went above it.
+                let mut req = MemAddressRequirements { lowest: 1 << 32, highest: (1 << 40) - 1, alignment: 0 };
+                let mut par = MemExtendedParameter { kind: 1, pointer: &mut req };
+                // SAFETY: a plain reservation; the parameter outlives the call.
+                let host = unsafe { virtual_alloc2()(GetCurrentProcess(), std::ptr::null_mut(), size, MEM_RESERVE, PAGE_NOACCESS, &mut par, 1) };
                 let gpu = XMemVirtualAlloc(std::ptr::null_mut(), size, MEM_RESERVE | PAGES_64K, GRAPHICS, GPU_NO_ACCESS) as usize;
+                // SAFETY: the reservation just made.
+                unsafe { VirtualFree(host, 0, MEM_RELEASE) };
                 let pair = Pair { cpu, gpu, len: size };
                 (with_physical(|p| p.pair) == Some(pair)).then_some(pair)
             })
             .expect("the pair is recognised");
-        assert_ne!(pair.cpu, pair.gpu);
+        // GRP1: the GPU view right above the CPU view, whatever else the
+        // process maps meanwhile.
+        assert_eq!(pair.gpu, pair.cpu + size);
         let mut n = 3usize;
         let mut pages = [0usize; 3];
         assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);

@@ -20,8 +20,9 @@
 //!   CPU is.
 //!
 //! Both off by default; with neither (nor `XNW_AB` or
-//! `XNW_STOP_WORLD_FRAMES`, `ab.rs`, which count its frames) the detour is
-//! not installed.
+//! `XNW_STOP_WORLD_FRAMES`, `ab.rs`, which count its frames, nor
+//! `XNW_ENCODE_TIME` or `XNW_PATCH=noencode`, `encode.rs`, whose lines
+//! close with the window) the detour is not installed.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
@@ -34,7 +35,14 @@ pub(crate) const ENTRY_RVA: usize = 0x43c3890;
 pub(crate) const ENTRY_BYTES: [u8; 14] = [0x8B, 0x51, 0x18, 0x48, 0x8B, 0x41, 0x08, 0x48, 0x8B, 0x49, 0x10, 0x48, 0xFF, 0xE0];
 
 /// Stage ids are below this (the largest queued is 90); larger ones share the last slot.
-const STAGES: usize = 128;
+pub(crate) const STAGES: usize = 128;
+/// No stage callback runs on the thread.
+pub(crate) const NO_STAGE: usize = STAGES - 1;
+
+thread_local! {
+    /// The stage whose callback runs on this thread now (`encode.rs` splits its rows by it).
+    pub(crate) static STAGE: std::cell::Cell<usize> = const { std::cell::Cell::new(NO_STAGE) };
+}
 /// The frame's last stage (frame end 0x142246A40, queued by 0x140511A40).
 const FRAME_END: usize = 64;
 /// Frames per line.
@@ -76,6 +84,19 @@ fn tsc() -> u64 {
 pub(crate) fn cycles_per_second() -> f64 {
     let (t, c) = *START.get_or_init(|| (Instant::now(), tsc()));
     (tsc().wrapping_sub(c) as f64 / t.elapsed().as_secs_f64().max(1e-9)).max(1.0)
+}
+
+/// Nanoseconds per cycle, times 2^20 (0: not measured yet); renewed with every line.
+static NS_PER_CYCLE_Q20: AtomicU64 = AtomicU64::new(0);
+
+/// `cycles` of thread time in nanoseconds, at the last measured rate.
+fn cycles_ns(cycles: u64) -> u64 {
+    let mut q = NS_PER_CYCLE_Q20.load(Ordering::Relaxed);
+    if q == 0 {
+        q = (1e9 / cycles_per_second() * (1u64 << 20) as f64) as u64;
+        NS_PER_CYCLE_Q20.store(q, Ordering::Relaxed);
+    }
+    ((u128::from(cycles) * u128::from(q)) >> 20) as u64
 }
 
 pub(crate) fn thread_cycles() -> u64 {
@@ -153,6 +174,7 @@ pub(crate) extern "system" fn hook(entry: usize) -> usize {
     let stage = (unsafe { ((entry + 0x1C) as *const u32).read() } as usize).min(STAGES - 1);
     // SAFETY: the trampoline made at install: the function's own bytes.
     let original: extern "system" fn(usize) -> usize = unsafe { std::mem::transmute(ORIGINAL.load(Ordering::Relaxed)) };
+    STAGE.with(|s| s.set(stage));
     let result = if SKIP[stage].load(Ordering::Relaxed) {
         SKIPPED[stage].fetch_add(1, Ordering::Relaxed);
         0
@@ -168,12 +190,16 @@ pub(crate) extern "system" fn hook(entry: usize) -> usize {
                 CB_CALLS[i].fetch_add(1, Ordering::Relaxed);
             }
         }
-        WALL_NS[stage].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let wall = t0.elapsed().as_nanos() as u64;
+        WALL_NS[stage].fetch_add(wall, Ordering::Relaxed);
+        xnw_core::framewall::add(xnw_core::framewall::STAGE_WALL, wall);
+        xnw_core::framewall::add(xnw_core::framewall::STAGE_CPU, cycles_ns(cycles));
         CALLS[stage].fetch_add(1, Ordering::Relaxed);
         r
     } else {
         original(entry)
     };
+    STAGE.with(|s| s.set(NO_STAGE));
     if !FIRST.swap(true, Ordering::Relaxed) {
         xnw_core::info!("title stages: first callback, stage {stage}, at {:.1} s", START.get().map_or(0.0, |s| s.0.elapsed().as_secs_f64()));
     }
@@ -181,6 +207,11 @@ pub(crate) extern "system" fn hook(entry: usize) -> usize {
         frame_end(FRAMES.fetch_add(1, Ordering::Relaxed) + 1);
     }
     result
+}
+
+/// World frames so far (stage 64 ends one).
+pub(crate) fn world_frames() -> u64 {
+    FRAMES.load(Ordering::Relaxed)
 }
 
 /// World frames in the meter's open window.
@@ -207,6 +238,7 @@ fn frame_end(n: u64) {
             xnw_core::info!("{}", take_callback_line(w));
         }
     }
+    crate::encode::window_end(w, &if crate::ab::armed() { format!(" [{}]", crate::ab::phase()) } else { String::new() });
     match act {
         crate::ab::At::Switch => crate::ab::switch(n),
         crate::ab::At::Stop => crate::ab::stop(n),
@@ -232,13 +264,24 @@ fn take_line(frames: u64) -> String {
     let ms = |c: u64| c as f64 / hz * 1000.0 / f;
     let by: Vec<String> = rows.iter().map(|&i| format!("{i} {:.2} ({:.1})", ms(cycles[i]), calls[i] as f64 / f)).collect();
     let skips: Vec<String> = (0..STAGES).filter(|&i| skipped[i] != 0).map(|i| format!("{i} x{:.1}", skipped[i] as f64 / f)).collect();
+    // WALL1: the six longest by wall (a stage's wall above its CPU is a wait inside it); the rate for the frame wall line.
+    NS_PER_CYCLE_Q20.store((1e9 / hz * (1u64 << 20) as f64) as u64, Ordering::Relaxed);
     format!(
-        "title stages: {frames} frames, cpu ms a frame by stage (calls a frame): {}; all {:.2} cpu, {:.2} wall; skipped a frame: {}",
+        "title stages: {frames} frames, cpu ms a frame by stage (calls a frame): {}; all {:.2} cpu, {:.2} wall; wall ms a frame, longest: {}; skipped a frame: {}",
         if by.is_empty() { "none".to_owned() } else { by.join(", ") },
         ms(cycles.iter().sum()),
         wall.iter().sum::<u64>() as f64 / 1e6 / f,
+        wall_top(&wall, &cycles, hz, f),
         if skips.is_empty() { "none".to_owned() } else { skips.join(", ") }
     )
+}
+
+/// The six stages longest by wall: `stage wall (cpu)` ms a frame; "none" without any.
+fn wall_top(wall: &[u64], cycles: &[u64], hz: f64, f: f64) -> String {
+    let mut rows: Vec<usize> = (0..wall.len()).filter(|&i| wall[i] != 0).collect();
+    rows.sort_by(|a, b| wall[*b].cmp(&wall[*a]).then(a.cmp(b)));
+    let top: Vec<String> = rows.iter().take(6).map(|&i| format!("{i} {:.2} ({:.2})", wall[i] as f64 / 1e6 / f, cycles[i] as f64 / hz * 1000.0 / f)).collect();
+    if top.is_empty() { "none".to_owned() } else { top.join(", ") }
 }
 
 /// The per-callback line for the last `frames` frames: the stages that ran
@@ -287,6 +330,18 @@ mod tests {
         assert_eq!(names, ["36 title+0x4413b0", "36 title+0xd3ac60"], "{line}");
         assert!(rows.contains("(1.0)") && !rows.contains("0x11544b0"), "{line}");
         assert!(take_callback_line(2).ends_with(": none"), "the sums start again");
+    }
+
+    /// The six longest stages by wall, each with its CPU beside it.
+    #[test]
+    fn the_longest_stages_by_wall_are_named() {
+        let (mut wall, mut cycles) = (vec![0u64; STAGES], vec![0u64; STAGES]);
+        for (stage, w_ms, c_ms) in [(69u64, 60, 36), (67, 20, 16), (73, 24, 12), (76, 10, 10), (1, 12, 10), (70, 8, 6), (74, 6, 6), (11, 2, 2)] {
+            // 2 frames; 1000 cycles a millisecond.
+            (wall[stage as usize], cycles[stage as usize]) = (w_ms * 1_000_000, c_ms * 1000);
+        }
+        assert_eq!(wall_top(&wall, &cycles, 1e6, 2.0), "69 30.00 (18.00), 73 12.00 (6.00), 67 10.00 (8.00), 1 6.00 (5.00), 76 5.00 (5.00), 70 4.00 (3.00)");
+        assert_eq!(wall_top(&[0; 4], &[0; 4], 1e6, 2.0), "none");
     }
 
     #[test]

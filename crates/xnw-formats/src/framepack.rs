@@ -208,6 +208,10 @@ pub mod reason {
     /// A view the GPU writes (unordered access) at a dispatch sink:
     /// its content does not exist on the CPU; not read.
     pub const GPU_OUTPUT: u32 = 10;
+    /// HAIR7, a live mode only: a large buffer view recorded by address and
+    /// length, not read on the title's thread; the list thread binds it in
+    /// place in title memory (`XNW_ZEROCOPY`) or reads it there.
+    pub const IN_PLACE: u32 = 11;
     /// Bytes present (whole or cut).
     pub fn has_bytes(r: u32) -> bool {
         r == OK || r == CUT
@@ -257,9 +261,16 @@ impl Ref {
     }
 }
 
+/// The records in the order [`FramePack::refs_of`] searches (frame scope
+/// first, then by owner, kind, slot); a pack kept in memory (the live
+/// modes) is sorted with it as refs.bin is.
+pub fn sort_refs(refs: &mut [Ref]) {
+    refs.sort_by_key(Ref::order);
+}
+
 /// refs.bin: the records sorted (frame scope first).
 pub fn encode_refs(refs: &mut [Ref]) -> Vec<u8> {
-    refs.sort_by_key(Ref::order);
+    sort_refs(refs);
     let mut out = Vec::with_capacity(refs.len() * REC_BYTES);
     for r in refs.iter() {
         r.encode(&mut out);
@@ -848,6 +859,9 @@ pub struct Manifest {
     pub bytes: Vec<(u16, u64, u64)>,
     /// (kind, reason, count).
     pub reasons: Vec<(u16, u32, u64)>,
+    /// The run's paired reservation (CPU view, GPU view, bytes; ALIAS1):
+    /// `None` in captures made before it was recorded.
+    pub pair: Option<[u64; 3]>,
 }
 
 impl Manifest {
@@ -861,6 +875,9 @@ impl Manifest {
         }
         for (k, r, n) in &self.reasons {
             let _ = writeln!(t, "reason\t{k}\t{r}\t{n}");
+        }
+        if let Some([c, g, l]) = self.pair {
+            let _ = writeln!(t, "pair\t{c:#x}\t{g:#x}\t{l:#x}");
         }
         t
     }
@@ -883,6 +900,10 @@ impl Manifest {
                 "dispatches" => m.dispatches = [n(1)? as u32, n(2)? as u32],
                 "bytes" => m.bytes.push((n(1)? as u16, n(2)?, n(3)?)),
                 "reason" => m.reasons.push((n(1)? as u16, n(2)? as u32, n(3)?)),
+                "pair" => {
+                    let h = |i: usize| f.get(i).and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()).ok_or_else(|| format!("manifest: bad line `{line}`"));
+                    m.pair = Some([h(1)?, h(2)?, h(3)?]);
+                }
                 _ => {}
             }
         }
@@ -1260,7 +1281,7 @@ mod tests {
     fn sample() -> FramePack {
         let r = |owner, kind, slot, len, reason, hash| Ref { owner, kind, slot, addr: 0x1_0000 + u64::from(slot), len, reason, hash };
         FramePack {
-            manifest: Manifest { version: VERSION, frame: 7, commit: "abc1234".into(), hook_draws: 2, sink_draws: 2, pairs: [0, 2, 0], unpaired_sinks: 0, dispatches: [3, 1600], bytes: vec![(kind::ROOTS, 2, 64)], reasons: vec![(kind::CBV, reason::UNREADABLE, 1)] },
+            manifest: Manifest { version: VERSION, frame: 7, commit: "abc1234".into(), hook_draws: 2, sink_draws: 2, pairs: [0, 2, 0], unpaired_sinks: 0, dispatches: [3, 1600], bytes: vec![(kind::ROOTS, 2, 64)], reasons: vec![(kind::CBV, reason::UNREADABLE, 1)], pair: Some([0x1_0000_0000, 0x6_6720_0000, 0x4_0000_0000]) },
             refs: vec![
                 r(1, kind::CBV, 0x20, 256, reason::UNREADABLE, 0),
                 r(0, kind::ROOTS, 3, 32, 0, 0x11),
@@ -1335,11 +1356,28 @@ mod tests {
     }
 
     #[test]
+    fn records_kept_in_memory_are_found_once_sorted() {
+        // LIVE1: the live take's records in push order (sink 0, frame scope, sink 1, sink 0).
+        let r = |owner: u32, k: u16| Ref { owner, kind: k, slot: 0, addr: 0, len: 0, reason: reason::OK, hash: u128::from(owner) };
+        let mut refs = vec![r(0, kind::IA), r(FRAME_SCOPE, kind::GSTATE), r(1, kind::IA), r(0, kind::DRAW_ARGS)];
+        let p = FramePack { refs: refs.clone(), ..FramePack::default() };
+        assert_ne!(p.refs_of(0).count(), 2, "unsorted, the search misses records");
+        sort_refs(&mut refs);
+        let p = FramePack { refs, ..FramePack::default() };
+        assert_eq!(p.refs_of(0).count(), 2);
+        assert_eq!(p.refs_of(FRAME_SCOPE).map(|r| r.kind).collect::<Vec<_>>(), [kind::GSTATE]);
+        assert_eq!(p.refs_of(1).count(), 1);
+    }
+
+    #[test]
     fn manifest_round_trips_and_refuses_other_versions() {
         let m = sample().manifest;
         assert_eq!(Manifest::parse(&m.text()), Ok(m.clone()));
         assert!(Manifest::parse(&m.text().replace("version\t2", "version\t3")).is_err());
         assert!(Manifest::parse("frame\t1\n").is_err());
+        // ALIAS1: a manifest without the pair line (older captures) reads as `None`.
+        let old: String = m.text().lines().filter(|l| !l.starts_with("pair\t")).map(|l| format!("{l}\n")).collect();
+        assert_eq!(Manifest::parse(&old).map(|m| m.pair), Ok(None));
     }
 
     #[test]

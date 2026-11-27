@@ -1537,7 +1537,11 @@ pub fn vehicle_skin(dir: &std::path::Path, list: &mut FrameList, geoms: &mut Has
             }));
             start
         });
-        list.draws[i].remap = at;
+        // A vehicle program (as the live list build, worldprobe.rs: a row given the
+        // vehicle table is no ped): raw w/255 up to the first zero weight, no ped
+        // normalisation and out of the ped skip. The flag came from the bone count
+        // (205-bone car skeleton) and `props_unflag` leaves remapped rows flagged.
+        (list.draws[i].remap, list.draws[i].ped) = (at, false);
         // A one-bone row whose every vertex lands on a bone with a zero 3x3
         // (the compacted palette's zero entry, or a bone scaled to zero) is
         // a part the title does not show.
@@ -1845,10 +1849,18 @@ pub fn wheel_reads(slots: InstSlots, groups: u32, view: &dyn Fn(u16, u32) -> Opt
 /// The replay's skin sources for a loaded list: draw-time bones
 /// ([`hook_palettes_arg`]), then the vehicle rules of `--skin-rules`.
 pub fn skin_args(args: &[String], dir: &std::path::Path, list: &mut FrameList, geoms: &mut HashMap<GeomKey, (Vec<u8>, Vec<u32>)>) -> Result<usize, String> {
+    // `geomfill` (default on; `--geomfill=off`): rows the dump has no geometry for, from the pack.
+    if crate::geomfill::on(args) {
+        crate::geomfill::fill(dir, list, geoms)?;
+    }
     let n = hook_palettes_arg(args, dir, list)?;
     let rules = crate::replay::skin_rules_arg(args);
     vehicle_skin(dir, list, geoms, rules)?;
     vehicle_instances(dir, list, rules)?;
+    // `instrec` (default on; `--instrec=off`): the static instanced programs' rows from their records.
+    if crate::instrec::on(args) {
+        crate::instrec::record_instances(dir, list)?;
+    }
     Ok(n)
 }
 

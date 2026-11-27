@@ -66,7 +66,9 @@ pub fn render_cli(args: &[String]) -> Result<(), String> {
     // `--bridgeps on|<hash>+<hash>` or `XNW_WORLD_RENDER=...,bridgeps=...`: those rows by the title's own programs in our pass.
     let bridgeps = opt("--bridgeps").map_or_else(|| xnw_world::bridge::parse_switch(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default()), |v| xnw_world::bridge::parse_switch(&format!("bridgeps={v}")));
     // `--bridgems on|<hash>+<hash>` or `XNW_WORLD_RENDER=...,bridgems=...`: those rows from the title's mesh programs inside our pass; with `--bridgeps`, its pixel programs where named.
-    let bridgems = opt("--bridgems").map_or_else(|| xnw_world::bridge_ms::parse_switch(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default()), |v| xnw_world::bridge_ms::parse_switch(&format!("bridgems={v}")));
+    // `--cables=title` (or `cables=title` there): the cable rows from the title's mesh program.
+    let cables = if args.iter().any(|a| a == "--cables=title") { ",cables=title" } else { "" };
+    let bridgems = opt("--bridgems").map_or_else(|| xnw_world::bridge_ms::parse_switch(&format!("{}{cables}", std::env::var("XNW_WORLD_RENDER").unwrap_or_default())), |v| xnw_world::bridge_ms::parse_switch(&format!("bridgems={v}{cables}")));
     if !bridgems.is_empty() {
         return crate::bridge_ms::bridgems_cli(args, dir, &host, &mut pass, &bridgems, &bridgeps);
     }
@@ -156,7 +158,7 @@ pub fn render_one(args: &[String], dir: &std::path::Path, out: &std::path::Path,
         if let Some(g) = &gpucull {
             // `--near-rows k[,k..]`: these rows' batches near-flagged (VEH3 lab instrument).
             let near_rows: Vec<u32> = args.iter().position(|a| a == "--near-rows").and_then(|i| args.get(i + 1)).map(|v| v.split(',').filter_map(|k| k.trim().parse().ok()).collect()).unwrap_or_default();
-            let rep = crate::gpucull::fill(dir, &mut list, g != "--gpucull=cpu", &near_rows)?;
+            let rep = crate::gpucull::fill(dir, &mut list, g != "--gpucull=cpu", &near_rows, &crate::gpucull::hashes_arg(args))?;
             for l in crate::gpucull::lines(&rep, &list.cull) {
                 println!("  {l}");
             }
@@ -242,7 +244,7 @@ pub fn render_one(args: &[String], dir: &std::path::Path, out: &std::path::Path,
         }
         println!("{} (live list): {} records, {} main view; drawn {} ({} triangles, {} skinned, {} instanced with {} instances, {} without geometry); {} geometries; record {:.1} ms, GPU {:.1} ms -> {}", dir.display(), list.draws.len(), list.main_draws().count(), st.draws, st.triangles, st.skinned, st.instanced, st.instances, st.skipped, geoms.len(), st.record_ms, st.gpu_ms, out.display());
         let ts = std::mem::take(&mut pass.tex.stats);
-        println!("  textures ({:?}): {} draws textured, {} flat ({}), {} distinct slots of {} asked (table {}); layered draws {}", pass.tex.opts.mode, ts.bound_draws, ts.flat_draws, xnw_world::textures::TexTable::flat_split(&ts), ts.distinct, ts.demand, pass.tex.opts.slots, st.layered);
+        println!("  textures ({:?}): {} draws textured, {} flat ({}), {} distinct slots of {} asked (table {}); layered draws {}, tinted {}, painted {}, vehmat {}", pass.tex.opts.mode, ts.bound_draws, ts.flat_draws, xnw_world::textures::TexTable::flat_split(&ts), ts.distinct, ts.demand, pass.tex.opts.slots, st.layered, st.tinted, st.painted, st.vehmat);
         if pass.tex.opts.mode == xnw_world::TexMode::Provided {
             let c: Vec<u64> = counts.iter().map(|n| n.load(std::sync::atomic::Ordering::Relaxed)).collect();
             println!("  pack texels: {} slots asked, {} from pack origin, {} from stored texels, {} flat (no view, no row or no texels)", c[0], c[1], c[2], c[0] - c[1] - c[2]);
@@ -512,7 +514,7 @@ pub fn pass_from_args(args: &[String]) -> Result<(xnw_gpu::host::Host, xnw_world
     let t_setup = Instant::now();
     // The hardware adapter takes `XNW_AGILITY` too (shader model 6.6 for
     // the title's translated programs, as the live device has it).
-    let agility = if hw { std::env::var_os("XNW_AGILITY").filter(|p| !p.is_empty()).map(std::path::PathBuf::from) } else { None };
+    let agility = if hw { agility_dir() } else { None };
     let host = xnw_gpu::host::Host::new(agility.as_deref()).map_err(|e| e.to_string())?;
     let t_device = t_setup.elapsed().as_secs_f64() * 1e3;
     if host.caps.software == hw {
@@ -629,4 +631,20 @@ pub fn watchdog_disarm() {
 pub fn watch_line(what: &str) -> String {
     let ms = FRAME.lock().ok().and_then(|f| f.and_then(|(t, d)| Some(d.unwrap_or_else(|| t.elapsed().as_secs_f64() * 1e3)))).unwrap_or(0.0);
     xnw_gpu::gpuwatch::line(what, ms, &xnw_gpu::gpuwatch::take())
+}
+
+/// `XNW_AGILITY` (the Agility SDK directory), unless the software adapter
+/// is asked for (`XNW_ADAPTER=warp`): the hardware adapter needs it for
+/// shader model 6.6 on Windows 10, as the live device and `card-sweep`
+/// load it (FACE1: `head --adapter hw` refused every sink with "shader
+/// model 6.5 < 6.6" without it). Read after the tool sets `XNW_ADAPTER`.
+pub fn hw_agility() -> Option<std::path::PathBuf> {
+    if std::env::var("XNW_ADAPTER").is_ok_and(|v| v == "warp") {
+        return None;
+    }
+    agility_dir()
+}
+
+fn agility_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("XNW_AGILITY").filter(|p| !p.is_empty()).map(std::path::PathBuf::from)
 }

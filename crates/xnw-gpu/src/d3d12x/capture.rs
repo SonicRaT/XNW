@@ -650,6 +650,8 @@ pub(crate) fn log_luma(frame: u64, buffer: &ID3D12Resource, footprint: &D3D12_PL
         }
         buffer.Unmap(0, None);
         xnw_core::info!("luma: frame {frame} max {max} mean {:.2} lit {:.2} %", sum as f64 / n.max(1) as f64, 100.0 * lit as f64 / n.max(1) as f64);
+        // SW1: the flicker counter (a line every 600 frames, restarted at each live change).
+        xnw_core::live::luma(frame, sum as f64 / n.max(1) as f64);
         flash_mode() && flash_luma(frame, max, 100.0 * lit as f64 / n.max(1) as f64)
     }
 }

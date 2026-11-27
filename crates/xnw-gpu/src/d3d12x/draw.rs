@@ -908,10 +908,53 @@ impl State {
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
-        let Some(p) = pipeline::host_pipeline(self.pipeline as This) else {
+        let found = pipeline::host_pipeline(self.pipeline as This);
+        // FLK3: the kept Bink draw's planes, for the flicker counter.
+        if super::uikeep::take_bink()
+            && found.is_some()
+            && let Some(tables) = pipeline::texture_tables(self.pipeline as This)
+        {
+            let mut planes = Vec::new();
+            for (slot, offset) in tables {
+                if let Some(&Root::Table(table)) = self.roots_ref(false).get(usize::from(slot))
+                    && let Some(View::Shader(resource, _)) = descriptor::view(table + u64::from(offset) * 4)
+                {
+                    planes.push(resource);
+                }
+            }
+            super::uikeep::bink_planes(&planes);
+            // MOV1: its planes are uploaded at every refresh.
+            super::texture::note_movie_planes(&planes);
+        }
+        // KEEP1: a blit admitted as the consumer of kept UI work draws only
+        // from textures kept UI draws (or the title's own uploads) wrote.
+        // Checked from the programs' translations, so also while its host
+        // pipeline is not made (or the adapter refuses it: the inbox WARP).
+        if super::uikeep::take_consumer()
+            && let Some(tables) = pipeline::texture_tables(self.pipeline as This)
+        {
+            let mut sources = Vec::new();
+            for (slot, offset) in tables {
+                if let Some(&Root::Table(table)) = self.roots_ref(false).get(usize::from(slot))
+                    && let Some(View::Shader(resource, _)) = descriptor::view(table + u64::from(offset) * 4)
+                {
+                    sources.push(resource);
+                }
+            }
+            let pipeline = self.pipeline;
+            if !super::uikeep::consumer_ok(pipeline, &sources, || pipeline::names_of(pipeline as This)) {
+                return false;
+            }
+        }
+        let Some(p) = found else {
             count_gated(self.pipeline);
             return false;
         };
+        // KEEP1: the clear of a UI-written target the title recorded
+        // earlier in this frame is done with its first kept draw.
+        if super::uikeep::on() {
+            super::list::clear_held(list);
+        }
         if p.compute || p.mesh != mesh {
             once!("a draw or mesh dispatch with another kind of pipeline (mesh {mesh})");
             return false;
@@ -1943,10 +1986,21 @@ impl State {
     /// before any host check).
     /// An indirect compute dispatch (op INDIRECT_DISPATCH) hands the
     /// compute roots.
-    fn tap(&self, op: u8, count: u32, args: [u32; 4]) {
+    /// KEEP1: the draw being recorded, for the kept-UI instrument.
+    pub(crate) fn ui_seen(&self, kept: bool) {
+        let pipeline = self.pipeline;
+        super::uikeep::draw_seen(kept, self.targets.first().copied().unwrap_or(0), self.rt_size, pipeline as usize, || pipeline::names_of(pipeline as This));
+    }
+
+    pub(crate) fn tap(&self, op: u8, count: u32, args: [u32; 4]) {
         let set = if op == xnw_formats::framepack::op::INDIRECT_DISPATCH { &self.compute } else { &self.graphics };
+        // LIVE1: with a draw filter (a live mode) no indirect dispatch reaches the tap: neither
+        // the UI nor the strand chain reads one, and each read the frame table (1,054 sinks in pk10ui2 f4000).
         if let Some(f) = super::tap::get()
-            && (op == xnw_formats::framepack::op::INDIRECT_DISPATCH || super::tap::tap_want().is_none_or(|want| want(self.pipeline)))
+            && match super::tap::tap_want() {
+                None => true,
+                Some(want) => op != xnw_formats::framepack::op::INDIRECT_DISPATCH && want(self.pipeline),
+            }
         {
             // UI1: a Draw or DrawIndexed sink carries its IA views.
             let ia = matches!(op, xnw_formats::framepack::op::DRAW | xnw_formats::framepack::op::INDEXED).then(|| self.tap_ia());
@@ -1957,6 +2011,8 @@ impl State {
         if let Some((want, f)) = super::tap::draw_tap()
             && want(self.pipeline)
         {
+            // PERF4: the frame wall's sink slot (wanted draws only: no clock read on the others).
+            let _sink = xnw_core::framewall::scope(xnw_core::framewall::SINK);
             self.tap_roots(f, op, count, [0; 2], args, set);
         }
     }

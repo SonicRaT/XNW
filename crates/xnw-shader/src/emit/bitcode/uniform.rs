@@ -26,6 +26,19 @@
 //! computed in every lane from uniform ones (a root constant, a table
 //! slot) stay uniform, so most handles keep the cheaper uniform form.
 //!
+//! First-lane reads (SKIN2, with `masked`: WARP 1.0.22): a
+//! `WaveReadLaneFirst` of a value no two lanes compute apart is that value,
+//! so the call is taken out and its uses read the value. Mesh 40943a69
+//! (PS 957fc3f6's pair) with our pre-skin range bound (hidden vertices:
+//! all-ones positions, its branch `v_cmpx_eq_u32 exec, 0, v74` at 0xa50)
+//! left WARP's dispatch of row 942 (pk8a f1027) unfinished in every trial
+//! before; with this, 5 of its 9 first-lane reads go (0x48, 0x138, and the
+//! group's counts at 0x1660-0x168c; 0x808/0x80c and 0x127c/0x13b8 read
+//! joins of split lanes and stay) and the dispatch ends. Which read WARP
+//! stalled on is not known: the program has no loop and no barrier, and
+//! every read made the lane's own (`xnw shader-reduce .. code=ms-rfl`)
+//! ended it too. On the hardware adapter nothing changes.
+//!
 //! "Only some lanes run" a block when it is control dependent on a branch
 //! whose condition varies: it lies between such a branch and the branch's
 //! immediate post-dominator (a loop with a varying exit: the whole loop).
@@ -307,6 +320,41 @@ impl Module {
             marked += 1;
             lanes += usize::from(is(&varying, index));
         }
+        // First-lane reads of values no two lanes compute apart (the module
+        // notes), after the handles are marked (a handle the call indexed stays as marked).
+        let mut first: Vec<Option<V>> = vec![None; self.insts.len()];
+        let mut reads = 0;
+        for &i in order.iter().filter(|_| check) {
+            if ops[i as usize] != Some(118) {
+                continue;
+            }
+            if let Op::Call(_, args) = &self.insts[i as usize].op
+                && let Some(&x) = args.get(1)
+                && !is(&varying, x)
+            {
+                first[i as usize] = Some(x);
+                reads += 1;
+            }
+        }
+        if reads > 0 {
+            let to = |mut v: V| {
+                while let V::Inst(j) = v
+                    && let Some(x) = first[j as usize]
+                {
+                    v = x;
+                }
+                v
+            };
+            for inst in &mut self.insts {
+                super::opt::map_operands(&mut inst.op, to);
+            }
+            for blk in &mut self.blocks {
+                if let Some(Term::CondBr(c, ..)) = &mut blk.term {
+                    *c = to(*c);
+                }
+                blk.body.retain(|&i| first[i as usize].is_none());
+            }
+        }
         (marked, lanes, handles)
     }
 }
@@ -378,6 +426,45 @@ mod tests {
         // Read where every lane runs: uniform, also when used or computed on
         // inside the branch.
         assert!(!k.nonuniform(entry) && !k.nonuniform(again) && !k.nonuniform(computed));
+    }
+
+    #[test]
+    fn a_first_lane_read_of_a_uniform_value_is_the_value_on_warp() {
+        // SKIN2 (40943a69): inside a branch only some lanes take, a
+        // first-lane read of a table value is the value; of a lane's own, kept.
+        let build = || {
+            let mut k = kit();
+            let (b0, b1, b2) = (k.m.new_block(), k.m.new_block(), k.m.new_block());
+            let zero = k.m.i32(0);
+            let table = k.op(b0, 139, zero);
+            let tid = k.op(b0, 93, zero);
+            let first = k.m.cmp(b0, pred::EQ, tid, zero);
+            k.m.terminate(b0, Term::CondBr(first, b1, b2));
+            let same = k.op(b1, 118, table);
+            let from_same = k.handle(b1, same);
+            let own = k.op(b1, 118, tid);
+            let from_own = k.handle(b1, own);
+            k.m.terminate(b1, Term::Br(b2));
+            k.m.terminate(b2, Term::Ret);
+            (k, b1, table, [same, own], [from_same, from_own])
+        };
+        let index = |k: &Kit, h: V| {
+            let V::Inst(i) = h else { panic!("a call") };
+            let Op::Call(_, args) = &k.m.insts[i as usize].op else { panic!("a call") };
+            args[1]
+        };
+        let in_block = |k: &Kit, b: usize, v: V| matches!(v, V::Inst(i) if k.m.blocks[b].body.contains(&i));
+        let (mut k, b1, table, [same, own], [from_same, from_own]) = build();
+        k.m.mark_nonuniform(true);
+        assert_eq!(index(&k, from_same), table, "the read's use takes the value");
+        assert!(!in_block(&k, b1, same), "the read is taken out");
+        assert_eq!(index(&k, from_own), own, "a lane's own value keeps its read");
+        assert!(in_block(&k, b1, own));
+        // The hardware adapter (no `masked`): as it was.
+        let (mut k, b1, _, [same, _], [from_same, _]) = build();
+        k.m.mark_nonuniform(false);
+        assert_eq!(index(&k, from_same), same);
+        assert!(in_block(&k, b1, same));
     }
 
     #[test]

@@ -115,14 +115,21 @@ pub struct Lighting {
     /// The timecycle's EV (794 clamped to 796..797) and our bias (EV).
     pub ev: f32,
     pub bias: f32,
+    /// The timecycle's EV range, floats 796..797 (low, high): the title's
+    /// b6+0x420/+0x424 [V pk8a]; -32..32 free, low = high pinned (post.rs).
+    pub ev_range: [f32; 2],
     /// The directional strength (TC+0x1650) and whether the moon set is in use.
     pub strength: f32,
     pub moon: bool,
     /// The sky stand-in's colours as radiance: x this (sunlit white's level,
     /// lum(radiance) / pi, at least the ambient floor).
     pub sky_scale: f32,
-    /// Hable A, B, C, D, E, F, W.
+    /// Hable A, B, C, D, E, F, W: timecycle floats 838..844, the title's
+    /// set 1 (b6+0x4C0; the one its composite uses, post.rs).
     pub curve: [f32; 7],
+    /// The title's set 0 (b6+0x4A0): timecycle floats 847..853 [V pk8a
+    /// f1030: both places hold 0.22 0.3 0.1 0.2 0.01 0.3 11.2]. `post=on` only.
+    pub curve_dark: [f32; 7],
     /// The fog colour (display value, the sky stand-in's horizon) for
     /// `ourlight=on`'s pass; zero otherwise.
     pub fog: [f32; 3],
@@ -169,6 +176,11 @@ impl Lighting {
         if !(hable(curve[6], &curve).is_finite() && hable(curve[6], &curve) > 0.0 && curve[5] != 0.0) {
             curve = [0.22, 0.3, 0.1, 0.2, 0.01, 0.3, 4.0];
         }
+        // Set 0: each value missing or not finite takes set 1's; a set that cannot be evaluated is set 1.
+        let mut curve_dark: [f32; 7] = std::array::from_fn(|i| tc.get(847 + i).copied().filter(|x| x.is_finite()).unwrap_or(curve[i]));
+        if !(hable(curve_dark[6], &curve_dark).is_finite() && hable(curve_dark[6], &curve_dark) > 0.0 && curve_dark[5] != 0.0) {
+            curve_dark = curve;
+        }
         let (lo, hi) = (v[6].min(v[7]), v[6].max(v[7]));
         let ev = (v[5] + v[21]).clamp(lo, hi);
         let bias = ev_bias().unwrap_or_else(|| auto_bias(ev));
@@ -198,10 +210,12 @@ impl Lighting {
             exposure,
             ev,
             bias,
+            ev_range: [lo, hi],
             strength,
             moon,
             sky_scale: (lum(&radiance) / std::f32::consts::PI).max(AMBIENT_FLOOR / exposure),
             curve,
+            curve_dark,
             fog: [0.0; 3],
         };
         (lit, table)
@@ -386,7 +400,7 @@ mod tests {
     fn timecycle_defaults_and_reads() {
         // Nothing readable: the defaults (exposure exp2(0) = 1, mult 14.75).
         let (l, t) = Lighting::from_timecycle(&[], None);
-        assert_eq!((l.exposure, l.mult, l.curve), (1.0, 14.75, DEF));
+        assert_eq!((l.exposure, l.mult, l.curve, l.curve_dark), (1.0, 14.75, DEF, DEF));
         assert!(t.iter().all(|r| r.3), "all defaults");
         let mut tc = vec![0f32; 0x16C0 / 4];
         tc[..4].copy_from_slice(&[0.89, 0.675, 0.392, 10.0]);
@@ -394,7 +408,10 @@ mod tests {
         tc[838..845].copy_from_slice(&DEF);
         tc[0x1630 / 4 + 2] = 2.0;
         tc[0x1650 / 4] = 1.0; // Directional strength
+        // Set 0 at 847..853 (the title's b6+0x4A0).
+        tc[847..854].copy_from_slice(&[0.22, 0.3, 0.1, 0.2, 0.02, 0.3, 11.2]);
         let (l, _) = Lighting::from_timecycle(&tc, Some(([0.2, 0.3, 0.6], [0.6, 0.6, 0.6])));
+        assert_eq!((l.curve, l.curve_dark), (DEF, [0.22, 0.3, 0.1, 0.2, 0.02, 0.3, 11.2]));
         assert_eq!((l.exposure, l.ev, l.bias), (8.0, 3.0, 0.0), "day-range EV: no bias");
         assert!((l.radiance[0] - 8.9).abs() < 1e-5 && l.mult == 10.0, "colour x multiplier, no saturate");
         assert_eq!(l.dir, [0.0, 0.0, 1.0]);

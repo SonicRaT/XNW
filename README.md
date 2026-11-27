@@ -24,7 +24,7 @@ around and interact with the world. The picture is still incomplete, so it is no
 | Story load | Working | About 20-35 seconds after launch. |
 | Intro cinematics | Working | They play through to the end, about six minutes. |
 | Player control | Working | After the cinematics you are given control and can walk around and interact with the world. |
-| Playable | Not yet | Characters and vehicles are drawn, at about 43 frames per second on the test GPU with the speed switches on. Our own lighting pass exists but is off by default (flat neutral colours); hair, the interface and most of the game's own materials are not in the live picture yet. |
+| Playable | Not yet | The world, characters, clothing, hair, vehicles (paint, interiors, wheels, lamps), local lights, decals, cables and the game's own movies and interface are drawn, at about 38-42 frames per second on the test GPU. Police livery, siren lights, hair under hats and the game's own reflections are still missing; some clothing and the road surface use stand-ins. |
 | Audio | Working | The game's audio plays. |
 | Asset streaming | Working | The game's streaming requests are served as it moves through the world. |
 | Online | Off | Network access is disabled by design. |
@@ -64,13 +64,20 @@ around and interact with the world. The picture is still incomplete, so it is no
 | 2026-11-25 | The intro credits drawn by the game's own interface shaders, in replay and on the real GPU (the live interface is not shown yet). |
 | 2026-11-25 | Cube, array and 3D textures carry their real texels in replay, through views of their own dimension. |
 | 2026-11-25 | Zero-copy geometry: buffers are used where they sit instead of being copied (a switch, off by default; run on the software adapter only). |
+| 2026-11-26 | Our renderer runs on its own thread instead of inside the game's present call: about 22 to 35 frames per second in one step. Cheaper capture hooks, helper threads at low priority and skipping game work we throw away bring it to 38-42 with far more on screen. |
+| 2026-11-26 | Local lights (street lamps, car lights) in our lighting pass, an HDR composite with the game's own tone curve and smoothed exposure. |
+| 2026-11-26 | Vehicles coloured from the game's own per-material records and palette: body paint, interiors, wheels and tyres, with a clearcoat; car lamps and their glow. |
+| 2026-11-26 | Hair on characters: our own ribbons built from the game's strand guides, with sway; body hair thin. |
+| 2026-11-26 | Clothing textures, distant characters in their palette colours, instanced props, overhead cables, ground decals blended correctly. |
+| 2026-11-26 | The game's own movies play without flicker; a characters-vanishing glitch held to the last good pose; a memory-layout race that dropped every translated material on some runs is fixed. |
+| 2026-11-26 | Bounds on bindless indices in translated shaders (the fix for a GPU hang): road and clothing families pass on the real GPU. |
 
 ### Performance so far
 
 | What | Measured |
 |---|---|
-| World on screen, our renderer, real GPU | about **43 frames per second** with characters and vehicles and the speed switches on (4,626 world frames in the best run; 25 fps with none of them, 2,733 frames); without the switches, 3,990 frames in 150 s earlier the same day |
-| Renderer cost inside each frame | 6-15 ms for our pass, plus 9-17 ms to read the game's draw lists; the draw-list hook costs 3.2-3.4 us a draw; GPU instance culling (a switch, `gpucull=on`, run on the card) 0.6 ms |
+| World on screen, our renderer, real GPU | about **38-42 frames per second** in the standard run with lighting, HDR, hair, vehicle materials, lamps, cables and the game's translated material shaders on (runs of about 2,950 world frames); 22-27 at the start of 2026-11-26 with far less on screen |
+| Renderer cost inside each frame | our pass runs on its own thread (busy about 20-25 ms a frame, a new picture for 34-47 of every 60 presents); the frame is now bound by the game's own render workers, about 24 ms a frame |
 | Texture slots filled with the game's textures | 23,562 of 25,653 at the end of an earlier run (92 %); the live table now holds 4,096 stable entries with no re-uploads |
 | Captured frame replayed in the frame lab | **4-7 ms per frame**; a shader edit shows on screen in about half a second |
 | Console GPU programs translated to DXIL | **25,674 of 25,889** (99.2 %) in the test game, all of them valid DXIL; 786 of the 788 that a typical frame uses. Programs that read barycentrics need hardware support for it and are run on the software adapter |
@@ -79,14 +86,13 @@ around and interact with the world. The picture is still incomplete, so it is no
 
 ### In progress
 
-- Drawing with the game's own translated shaders, family by family, inside our renderer: its pixel shaders for
-  materials, and its mesh shaders through a compute-plus-indexed-draw form (the test GPU has no mesh shaders).
-- Hair: the game builds strand hair on the GPU with a chain of compute shaders; running that chain is next.
-- Occasional one-frame flicker of some objects.
+- More of the game's own translated shaders inside our renderer, family by family (roads and character
+  clothing are proven on the real GPU but not yet on by default).
+- Vehicle livery (decals such as police lettering) and siren lights; hair under hats.
+- The game's own reflections; water.
 
 ### Pending
 
-- Showing the lighting pass, strand hair and the game's user interface in the live picture: they are wired but off by default, not yet shown live. Water and decals are not started. Without the lighting switch the picture is flat and unlit.
 - Running the game's own GPU work on real hardware at a usable speed.
 - The frame lab (a window that replays captured frames with a free camera) is not in this tree yet.
 

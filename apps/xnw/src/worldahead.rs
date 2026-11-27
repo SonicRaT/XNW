@@ -241,6 +241,29 @@ fn unload(object: u64) {
     UNLOADS[(i as usize) & (UNLOAD_N - 1)].store(object, Ordering::Release);
 }
 
+/// The unload ring for another reader with its own tail (the hook's
+/// instance cache, worldprobe/instcache.rs): `f` gets each object queued
+/// since `tail` (at most the ring's length, the newest); returns the new tail.
+/// Empty when the slot remove is not hooked.
+pub(crate) fn unloads_since(tail: u64, f: &mut dyn FnMut(u64)) -> u64 {
+    let head = EV_UNLOAD_HEAD.load(Ordering::Acquire);
+    for i in tail.max(head.saturating_sub(UNLOAD_N as u64))..head {
+        f(UNLOADS[(i as usize) & (UNLOAD_N - 1)].load(Ordering::Acquire));
+    }
+    head
+}
+
+/// The unload ring's head (a new reader starts there).
+pub(crate) fn unload_head() -> u64 {
+    EV_UNLOAD_HEAD.load(Ordering::Acquire)
+}
+
+/// Tests: an unload of `object`, as the slot-remove hook queues it.
+#[cfg(test)]
+pub(crate) fn test_unload(object: u64) {
+    unload(object);
+}
+
 // ---- entity drawable attach (the sharper "about to be drawn" signal) ----
 
 /// 0x144F40940(entity): called by CreateDrawable 0x144F407B0 only when the

@@ -94,6 +94,25 @@ const ELEMENT_RUN_BYTES: [u8; 4] = [0x48, 0xFF, 0x61, 0x18];
 const GROUP_RUN_BYTES: [u8; 10] = [0x56, 0x57, 0x48, 0x83, 0xEC, 0x28, 0x48, 0x8B, 0x71, 0x18];
 /// The row called once per frame of the game thread.
 const FRAME_ROW: usize = 1;
+/// The rows the frame wall line takes (WALL1, `xnw_core::framewall`): row, its slot.
+const WALL_ROWS: [(usize, usize); 4] = [(1, xnw_core::framewall::UPDATE), (11, xnw_core::framewall::KICK_WAIT), (12, xnw_core::framewall::DRAIN), (13, xnw_core::framewall::FRAME_END)];
+/// Only [`WALL_ROWS`] are metered and no `title time:` line is printed (no `XNW_TITLE_TIME`, a screen pass).
+static QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A metered call of row `i` ended: its wall (and the drain's CPU) into the frame wall line.
+fn wall_row(i: usize, cycles: u64, wall_ns: u64) {
+    let Some(&(_, slot)) = WALL_ROWS.iter().find(|r| r.0 == i) else { return };
+    xnw_core::framewall::add(slot, wall_ns);
+    if slot == xnw_core::framewall::DRAIN {
+        xnw_core::framewall::add(xnw_core::framewall::DRAIN_CPU, (cycles as f64 / crate::stagemeter::cycles_per_second() * 1e9) as u64);
+    }
+}
+
+/// Whether the frame wall rows are metered without `XNW_TITLE_TIME`: a
+/// screen pass is asked for and `XNW_FRAME_WALL` is not `off`.
+fn wall_wanted(world_render: &str, frame_wall: &str) -> bool {
+    world_render.split(',').any(|p| p.trim().starts_with("screen")) && !matches!(frame_wall.trim(), "off" | "0")
+}
 const EVERY: u64 = 60;
 
 static TARGETS: [AtomicUsize; N] = [const { AtomicUsize::new(0) }; N];
@@ -197,8 +216,13 @@ fn run(i: usize, a: usize, b: usize, c: usize, d: usize) -> usize {
     } else {
         f(a, b, c, d)
     };
-    CYCLES[i].fetch_add(crate::stagemeter::thread_cycles().wrapping_sub(c0), Ordering::Relaxed);
-    WALL_NS[i].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let (cycles, wall_ns) = (crate::stagemeter::thread_cycles().wrapping_sub(c0), t0.elapsed().as_nanos() as u64);
+    wall_row(i, cycles, wall_ns);
+    if QUIET.load(Ordering::Relaxed) {
+        return r;
+    }
+    CYCLES[i].fetch_add(cycles, Ordering::Relaxed);
+    WALL_NS[i].fetch_add(wall_ns, Ordering::Relaxed);
     CALLS[i].fetch_add(1, Ordering::Relaxed);
     if i == FRAME_ROW && FRAMES.fetch_add(1, Ordering::Relaxed) % EVERY == EVERY - 1 {
         xnw_core::info!("{}", take_line(EVERY));
@@ -300,13 +324,20 @@ pub(crate) unsafe fn redirect(site: *mut u8, target: usize, thunk: *mut u8, hook
     Ok(())
 }
 
-/// Installs the meter when `XNW_TITLE_TIME=1`.
+/// Installs the meter when `XNW_TITLE_TIME=1`; without it, the four frame
+/// wall rows alone when a screen pass is asked for (WALL1, [`wall_wanted`]).
 ///
 /// # Safety
 /// `base` is the mapped title and none of its code runs yet.
 pub unsafe fn install(base: usize) {
     let (split, sky) = match std::env::var("XNW_TITLE_TIME").unwrap_or_default().trim() {
-        "" | "0" => return,
+        "" | "0" => {
+            if !wall_wanted(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default(), &std::env::var("XNW_FRAME_WALL").unwrap_or_default()) {
+                return;
+            }
+            QUIET.store(true, Ordering::Relaxed);
+            (false, false)
+        }
         "1" => (false, false),
         "2" => (true, false),
         "3" => (false, true),
@@ -330,8 +361,12 @@ pub unsafe fn install(base: usize) {
     };
     crate::stagemeter::cycles_per_second();
     let (hooks, mut done) = (hook_table(), 0);
+    let quiet = QUIET.load(Ordering::Relaxed);
     let rows = if sky { N } else { SKY_FIRST };
     for (i, s) in SITES.iter().enumerate().take(rows) {
+        if quiet && !WALL_ROWS.iter().any(|r| r.0 == i) {
+            continue;
+        }
         TARGETS[i].store(base + s.target, Ordering::Relaxed);
         // SAFETY: inside the mapped .text of this build, no code running; 16 bytes of our page per row.
         match unsafe { redirect((base + s.site) as *mut u8, base + s.target, page.add(16 * i), hooks[i]) } {
@@ -351,6 +386,10 @@ pub unsafe fn install(base: usize) {
     if sky {
         SKY.store(true, Ordering::Relaxed);
         xnw_core::info!("title time: stage 36's sky body title+0xd3ac70 is split by call; one 'title stage 36 sky:' line per {EVERY} frames");
+    }
+    if quiet {
+        xnw_core::info!("title time: {done} of {} call sites metered for the 'frame wall:' line only (update, kick+wait, render.drain, render.frame end; XNW_FRAME_WALL=off: none)", WALL_ROWS.len());
+        return;
     }
     xnw_core::info!("title time: {done} of {rows} call sites metered (main loop title+0x812620, render thread); one line per {EVERY} frames");
 }
@@ -383,6 +422,17 @@ mod tests {
         assert_eq!(exe.at(WALK_RVA + 9, 7), [0x48, 0x8B, 0x81, 0x40, 0x01, 0x00, 0x00]);
         // The frame end is entered by a jump each frame, not by the render loop's call.
         assert_eq!((exe.at(0xc9e33e, 1)[0], exe.rel32_target(0xc9e33e)), (0xE9, 0xc9e5e0));
+    }
+
+    /// The frame wall rows are the four it names; they are metered alone only for a screen pass.
+    #[test]
+    fn the_frame_wall_rows_are_the_named_sites() {
+        let names: Vec<&str> = WALL_ROWS.iter().map(|r| SITES[r.0].name).collect();
+        assert_eq!(names, ["update", "kick+wait", "render.drain", "render.frame end"]);
+        assert_eq!(WALL_ROWS[0].0, FRAME_ROW);
+        assert!(wall_wanted("screen,drawbones=on", ""));
+        assert!(wall_wanted("gbuf=on, screen-hw", " on "));
+        assert!(!wall_wanted("screen", "off") && !wall_wanted("capture", "") && !wall_wanted("", ""));
     }
 
     static RAN: AtomicU64 = AtomicU64::new(0);

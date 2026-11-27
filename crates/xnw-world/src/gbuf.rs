@@ -50,7 +50,9 @@ pub fn source(src: &str) -> String {
 /// states): `#define OURLIGHT 1` first with `ourlight=on` (its rows before
 /// the lighting pass write their albedo), else as it is.
 pub fn plain_source(src: &str) -> String {
-    if crate::ourlight::on() && !src.contains("#define OURLIGHT") { format!("#define OURLIGHT 1\n{src}") } else { src.to_string() }
+    let src = if crate::ourlight::on() && !src.contains("#define OURLIGHT") { format!("#define OURLIGHT 1\n{src}") } else { src.to_string() };
+    // CAR1 `carshade=on`: the paint rows' gloss (carshade.rs).
+    crate::carshade::raw_source(src)
 }
 
 /// The title's normal packing (PS_DeferredTextured ff2c46ab): octahedral
@@ -149,6 +151,49 @@ pub(crate) fn layout(desc: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC, ps: &[u8]) {
     }
 }
 
+/// DEC2: a raw-path state whose target-0 blend is a decal's (SRC_ALPHA /
+/// INV_SRC_ALPHA / ADD into RGB: the stage-74 rows, list.tsv rstate
+/// `1,5,6,1,2,1,1,7`) takes the title's decal rule on our G-buffer
+/// ([`decal_layout`]). `XNW_DECAL_GBUF=off` (A/B, read once): targets 1 and 2
+/// unblended, as before.
+pub fn decal_rule(b: &[u8; 8]) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("XNW_DECAL_GBUF").is_ok_and(|v| v.trim() == "off")) && decal_blend(b)
+}
+
+fn decal_blend(b: &[u8; 8]) -> bool {
+    crate::bridged::blend_ok(*b) && b[1] == 5 && b[2] == 6 && b[3] == 1 && b[7] & 0xF == 0x7
+}
+
+/// The raw shader's matFlags bit for a [`decal_rule`] row: its albedo
+/// output carries the texture's alpha (the blend factor of target 1).
+pub const DECAL_ALPHA: u32 = 16;
+
+/// DEC2: targets 1 and 2 of a [`decal_rule`] pipeline as the title blends a
+/// decal ([`crate::bridged::DECAL_TARGETS`], every stage-74 pipeline of the
+/// warm cache, SHD1): the albedo (title target 0) RGB by the decal's alpha;
+/// the normal word untouched (title target 1 writes R only, 1 - roughness,
+/// where ours keeps the fog flag of the row below). Before this, a decal row
+/// wrote both targets over its whole quad, alpha 0 included: the lighting
+/// pass lit the quad with the decal's normal and flag (pk8a f1031 row 1370,
+/// `standard_decal_blend_ground`: the teal band across the road).
+pub(crate) fn decal_layout(desc: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC, b: &[u8; 8]) {
+    if on() && decal_rule(b) {
+        decal_targets(desc, b);
+    }
+}
+
+/// [`decal_layout`]'s targets for a pipeline that binds the G-buffer.
+fn decal_targets(desc: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC, b: &[u8; 8]) {
+    if desc.NumRenderTargets != 3 {
+        return;
+    }
+    let mask = desc.BlendState.RenderTarget[1].RenderTargetWriteMask;
+    desc.BlendState.RenderTarget[1] = crate::bridged::decal_target(*b, 0);
+    desc.BlendState.RenderTarget[1].RenderTargetWriteMask &= mask;
+    desc.BlendState.RenderTarget[2].RenderTargetWriteMask = 0;
+}
+
 /// The G-buffer as read back: albedo and normal rows (RGBA8, `width * 4`
 /// bytes a row, albedo sRGB-encoded) and the depth (reverse Z, 0 = far).
 pub struct Read {
@@ -168,6 +213,17 @@ pub struct Targets {
 /// Reads the two targets and the depth back on a submission of its own
 /// (they stay in the render-target / depth-write states between frames).
 pub fn read(device: &ID3D12Device, queue: &ID3D12CommandQueue, t: &Targets, depth: &ID3D12Resource, width: u32, height: u32) -> Result<Read, String> {
+    let rt = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    let mut rows = read_targets(device, queue, &[(&t.albedo, ALBEDO, rt), (&t.normal, NORMAL, rt), (depth, DXGI_FORMAT_R32_TYPELESS, D3D12_RESOURCE_STATE_DEPTH_WRITE)], width, height)?;
+    let depth = rows.pop().unwrap_or_default().chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let normal = rows.pop().unwrap_or_default();
+    let albedo = rows.pop().unwrap_or_default();
+    Ok(Read { width, height, albedo, normal, depth })
+}
+
+/// Reads 4-byte-texel targets back (each in `state`, left in it) on a
+/// submission of its own: one `width * 4`-byte row vector per target.
+pub fn read_targets(device: &ID3D12Device, queue: &ID3D12CommandQueue, want: &[(&ID3D12Resource, DXGI_FORMAT, D3D12_RESOURCE_STATES)], width: u32, height: u32) -> Result<Vec<Vec<u8>>, String> {
     let e = |e: windows::core::Error| e.message().to_string();
     let pitch = (width * 4).next_multiple_of(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
     let size = u64::from(pitch) * u64::from(height);
@@ -176,7 +232,7 @@ pub fn read(device: &ID3D12Device, queue: &ID3D12CommandQueue, t: &Targets, dept
         let alloc: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
         let list: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(e)?;
         let mut backs = Vec::new();
-        for (r, format, state) in [(&t.albedo, ALBEDO, D3D12_RESOURCE_STATE_RENDER_TARGET), (&t.normal, NORMAL, D3D12_RESOURCE_STATE_RENDER_TARGET), (depth, DXGI_FORMAT_R32_TYPELESS, D3D12_RESOURCE_STATE_DEPTH_WRITE)] {
+        for &(r, format, state) in want {
             let back = crate::bridge::buffer(device, size, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST)?;
             crate::transition(&list, r, state, D3D12_RESOURCE_STATE_COPY_SOURCE);
             let fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: 0, Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: if format == DXGI_FORMAT_R32_TYPELESS { DXGI_FORMAT_R32_FLOAT } else { format }, Width: width, Height: height, Depth: 1, RowPitch: pitch } };
@@ -214,10 +270,7 @@ pub fn read(device: &ID3D12Device, queue: &ID3D12CommandQueue, t: &Targets, dept
             b.Unmap(0, None);
             rows.push(v);
         }
-        let depth = rows.pop().unwrap_or_default().chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-        let normal = rows.pop().unwrap_or_default();
-        let albedo = rows.pop().unwrap_or_default();
-        Ok(Read { width, height, albedo, normal, depth })
+        Ok(rows)
     }
 }
 
@@ -262,5 +315,38 @@ mod tests {
         let three = crate::compile_source(&format!("#define GBUF 1\n{}", crate::RAW_SHADER), c"ps", c"ps_5_1").unwrap();
         assert_eq!(targets(crate::blob_bytes(&one)), 1);
         assert_eq!(targets(crate::blob_bytes(&three)), 7);
+    }
+
+    /// DEC2: a decal state (list.tsv rstate `1,5,6,1,2,1,1,7`) blends the
+    /// albedo target's RGB by alpha and leaves the normal target; an opaque
+    /// state and a pipeline without the G-buffer are left as they are.
+    #[test]
+    fn decal_states_blend_the_albedo_and_keep_the_normal() {
+        let decal = [1, 5, 6, 1, 2, 1, 1, 7];
+        assert!(decal_blend(&decal));
+        assert!(!decal_blend(&[0, 2, 1, 1, 2, 1, 1, 15]));
+        assert!(!decal_blend(&[1, 2, 2, 1, 2, 1, 1, 7]));
+        let three = || {
+            let mut d = D3D12_GRAPHICS_PIPELINE_STATE_DESC { NumRenderTargets: 3, ..Default::default() };
+            for k in 1..3 {
+                d.BlendState.RenderTarget[k].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+            }
+            d
+        };
+        let mut d = three();
+        decal_targets(&mut d, &decal);
+        let (a, n) = (d.BlendState.RenderTarget[1], d.BlendState.RenderTarget[2]);
+        assert!(a.BlendEnable.as_bool());
+        assert_eq!((a.SrcBlend, a.DestBlend, a.BlendOp, a.RenderTargetWriteMask), (D3D12_BLEND_SRC_ALPHA, D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_OP_ADD, 0x7));
+        assert_eq!(n.RenderTargetWriteMask, 0);
+        // A pixel program that does not write target 1 keeps its zero mask.
+        let mut d = three();
+        d.BlendState.RenderTarget[1].RenderTargetWriteMask = 0;
+        decal_targets(&mut d, &decal);
+        assert_eq!(d.BlendState.RenderTarget[1].RenderTargetWriteMask, 0);
+        let mut d = D3D12_GRAPHICS_PIPELINE_STATE_DESC { NumRenderTargets: 1, ..Default::default() };
+        decal_targets(&mut d, &decal);
+        assert_eq!(d.BlendState.RenderTarget[1].RenderTargetWriteMask, 0);
+        assert!(!d.BlendState.RenderTarget[1].BlendEnable.as_bool());
     }
 }

@@ -32,7 +32,10 @@
 //! "this thread's last hooked draw" (`attach`); `apply` puts what they gave
 //! on the list as the live list build does (`place_wheel`, `frame_for`,
 //! `bridged::Frame`) and prints the live lines. `gpucull=on` rebuilds the
-//! batches as the replay does (`xnw_frame::gpucull::fill`).
+//! batches as the replay does (`xnw_frame::gpucull::fill`), with the
+//! capture's hide and near fade-in bitsets; `--near-hash h[,h..]` flags
+//! every instance of those geometries' batches near (VEH3c: captures older
+//! than the bitset dump).
 //!
 //! Not driven: the hook (`capture_light` reads the TLS block, the render
 //! context and the geometry headers, which no capture holds: spec on the
@@ -118,14 +121,23 @@ fn place(at: u64, bytes: Vec<u8>, whole: bool) {
 
 /// A geometry's captured bytes at its title addresses: the vertex buffer,
 /// and the meshlets made again (or the classic index buffer at its width).
-/// False when the indices cannot be put back in the title's form.
-fn place_geometry(key: &GeomKey, vb: Vec<u8>, idx: &[u32]) -> bool {
+/// `word0`: the title's meshlet word 0, whose bits 17-31 (the MSR one-bone
+/// field: one bone for the whole mesh, or the u8/u16 array's shift) the blob
+/// made again keeps, so the geometry step's one-bone rule reads them as live
+/// (the count, bits 0-16, is the blob's own). False when the indices cannot be
+/// put back in the title's form.
+fn place_geometry(key: &GeomKey, vb: Vec<u8>, idx: &[u32], word0: Option<u32>) -> bool {
     let mesh = if key.mesh_len != 0 {
         // The meshlet form holds vertex indices below 65,536 (u16 vertex lists).
         if idx.iter().any(|&i| i > 0xFFFF) {
             return false;
         }
-        geomread::meshlets(idx)
+        let mut m = geomread::meshlets(idx);
+        if let (Some(w), Some(h)) = (word0, m.get_mut(0..4)) {
+            let count = u32::from_le_bytes(h.try_into().unwrap());
+            h.copy_from_slice(&(count & 0x1_FFFF | w & !0x1_FFFF).to_le_bytes());
+        }
+        m
     } else {
         match key.ib & 0xFF {
             2 if idx.iter().all(|&i| i <= 0xFFFF) => idx.iter().flat_map(|&i| (i as u16).to_le_bytes()).collect(),
@@ -140,6 +152,26 @@ fn place_geometry(key: &GeomKey, vb: Vec<u8>, idx: &[u32]) -> bool {
     place(key.vb_at, vb, false);
     place(key.mesh_at, mesh, key.mesh_len != 0);
     true
+}
+
+/// The title's meshlet word 0 of each of `keys` (meshlet geometries), from
+/// the frame's pack: a buffer object at the key's mesh address (low 32 bits,
+/// as `xnw_frame::audit::vehicle_skin` matches it: the pack holds the GPU
+/// view's address) and length. Keys the pack does not hold are left out
+/// (their blob keeps word 0 = count).
+fn title_word0s(fdir: &std::path::Path, keys: &[GeomKey]) -> Result<HashMap<GeomKey, u32>, String> {
+    let Some(pack) = xnw_frame::pack::Pack::open(fdir)? else { return Ok(HashMap::new()) };
+    let want: HashMap<(u32, u64), GeomKey> = keys.iter().map(|k| ((k.mesh_at as u32, k.mesh_len as u64), *k)).collect();
+    let mut out = HashMap::new();
+    for r in pack.data.refs.iter().filter(|r| r.kind == xnw_formats::framepack::kind::BUFFER) {
+        if let Some(k) = want.get(&(r.addr as u32, u64::from(r.len)))
+            && !out.contains_key(k)
+            && let Some(w) = pack.blob(r.hash).and_then(|b| b.get(0..4).map(|s| u32::from_le_bytes(s.try_into().unwrap())))
+        {
+            out.insert(*k, w);
+        }
+    }
+    Ok(out)
 }
 
 /// The hook's record of a row, as far as the geometry step reads it.
@@ -190,8 +222,17 @@ pub(super) struct Given {
     pub streams: (u64, u64, u64),
     pub range: Option<u32>,
     pub wheel: Option<super::skinhook::WheelInst>,
+    pub inst_rec: Option<Vec<[f32; 12]>>,
     pub bridged: Option<Box<xnw_world::bridged::Owned>>,
     pub sink_range: Option<u32>,
+    /// INT1: a vehicle-body effect (WHL1: or a wheel or tyre; draws.tsv
+    /// `effect_name`, the live hook's class), and the material table its sink gave.
+    pub vehicle: bool,
+    pub vehmat: Option<super::vehmat::Table>,
+    /// CAR1: a vehicle paint-class row (draws.tsv `effect_name`, as the live list's `Material::coat`).
+    pub coat: bool,
+    /// NPC1: a `ped_slod_tint` draw (its sink reads the palette block).
+    pub slod: bool,
 }
 
 /// The burst's frame (`frame_key` while serving).
@@ -213,6 +254,18 @@ pub(super) fn frame() -> u64 {
 /// The current sink's hook draw.
 pub(super) struct Current {
     pub streams: (u64, u64, u64),
+}
+
+/// INT1: the current sink's hook draw is a vehicle-body draw.
+pub(super) fn current_vehicle() -> bool {
+    let Some(d) = *lock(&CUR) else { return false };
+    lock(&GIVEN).as_ref().and_then(|m| m.get(&d)).is_some_and(|g| g.vehicle)
+}
+
+/// NPC1: the current sink's hook draw is a `ped_slod_tint` draw.
+pub(super) fn current_slod() -> bool {
+    let Some(d) = *lock(&CUR) else { return false };
+    lock(&GIVEN).as_ref().and_then(|m| m.get(&d)).is_some_and(|g| g.slod)
 }
 
 pub(super) fn current() -> Option<Current> {
@@ -246,6 +299,8 @@ struct SinkDraw {
     sampler_heap: usize,
     hook: Option<u32>,
     roots: Vec<Root>,
+    /// LIVE1: a Draw or DrawIndexed sink's IA views and (phase, stage), from its IA record.
+    ia: Option<(xnw_gpu::d3d12x::tap::TapIa, (u32, u32))>,
 }
 
 /// A frame's sinks, the objects they name and the bytes behind them.
@@ -290,6 +345,9 @@ fn taps_of(pack: &xnw_frame::pack::Pack, fdir: &std::path::Path, slots: &mut Slo
     use xnw_formats::framepack::{FRAME_SCOPE, kind, op, reason};
     use xnw_gpu::d3d12x::tap;
     let mut served = tap::Served::default();
+    // LIVE1: what only the pack's own tap reads is served in a live mode only
+    // (the other consumers' bursts stay as they were).
+    let live = super::pack::live();
     let mut mem: BTreeMap<u64, Arc<Vec<u8>>> = BTreeMap::new();
     let mut blobs: HashMap<u128, Arc<Vec<u8>>> = HashMap::new();
     let mut blob = |h: u128| -> Option<Arc<Vec<u8>>> {
@@ -331,6 +389,14 @@ fn taps_of(pack: &xnw_frame::pack::Pack, fdir: &std::path::Path, slots: &mut Slo
                 for v in slots_of(r, &mut blob).iter() {
                     served.views.insert(r.addr + 32 * u64::from(v.slot), tap_view(v));
                 }
+                // LIVE1: the pack's tap reads a table's raw slots first (and keys
+                // its reuse by their hash): bytes unique to the handle and content.
+                if live && r.kind == kind::TABLE && r.owner != FRAME_SCOPE {
+                    let mut raw = vec![0u8; (tap::TABLE_SLOTS as u64 * tap::SLOT) as usize];
+                    raw[..8].copy_from_slice(&r.addr.to_le_bytes());
+                    raw[8..24].copy_from_slice(&r.hash.to_le_bytes());
+                    put(&mut mem, r.addr, Arc::new(raw));
+                }
             }
             kind::HEAP_SLOT if r.owner == FRAME_SCOPE && r.addr != 0 => {
                 view_heap = r.addr;
@@ -353,6 +419,18 @@ fn taps_of(pack: &xnw_frame::pack::Pack, fdir: &std::path::Path, slots: &mut Slo
                     }
                 }
             }
+            // LIVE1: what the pack's own tap reads of a UI sink: the pipeline's
+            // state, the index and vertex bytes.
+            kind::GSTATE if live && r.owner == FRAME_SCOPE => {
+                if let Some(b) = blob(r.hash) {
+                    served.gstates.insert(r.addr as usize, b.to_vec());
+                }
+            }
+            kind::IA_DATA if live => {
+                if let Some(b) = blob(r.hash) {
+                    put(&mut mem, r.addr, b);
+                }
+            }
             kind::TARGETS => {
                 if let Some(b) = blob(r.hash) {
                     let w = u32s(&b);
@@ -363,6 +441,9 @@ fn taps_of(pack: &xnw_frame::pack::Pack, fdir: &std::path::Path, slots: &mut Slo
             }
             kind::SAMPLERS => {
                 if let Some(e) = blob(r.hash).and_then(|b| xnw_formats::framepack::decode_samplers(&b)) {
+                    for x in e.iter().filter(|x| live && x.form != xnw_formats::framepack::SAMPLER_RAW) {
+                        served.samplers.insert(x.raw, (x.form, x.desc));
+                    }
                     let n = e.iter().map(|x| x.index + 1).max().unwrap_or(0);
                     let mut raw = vec![0u8; 16 * n as usize];
                     for x in &e {
@@ -381,7 +462,8 @@ fn taps_of(pack: &xnw_frame::pack::Pack, fdir: &std::path::Path, slots: &mut Slo
                     put(&mut mem, r.addr, b);
                 }
             }
-            kind::CBV | kind::BUFFER | kind::FRAME_CB | kind::HEAP_BYTES | kind::PAL_WINDOW | kind::STRAND_BYTES => {
+            // HAIR10: the strand records' palette windows (kind 58) are title memory too.
+            kind::CBV | kind::BUFFER | kind::FRAME_CB | kind::HEAP_BYTES | kind::PAL_WINDOW | kind::STRAND_BYTES | kind::STRAND_PALETTE => {
                 if let Some(b) = blob(r.hash) {
                     put(&mut mem, r.addr, b);
                 }
@@ -391,7 +473,26 @@ fn taps_of(pack: &xnw_frame::pack::Pack, fdir: &std::path::Path, slots: &mut Slo
                     put(&mut mem, r.addr, b);
                 }
             }
+            // LAMP1: the vehicle mask words (arena base + rec+0x74, inside slot 86's
+            // view) are title memory the bridged rows read.
+            kind::ARENA if r.addr != 0 => {
+                if let Some(b) = blob(r.hash) {
+                    put(&mut mem, r.addr, b);
+                }
+            }
             _ => {}
+        }
+    }
+    // LIVE1: texels where the capture kept them, zeros where it found zeros
+    // (the pack's tap samples a texture's windows before it reads it).
+    let zeros = Arc::new(vec![0u8; 4 << 20]);
+    for t in pack.data.textures.iter().filter(|_| live) {
+        if t.texels != 0 {
+            if let Some(b) = blob(t.texels) {
+                put(&mut mem, t.at, b);
+            }
+        } else if t.reason == reason::ZERO_FILLED && t.len <= zeros.len() as u64 {
+            put(&mut mem, t.at, zeros.clone());
         }
     }
     // The descriptor slots themselves (a consumer reads a slot before it
@@ -407,7 +508,7 @@ fn taps_of(pack: &xnw_frame::pack::Pack, fdir: &std::path::Path, slots: &mut Slo
     let mut sinks = Vec::with_capacity(pack.data.sinks.len());
     for sk in &pack.data.sinks {
         let mut roots: Vec<Root> = Vec::new();
-        let (mut yz, mut args, mut sampler_heap) = ([0u32; 2], [0u32; 4], 0usize);
+        let (mut yz, mut args, mut sampler_heap, mut ia) = ([0u32; 2], [0u32; 4], 0usize, None);
         let set = |roots: &mut Vec<Root>, at: u16, r: Root| {
             let at = usize::from(at);
             if roots.len() <= at {
@@ -431,11 +532,17 @@ fn taps_of(pack: &xnw_frame::pack::Pack, fdir: &std::path::Path, slots: &mut Slo
                     }
                 }
                 kind::SAMPLERS if r.addr != 0 => sampler_heap = r.addr as usize,
+                kind::IA => {
+                    if let Some(a) = blob(r.hash).and_then(|b| xnw_formats::framepack::Ia::decode(&b)) {
+                        let slots = a.vertex.iter().enumerate().filter(|v| v.1.0 != 0 && v.1.1 != 0).fold(0u32, |m, (k, _)| m | 1 << k);
+                        ia = Some((tap::TapIa { index: a.index, vertex: a.vertex, slots, topology: a.topology }, (a.phase, a.stage)));
+                    }
+                }
                 _ => {}
             }
         }
         let hook = if op::is_dispatch(sk.op) { None } else { sk.hook_draw };
-        sinks.push(SinkDraw { op: sk.op, count: sk.count, yz, args, pipeline: sk.pipeline as usize, view_heap: view_heap as usize, sampler_heap, hook, roots });
+        sinks.push(SinkDraw { op: sk.op, count: sk.count, yz, args, pipeline: sk.pipeline as usize, view_heap: view_heap as usize, sampler_heap, hook, roots, ia });
     }
     // The hook draws: what the consumers ask of the hook's record.
     let tsv = std::fs::read_to_string(fdir.join("draws.tsv")).map_err(|e| format!("draws.tsv: {e}"))?;
@@ -443,7 +550,7 @@ fn taps_of(pack: &xnw_frame::pack::Pack, fdir: &std::path::Path, slots: &mut Slo
     let head: Vec<&str> = lines.next().unwrap_or_default().split('\t').collect();
     let col = |n: &str| head.iter().position(|h| *h == n);
     let hex = |s: Option<&&str>| s.and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok());
-    let (cd, cs, cv, cvn, cm, cr) = (col("draw"), col("model_skinned"), col("vb"), col("vb_bytes"), col("mesh_data"), col("range"));
+    let (cd, cs, cv, cvn, cm, cr, ce) = (col("draw"), col("model_skinned"), col("vb"), col("vb_bytes"), col("mesh_data"), col("range"), col("effect_name"));
     let mut given = HashMap::new();
     for l in lines {
         let f: Vec<&str> = l.split('\t').collect();
@@ -451,7 +558,9 @@ fn taps_of(pack: &xnw_frame::pack::Pack, fdir: &std::path::Path, slots: &mut Slo
         let at = |c: Option<usize>| hex(c.and_then(|c| f.get(c))).unwrap_or(0);
         let vb_len = cvn.and_then(|c| f.get(c)?.parse().ok()).unwrap_or(0);
         let range = hex(cr.and_then(|c| f.get(c))).filter(|&w| w != 0).map(|w| w as u32);
-        given.insert(d, Given { skinned: cs.and_then(|c| f.get(c)).is_some_and(|v| *v == "1"), streams: (at(cv), vb_len, at(cm)), range, ..Default::default() });
+        let class = ce.and_then(|c| f.get(c)).map_or(crate::worldtex::CLASS_OTHER, |n| crate::worldtex::class_of(n));
+        let (vehicle, coat) = (crate::worldtex::vehmat_class(class), class == crate::worldtex::CLASS_PAINT);
+        given.insert(d, Given { skinned: cs.and_then(|c| f.get(c)).is_some_and(|v| *v == "1"), streams: (at(cv), vb_len, at(cm)), range, vehicle, coat, slod: class == crate::worldtex::CLASS_SLOD, ..Default::default() });
     }
     let rows = pack.list_draws().unwrap_or_default();
     Ok(Taps { served, mem, sinks, given, rows })
@@ -460,6 +569,20 @@ fn taps_of(pack: &xnw_frame::pack::Pack, fdir: &std::path::Path, slots: &mut Slo
 /// Hands the frame's sinks to the registered consumers as the list sink
 /// does; returns (sinks handed, ms).
 fn drive(taps: &Taps) -> (u32, f64) {
+    drive_with(taps, |d, _| {
+        xnw_gpu::d3d12x::tap::replay(d);
+        true
+    })
+}
+
+/// LIVE1: hands the frame's sinks to the frame pack's own tap in its live
+/// mode (`ui=on`, `hair=on`), as draw.rs does on the title's threads;
+/// returns (sinks the pack took, ms).
+fn drive_pack(taps: &Taps) -> (u32, f64) {
+    drive_with(taps, |d, s| xnw_gpu::d3d12x::tap::replay_pack(d, s.ia.map(|x| x.0), s.ia.map(|x| x.1)))
+}
+
+fn drive_with(taps: &Taps, mut hand: impl FnMut(&xnw_gpu::d3d12x::tap::TapDraw, &SinkDraw) -> bool) -> (u32, f64) {
     use xnw_gpu::d3d12x::tap::{self, TapDraw, TapRoot};
     let t0 = Instant::now();
     let mut n = 0u32;
@@ -475,8 +598,7 @@ fn drive(taps: &Taps) -> (u32, f64) {
             })
             .collect();
         *lock(&CUR) = s.hook;
-        tap::replay(&TapDraw { op: s.op, count: s.count, yz: s.yz, args: s.args, pipeline: s.pipeline, view_heap: s.view_heap, sampler_heap: s.sampler_heap, roots: &roots });
-        n += 1;
+        n += u32::from(hand(&TapDraw { op: s.op, count: s.count, yz: s.yz, args: s.args, pipeline: s.pipeline, view_heap: s.view_heap, sampler_heap: s.sampler_heap, roots: &roots }, s));
     }
     *lock(&CUR) = None;
     (n, t0.elapsed().as_secs_f64() * 1e3)
@@ -487,7 +609,7 @@ fn drive(taps: &Taps) -> (u32, f64) {
 /// the pipeline; a burst's few frames would draw none of them).
 fn warm_bridged(served: &xnw_gpu::d3d12x::tap::Served, host: &xnw_gpu::host::Host) -> usize {
     let mut n = 0;
-    for v in served.pipelines.values() {
+    for (at, v) in &served.pipelines {
         let stages: Vec<_> = v.iter().map(|x| x.0.clone()).collect();
         let Some(key) = super::bridgeps::key_of(&stages, super::bridgeps::wanted()) else { continue };
         if xnw_world::bridged::cache().asked(key) {
@@ -495,7 +617,8 @@ fn warm_bridged(served: &xnw_gpu::d3d12x::tap::Served, host: &xnw_gpu::host::Hos
         }
         let bytes = |name: &str| v.iter().find(|x| x.0.name == name).map(|x| x.1.clone());
         if let (Some(msc), Some(psc)) = (bytes("mesh"), bytes("pixel")) {
-            xnw_world::bridged::cache().ask(key, msc, psc, &host.device, &host.caps, true);
+            let title = served.targets.get(at).map(|t| t.0.clone()).unwrap_or_default();
+            xnw_world::bridged::cache().ask(key, msc, psc, &title, &host.device, &host.caps, true);
             n += 1;
         }
     }
@@ -519,14 +642,58 @@ fn apply(list: &mut xnw_world::FrameList, taps: &mut Taps, n: u64) -> Vec<String
             let d = &mut list.draws[row];
             if r.inst_count > 0 {
                 (d.world, d.palette, d.bone_first, d.bone_count, d.remap, d.inst_first, d.inst_count) = (r.world, r.palette, r.bone_first, r.bone_count, r.remap, r.inst_first, r.inst_count);
+                // VEH2: a vehicle program, as the live list build (worldprobe.rs): out of the ped skip.
+                d.ped = false;
             }
         }
         lines.push(super::skinhook::wheel_line(n, placed, left));
     }
+    if super::instrec_sink() {
+        let mut placed = 0u32;
+        for row in 0..list.draws.len() {
+            let Some(w) = of(row).and_then(|g| g.inst_rec.clone()).filter(|w| !w.is_empty()) else { continue };
+            if list.draws[row].inst_count != 0 || list.draws[row].palette != xnw_world::NO_PALETTE {
+                continue;
+            }
+            let (world, first, count) = super::place_instrec(list, &w);
+            let d = &mut list.draws[row];
+            (d.world, d.inst_first, d.inst_count) = (world, first, count);
+            placed += 1;
+        }
+        lines.push(super::skinhook::instrec_line(n, placed));
+    }
     if preskin_on {
         list.preskin = super::preskin::frame_for(list.frame, list, |row| of(row).and_then(|g| g.sink_range).unwrap_or(u32::MAX));
+        // `pedhold`: rows without an item this frame take their last one.
+        let held = super::preskin::hold(list) as usize;
         let words: Vec<(Option<u32>, Option<u32>)> = (0..list.draws.len()).filter_map(of).map(|g| (g.sink_range, g.range)).collect();
-        lines.push(super::preskin::join_line(n, &words, list.preskin.draws.len()));
+        lines.push(super::preskin::join_line(n, &words, list.preskin.draws.len() - held));
+    }
+    // CAR1: the live list's paint class (`carshade=on` reads it).
+    for row in 0..list.draws.len() {
+        if of(row).is_some_and(|g| g.coat) {
+            list.draws[row].material.coat = true;
+        }
+    }
+    if super::vehmat_sink() {
+        let mut placed = HashMap::new();
+        let mut rows = 0u32;
+        for row in 0..list.draws.len() {
+            let Some(t) = of(row).and_then(|g| g.vehmat.clone()) else { continue };
+            if let Some(at) = super::vehmat::place(list, &mut placed, &t) {
+                list.draws[row].material.vehmat = Some(at);
+                (list.draws[row].material.livery_at, list.draws[row].material.livery) = (t.livery_at, t.livery);
+                list.draws[row].material.slod = t.slod;
+                rows += 1;
+            }
+        }
+        let vehicle = (0..list.draws.len()).filter(|&r| of(r).is_some_and(|g| g.vehicle)).count();
+        lines.push(super::vehmat::line(n, rows, vehicle, placed.len()));
+        if super::slod_sink() {
+            let slod = (0..list.draws.len()).filter(|&r| of(r).is_some_and(|g| g.slod)).count();
+            let coloured = list.draws.iter().filter(|d| d.material.slod != 0).count();
+            lines.push(super::slodtint::line(n, coloured, slod));
+        }
     }
     if bridge {
         let rows: Vec<(u32, xnw_world::bridged::Owned)> = (0..list.draws.len())
@@ -540,6 +707,8 @@ fn apply(list: &mut xnw_world::FrameList, taps: &mut Taps, n: u64) -> Vec<String
         let (not_ready, unread) = super::bridgeps::take_counts();
         let mut f = xnw_world::bridged::Frame::new(rows);
         (f.not_ready, f.unread) = (not_ready, unread);
+        // `XNW_REDUCE` (`xnw shader-reduce`): one row of one program, one input stood in.
+        lines.extend(xnw_world::reduce::frame(&mut f, n));
         lines.push(super::bridgeps::reads_line(n, f.rows.len()));
         list.bridged = Some(Arc::new(f));
     }
@@ -548,7 +717,7 @@ fn apply(list: &mut xnw_world::FrameList, taps: &mut Taps, n: u64) -> Vec<String
 }
 
 pub fn run(args: &[String]) -> Result<(), String> {
-    let usage = "usage: xnw burst <capture dir> --adapter hw|warp [--from N] [--frames K] [--switches a,b=c] [--png DIR] [--png-at N,..]";
+    let usage = "usage: xnw burst <capture dir> --adapter hw|warp [--from N] [--frames K] [--switches a,b=c] [--png DIR] [--png-at N,..] [--steady] [--settle] [--near-hash h[,h..]]";
     let dir = PathBuf::from(args.first().filter(|a| !a.starts_with("--")).ok_or(usage)?);
     let opt = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned();
     let hw = match opt("--adapter").as_deref() {
@@ -559,12 +728,15 @@ pub fn run(args: &[String]) -> Result<(), String> {
     // The live switches, read once by the pass and the probe (`screen` first).
     let switches = opt("--switches").unwrap_or_default();
     let render = if switches.is_empty() { "screen".to_string() } else { format!("screen,{switches}") };
+    // LIVE1: with a live mode a v2 frame without a live list (a capture made
+    // without screen mode, pk10ui2) runs its sinks through the pack's tap only.
+    let live = xnw_world::ui::switch_on(&render) || xnw_world::hair::switch_on(&render) || xnw_world::hair::ribbon_switch_on(&render);
     // SAFETY: set before any thread of ours reads the environment.
     unsafe {
         std::env::set_var("XNW_WORLD_RENDER", &render);
         std::env::set_var("XNW_ADAPTER", if hw { "hw" } else { "warp" });
     }
-    let mut frames: Vec<(u64, PathBuf)> = std::fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?.flatten().filter_map(|e| Some((e.file_name().to_str()?.strip_prefix("frame-")?.parse().ok()?, e.path()))).filter(|f: &(u64, PathBuf)| f.1.join("list.tsv").exists()).collect();
+    let mut frames: Vec<(u64, PathBuf)> = std::fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?.flatten().filter_map(|e| Some((e.file_name().to_str()?.strip_prefix("frame-")?.parse().ok()?, e.path()))).filter(|f: &(u64, PathBuf)| f.1.join("list.tsv").exists() || live && f.1.join("pack").is_dir()).collect();
     frames.sort();
     let from: u64 = opt("--from").and_then(|v| v.parse().ok()).unwrap_or(0);
     let count: usize = opt("--frames").and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
@@ -575,11 +747,14 @@ pub fn run(args: &[String]) -> Result<(), String> {
     }
     let gaps = frames.windows(2).filter(|w| w[1].0 != w[0].0 + 1).count();
     let png_dir = opt("--png").map(PathBuf::from);
+    let settle = args.iter().any(|a| a == "--settle");
     let png_at: HashSet<u64> = opt("--png-at").map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default();
     if let Some(d) = &png_dir {
         std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
     }
 
+    // `xnw shader-reduce`: the first faults named before the adapter removes the device.
+    xnw_world::reduce::watch_faults();
     let t_setup = Instant::now();
     // The live pass's device (the bridged rows' pipelines are made on it).
     let host = xnw_gpu::d3d12x::host::host_device().ok_or("no host device")?;
@@ -609,8 +784,11 @@ pub fn run(args: &[String]) -> Result<(), String> {
     // capture's sink records (a v2 capture; BURST2).
     if packed {
         super::install_sinks(true);
+        // LIVE1: `ui=on` / `hair=on` put the pack writer in its live mode, as at a run's start.
+        super::live_modes(true);
     }
     let gpucull = render.split(',').any(|w| w == "gpucull=on");
+    let near_hashes = xnw_frame::gpucull::hashes_arg(args);
     println!(
         "burst: {} frames {}..{} of {} ({gaps} gaps), {} on {}; XNW_WORLD_RENDER={render}; geometry reads {} {}; textures {:?}; setup {:.0} ms",
         frames.len(),
@@ -649,18 +827,39 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let mut slot_cache = SlotCache::new();
     let mut warmed = 0usize;
     let packs = if packed { prefetch_packs(&frames, counts.clone()) } else { Vec::new() };
+    let lag = xnw_world::lag_on();
+    let mut png_due: Option<u64> = None;
     let result = (|| -> Result<(), String> {
         for (k, (n, fdir)) in frames.iter().enumerate() {
             let n = *n;
             // Load: the frame's list and the bytes of geometries not seen before (not timed as the frame).
             let tl = Instant::now();
-            let (mut list, mut geoms) = xnw_frame::load::load_list_with(fdir, &|k| have.contains(k))?;
+            let listed = fdir.join("list.tsv").exists();
+            let (mut list, mut geoms) = if listed { xnw_frame::load::load_list_with(fdir, &|k| have.contains(k))? } else { Default::default() };
             list.frame = n;
-            xnw_frame::audit::skin_args(args, fdir, &mut list, &mut geoms)?;
-            xnw_frame::preskin::preskin_arg(args, fdir, &mut list, &mut geoms)?;
-            xnw_frame::list_options(args, &mut list);
+            if listed {
+                // `instrec`: with the live consumer installed the rows are placed by it (from the sinks), not by the replay's rule.
+                let mut largs: Vec<String> = args.iter().cloned().chain(super::instrec_sink().then(|| "--instrec=off".to_string())).collect();
+                // VEH4b: the vehicle rules of the switches' `skinrules` (mask|rank table, rec+0x54),
+                // as the live list build gives a vehicle row (`d.veh`); without them the 205-bone body
+                // read the compacted palette by raw bone number (torn rear quarter, pk8a f1030).
+                // Bit 8 stays with the live wheel consumer when it is installed; bit 5 (one-bone
+                // streams) with the geometry step, as live (`burst_skin_rules`).
+                if let Some(r) = burst_skin_rules(args, super::skinhook::rules(), super::sinks_on().0) {
+                    largs.extend(["--skin-rules".to_string(), format!("{r:x}")]);
+                }
+                xnw_frame::audit::skin_args(&largs, fdir, &mut list, &mut geoms)?;
+                xnw_frame::preskin::preskin_arg(args, fdir, &mut list, &mut geoms)?;
+                xnw_frame::list_options(args, &mut list);
+            }
+            let fresh: Vec<GeomKey> = geoms.keys().filter(|k| k.mesh_len != 0 && !have.contains(*k)).copied().collect();
+            let word0s = if packed && !fresh.is_empty() { title_word0s(fdir, &fresh)? } else { HashMap::new() };
+            if !fresh.is_empty() {
+                let whole = word0s.values().filter(|w| *w >> 29 & 3 == 3).count();
+                println!("burst frame {n}: meshlet word 0: {} of {} new meshlet geometries from the pack ({whole} in the one-bone whole-mesh form)", word0s.len(), fresh.len());
+            }
             for (k, (vb, idx)) in geoms {
-                if have.insert(k) && !place_geometry(&k, vb, &idx) {
+                if have.insert(k) && !place_geometry(&k, vb, &idx, word0s.get(&k).copied()) {
                     unplaced += 1;
                 }
             }
@@ -676,7 +875,13 @@ pub fn run(args: &[String]) -> Result<(), String> {
             // The sinks' objects and bytes (loading, not timed as the frame).
             let tl = Instant::now();
             let mut taps = match (packed, xnw_frame::pack::Pack::open(fdir)?) {
-                (true, Some(p)) => Some(taps_of(&p, fdir, &mut slot_cache)?),
+                (true, Some(p)) => {
+                    // PAL1: the vehicle palette's texels at the sinks (its pack origin, else stored texels).
+                    if super::vehmat::on() {
+                        super::vehmat::set_texels(Some(p.texel_provider(Arc::new(std::array::from_fn(|_| AtomicU64::new(0))))));
+                    }
+                    Some(taps_of(&p, fdir, &mut slot_cache)?)
+                }
                 _ => None,
             };
             if let Some(t) = taps.as_mut() {
@@ -694,16 +899,36 @@ pub fn run(args: &[String]) -> Result<(), String> {
             }
             let mut cull_rep = None;
             if gpucull {
-                cull_rep = Some(xnw_frame::gpucull::fill(fdir, &mut list, true, &[])?);
+                cull_rep = Some(xnw_frame::gpucull::fill(fdir, &mut list, true, &[], &near_hashes)?);
             }
             load_ms += tl.elapsed().as_secs_f64() * 1e3;
             // The list sink's consumers, as the title's threads run them at its list sink.
             FRAME_N.store(n, Ordering::Relaxed);
             let on = super::sinks_on();
-            let (sinks, taps_ms) = taps.as_ref().filter(|_| on.0 || on.1 || on.2).map_or((0, 0.0), drive);
+            let (sinks, taps_ms) = taps.as_ref().filter(|_| on.0 || on.1 || on.2 || super::instrec_sink()).map_or((0, 0.0), drive);
+            // LIVE1: the pack's live modes, as the title's list sink and our list thread run them.
+            if super::pack::live()
+                && let Some(t) = taps.as_ref()
+            {
+                let (taken, ms) = drive_pack(t);
+                println!("burst frame {n}: live pack: {taken} sinks read by the pack's tap in {ms:.2} ms ({})", super::pack::live_parts());
+                super::live_frame(n, 0, &mut list);
+            }
             let tap_lines = taps.as_mut().map(|t| apply(&mut list, t, n)).unwrap_or_default();
             for l in &tap_lines {
                 println!("{l}");
+            }
+            if !listed {
+                println!("burst frame {n}: no live list (list.tsv): the pass is not drawn");
+                continue;
+            }
+            // VEH2: the live list thread's last step before it publishes (worldprobe.rs, after the
+            // pre-skin join, which takes the flag): `preskinbits` bit 3 unflags ped-flagged rows without
+            // a ped remap (205-bone vehicle parts flagged by bone count), drawn as skinned props.
+            // Without it the burst skipped ~30 vehicle rows a frame that the live pass draws.
+            if super::preskin::bits() & xnw_world::preskin_gpu::BIT_PROPS != 0 {
+                let props = xnw_world::preskin_gpu::props_unflag(&mut list);
+                println!("burst frame {n}: props: {props} ped-flagged rows without a ped remap drawn as skinned props");
             }
             if let Some(r) = &cull_rep {
                 for l in xnw_frame::gpucull::lines(r, &list.cull) {
@@ -717,7 +942,20 @@ pub fn run(args: &[String]) -> Result<(), String> {
             let draws: Vec<Draw> = list.draws.iter().map(|r| draw_of(&r.geom)).collect();
             let mut why: HashMap<GeomKey, u8> = HashMap::new();
             burst_mem::GEOMETRY.with(|g| g.set(true));
-            let taken = geomread::take(&draws, n, &mut cache, &mut list.new_geoms, &mut why, false, geomread::asynchronous(), geomread::direct());
+            let mut taken = geomread::take(&draws, n, &mut cache, &mut list.new_geoms, &mut why, false, geomread::asynchronous(), geomread::direct());
+            // `--settle` (VIS2): the last frame also waits for the reader's geometries
+            // (`geomasync=on`), as for its textures: before, pk8a f1032 (a camera cut into
+            // the car) drew 179 rows, 48 without geometry (reader sent 79, arrived 66).
+            if settle && k + 1 == frames.len() && geomread::asynchronous() {
+                let tw = Instant::now();
+                // No rows: only the reader's results are taken, nothing is sent again.
+                while geomread::in_flight() > 0 && tw.elapsed().as_secs_f64() < 30.0 {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    let more = geomread::take(&[], n, &mut cache, &mut list.new_geoms, &mut why, false, true, geomread::direct());
+                    (taken.arrived, taken.failed, taken.not_ready) = (taken.arrived + more.arrived, taken.failed + more.failed, taken.not_ready + more.not_ready);
+                }
+                println!("burst frame {n}: settle: geometry reads waited for {:.0} ms; in flight {}", tw.elapsed().as_secs_f64() * 1e3, geomread::in_flight());
+            }
             burst_mem::GEOMETRY.with(|g| g.set(false));
             let geom_ms = t0.elapsed().as_secs_f64() * 1e3;
             if geomread::asynchronous() && n % 60 == 0 {
@@ -742,19 +980,57 @@ pub fn run(args: &[String]) -> Result<(), String> {
             // The pass, as the live screen path draws a list.
             let rows = list.draws.len();
             let png = png_dir.is_some() && (png_at.is_empty() || png_at.contains(&n));
+            // `XNW_PASS_LAG=on`: the last frame's picture is read once this
+            // frame's list side ran (the GPU drew it meanwhile).
+            if let (Some(m), Some(d)) = (png_due.take(), &png_dir) {
+                let rgba = pass.read_rgba()?;
+                xnw_frame::write_png(&d.join(format!("seq-{m:05}.png")), pass.width, pass.height, &rgba).map_err(|e| e.to_string())?;
+            }
             let tp = Instant::now();
             if hw {
                 xnw_frame::watchdog_arm();
             }
+            // `--settle`: the last frame waits for its textures' reads (`texasync`), so its
+            // picture is the one the in-frame path draws once every read has landed.
+            pass.tex.settle = settle && k + 1 == frames.len();
             let st = xnw_world::screen_draw(&mut pass, list, png);
             let pm = tp.elapsed().as_secs_f64() * 1e3;
             if hw {
                 xnw_frame::watchdog_disarm();
             }
             let st = st?;
-            if png && let Some(d) = &png_dir {
+            if png && lag {
+                png_due = Some(n);
+            } else if png && let Some(d) = &png_dir {
                 let rgba = pass.read_rgba()?;
                 xnw_frame::write_png(&d.join(format!("seq-{n:05}.png")), pass.width, pass.height, &rgba).map_err(|e| e.to_string())?;
+                // `xnw shader-reduce` compares its steps' pictures as raw RGBA.
+                if xnw_world::reduce::get().is_some() {
+                    std::fs::write(d.join(format!("seq-{n:05}.rgba")), &rgba).map_err(|e| e.to_string())?;
+                }
+            }
+            // SHADOW1 `sunshadow=on`: the screen term's numbers, and its picture beside the frame's.
+            if png && let Some(t) = pass.read_sunshadow() {
+                let t = t?;
+                let r = || t.chunks_exact(4).map(|p| p[0]);
+                let (lo, hi, sum) = r().fold((255u8, 0u8, 0u64), |(lo, hi, s), v| (lo.min(v), hi.max(v), s + u64::from(v)));
+                let px = (t.len() / 4).max(1);
+                let by: [usize; 5] = std::array::from_fn(|k| t.chunks_exact(4).filter(|p| (usize::from(p[1]) + 32) / 64 == k).count());
+                println!("burst frame {n}: sunshadow term: min {:.3} max {:.3} mean {:.4}; pixels in shadow (< 0.5) {}, partly (0.5..1) {}, of {px}; by cascade none {} c0 {} c1 {} c2 {} c3 {}", f32::from(lo) / 255.0, f32::from(hi) / 255.0, sum as f64 / 255.0 / px as f64, r().filter(|v| *v < 128).count(), r().filter(|v| (128..255).contains(v)).count(), by[0], by[1], by[2], by[3], by[4]);
+                if let Some(d) = &png_dir {
+                    let grey: Vec<u8> = t.chunks_exact(4).flat_map(|p| [p[0], p[0], p[0], 255]).collect();
+                    xnw_frame::write_png(&d.join(format!("sunshadow-{n:05}.png")), pass.width, pass.height, &grey).map_err(|e| e.to_string())?;
+                    // The atlas: nearer the light is brighter, black where no caster drew.
+                    if let Some(a) = pass.read_sunshadow_atlas() {
+                        let a = a?;
+                        let side = 2 * xnw_world::sunshadow::TILE;
+                        let drawn = a.iter().filter(|v| **v < 1.0).count();
+                        let (lo, hi) = a.iter().filter(|v| **v < 1.0).fold((1f32, 0f32), |(lo, hi), v| (lo.min(*v), hi.max(*v)));
+                        println!("burst frame {n}: sunshadow atlas: {drawn} of {} texels drawn, depth {lo:.4}..{hi:.4}", a.len());
+                        let grey: Vec<u8> = a.iter().flat_map(|v| { let g = if *v < 1.0 { (40.0 + 215.0 * (1.0 - (v - lo) / (hi - lo).max(1e-6))) as u8 } else { 0 }; [g, g, g, 255] }).collect();
+                        xnw_frame::write_png(&d.join(format!("sunatlas-{n:05}.png")), side, side, &grey).map_err(|e| e.to_string())?;
+                    }
+                }
             }
             // The pass's lines for this frame (live prints them every 60:
             // then the pass has printed them already).
@@ -766,12 +1042,12 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 println!("{}", xnw_world::preskin_gpu::line(n, &preskin_frame, &pass.preskin_stats()));
             }
             if every && let Some(f) = &bridged_frame {
-                println!("{}", xnw_world::bridged::line(n, f, &pass.bridge_stats));
+                println!("{}{}", xnw_world::bridged::line(n, f, &pass.bridge_stats), xnw_world::bridge_cam_text());
             }
             slow_pass += u32::from(pm > 50.0);
             held += u32::from(st.held);
             println!(
-                "burst frame {n}: rows {rows}, taps {taps_ms:.1} ms ({sinks} sinks), list {lm:.1} ms (geometry reads {geom_ms:.1} ms: {}; {new} new, {} failed, {} not ready{}), pass {pm:.1} ms (upload {:.1} ms: {} geometries, {} KiB, {} pending; pipelines {} new; textures {:.1} ms; record {:.1} ms; GPU {:.1} ms), drawn {} ({} without geometry), coverage {:.2}{}",
+                "burst frame {n}: rows {rows}, taps {taps_ms:.1} ms ({sinks} sinks), list {lm:.1} ms (geometry reads {geom_ms:.1} ms: {}; {new} new, {} failed, {} not ready{}), pass {pm:.1} ms (upload {:.1} ms: {} geometries, {} KiB, {} pending; pipelines {} new; textures {:.1} ms; record {:.1} ms; draw loop {:.2} ms (resolve {:.2}, parallel {:.2} on {} lists); GPU {:.1} ms), drawn {} ({} without geometry), coverage {:.2}{}",
                 taken.parts.line(),
                 taken.failed,
                 taken.not_ready,
@@ -783,12 +1059,17 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 st.new_psos,
                 st.tex_ms,
                 (st.record_ms - st.upload_ms - st.pso_ms - st.tex_ms).max(0.0),
+                st.loop_ms,
+                st.resolve_ms,
+                st.precord_ms,
+                st.precord_lists,
                 st.gpu_ms,
                 st.draws,
                 st.skipped,
                 st.coverage,
                 if st.held { " held" } else { "" }
             );
+            println!("burst frame {n}: textures: asked {}, in the table {}, waiting for their read {}{}", pass.tex.stats.demand, pass.tex.stats.distinct, pass.tex.stats.waiting, if pass.tex.settle { " (settled: reads waited for)" } else { "" });
             println!("burst frame {n}: title memory read: {}", burst_mem::text());
             println!("burst frame {n}: device memory: {}; geometries in place {} (dropped for a window gone or pages remapped {})", xnw_gpu::d3d12x::resource::video_memory_text(), st.in_place_geoms, st.in_place_dropped);
             if xnw_gpu::shared::world_on() {
@@ -799,6 +1080,14 @@ pub fn run(args: &[String]) -> Result<(), String> {
         }
         Ok(())
     })();
+    // The last frame's picture (`XNW_PASS_LAG=on`).
+    let result = result.and_then(|()| match (png_due.take(), &png_dir) {
+        (Some(m), Some(d)) => {
+            let rgba = pass.read_rgba()?;
+            xnw_frame::write_png(&d.join(format!("seq-{m:05}.png")), pass.width, pass.height, &rgba).map_err(|e| e.to_string())
+        }
+        _ => Ok(()),
+    });
     SERVING.store(false, Ordering::Relaxed);
     xnw_gpu::d3d12x::tap::serve(None);
     if warmed > 0 {
@@ -824,10 +1113,34 @@ pub fn run(args: &[String]) -> Result<(), String> {
     result
 }
 
+/// The `--skin-rules` the burst gives the replay's `skin_args`: the live
+/// `skinrules` (`live`), less bit 8 when the live wheel consumer (`wheels`)
+/// places the instanced rows itself, and always less bit 5: the one-bone
+/// streams are the geometry step's (`geomread`, as live). The replay's would be
+/// appended past the buffer's title length, which the burst's reads stop at:
+/// every door vertex read bone 0, the compacted palette's zero entry (doors and
+/// glass gone, pk8a f1030). None when the command line names its own rules or
+/// none are left.
+fn burst_skin_rules(args: &[String], live: u32, wheels: bool) -> Option<u32> {
+    let r = live & !xnw_frame::audit::SKIN_ONE_BONE & if wheels { !xnw_frame::audit::SKIN_INSTANCES } else { u32::MAX };
+    (r != 0 && !args.iter().any(|a| a == "--skin-rules")).then_some(r)
+}
+
 /// The burst's table serves what it holds and nothing else.
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// VEH4b: main's `skinrules=1eb` reaches the replay's vehicle rules (bits 6, 7) in a burst.
+    #[test]
+    fn burst_takes_live_skin_rules() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(burst_skin_rules(&a(&["burst", "--steady"]), 0x1eb, true), Some(0xcb));
+        assert_eq!(burst_skin_rules(&a(&["burst"]), 0x1eb, false), Some(0x1cb));
+        assert_eq!(burst_skin_rules(&a(&["burst", "--skin-rules", "f9"]), 0x1eb, true), None, "the command line's own");
+        assert_eq!(burst_skin_rules(&a(&["burst"]), 0x120, true), None, "nothing left");
+        assert_eq!(burst_skin_rules(&a(&["burst"]), 0, false), None);
+    }
 
     #[test]
     fn table_serves_captured_ranges_only() {
@@ -835,7 +1148,7 @@ mod tests {
         let read = |at, len| read(at, len, |to, from| crate::watch::guarded_read(from as usize, to));
         let k = GeomKey { mesh_at: 0x7_0000_1000, mesh_len: 64, vb_at: 0x7_0000_0000, vb_len: 32, ib: 0, hash: 1 };
         let idx: Vec<u32> = (0..30).map(|i| i % 7).collect();
-        assert!(place_geometry(&k, (0..32u8).collect(), &idx));
+        assert!(place_geometry(&k, (0..32u8).collect(), &idx, None));
         assert_eq!(read(0x7_0000_0004, 8), Some((4..12u8).collect()), "inside the vertex buffer");
         assert_eq!(read(0x7_0000_001C, 8), None, "past its end");
         assert_eq!(read(0x6_FFFF_FFF0, 8), None, "before any entry");
@@ -843,8 +1156,17 @@ mod tests {
         assert_eq!(super::super::expand_meshlets(&mesh).unwrap(), idx);
         // Classic u16 indices at their width; a u16 buffer cannot hold 70,000.
         let c = GeomKey { mesh_at: 0x7_0000_2000, mesh_len: 0, vb_at: 0x7_0000_3000, vb_len: 4, ib: 3 << 8 | 2, hash: 2 };
-        assert!(place_geometry(&c, vec![0; 4], &[1, 2, 3]));
+        assert!(place_geometry(&c, vec![0; 4], &[1, 2, 3], None));
         assert_eq!(read(c.mesh_at, 6), Some(vec![1, 0, 2, 0, 3, 0]));
-        assert!(!place_geometry(&GeomKey { hash: 3, ..c }, vec![0; 4], &[70_000, 1, 2]));
+        assert!(!place_geometry(&GeomKey { hash: 3, ..c }, vec![0; 4], &[70_000, 1, 2], None));
+        // VEH4b: the title's word 0 above the count (the MSR one-bone field; here whole-mesh
+        // form, bone 37) is kept; the count and the triangles are the blob's own.
+        let o = GeomKey { mesh_at: 0x7_0000_4000, mesh_len: 64, vb_at: 0x7_0000_5000, vb_len: 32, ib: 0, hash: 4 };
+        let title = 3u32 << 29 | 37 << 17 | 9;
+        assert!(place_geometry(&o, (0..32u8).collect(), &idx, Some(title)));
+        let mesh = read(o.mesh_at, 4).expect("the meshlets, whole");
+        let w0 = u32::from_le_bytes(mesh[0..4].try_into().unwrap());
+        assert_eq!((w0 >> 17, w0 & 0x1_FFFF), (title >> 17, 1), "one-bone field the title's, count ours");
+        assert_eq!(super::super::expand_meshlets(&mesh).unwrap(), idx);
     }
 }

@@ -134,8 +134,9 @@ pub(crate) struct Desc {
     pub drawn: AtomicBool,
     /// The host pipeline's making, set up on first bind.
     host: OnceLock<Arc<Pending>>,
-    /// Its last program is unnamed or of the UI class (uikeep.rs).
-    ui_class: OnceLock<bool>,
+    /// Its last program is named, and is unnamed or of the UI
+    /// class (uikeep.rs).
+    ui_class: OnceLock<(bool, bool)>,
 }
 
 impl Desc {
@@ -207,9 +208,11 @@ pub(crate) fn created_text() -> String {
 }
 
 /// Pipelines created so far, all slots.
-/// Host pipelines made after the null point.
-pub(crate) fn made_in_null() -> u64 {
-    make::MADE_IN_NULL.load(Ordering::Relaxed)
+/// Host pipelines whose making started after the null point
+/// (refused: expected 0), and those in flight at it that finished after
+/// (not used by kept draws).
+pub(crate) fn made_in_null() -> (u64, u64, u64) {
+    (make::STARTED_IN_NULL.load(Ordering::Relaxed), make::MADE_IN_NULL.load(Ordering::Relaxed), make::UI_MADE_IN_NULL.load(Ordering::Relaxed))
 }
 
 pub(crate) fn created() -> u64 {
@@ -999,18 +1002,98 @@ pub(crate) fn host_pipeline_of(d: &Arc<Desc>) -> Option<&HostPipeline> {
 /// already (never compiled or waited for now), and, inside a stage-30 pass,
 /// only for a program of the UI class.
 fn kept_pipeline(d: &Arc<Desc>) -> Option<&HostPipeline> {
-    if !super::uikeep::keep_now() {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !super::uikeep::on() {
         return None;
     }
-    let Some(made) = make::made_now(pending(d)) else {
-        super::uikeep::NOT_MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let Some(how) = super::uikeep::command_kept() else { return None };
+    let p = pending(d);
+    let stage = super::uikeep::stage_in_pass();
+    // Inside stage 30 an unnamed program is kept; outside a pass
+    // and in stage 6 (Bink, KEEP1) only a named UI one.
+    let (named, ui) = *d.ui_class.get_or_init(|| match make::programs(p).1 {
+        Some(n) => (true, super::uikeep::ui_name(&n)),
+        // Unnamed: of the UI class by hash, else kept only inside stage 30.
+        None if make::last_hash(p).is_some_and(super::uikeep::ui_hash) => (true, true),
+        None => (false, true),
+    });
+    // The world's blits of kept UI work onto the UI plane (sources checked at the draw).
+    let consumer = how == super::uikeep::Kept::UiNameOnly && named && !ui && make::programs(p).1.as_deref().is_some_and(super::uikeep::consumer_name) && super::uikeep::consumer_admit();
+    let wanted = consumer
+        || match how {
+            super::uikeep::Kept::Free => true,
+            super::uikeep::Kept::UiNameOnly if stage.is_some() && stage != Some(6) => ui,
+            super::uikeep::Kept::UiNameOnly => named && ui,
+        };
+    if !wanted {
+        super::uikeep::NOT_UI.fetch_add(1, Relaxed);
+        if make::programs(p).0 != ["compute"] {
+            super::uikeep::refused(Arc::as_ptr(d) as usize, || make::label_of(p));
+        }
+        return None;
+    }
+    // Only a pipeline made before the null point (one in flight at it
+    // is not used). KEEP1 (null from frame 0: none is made before it): one
+    // is made after it for a named UI-class program of plain stages only
+    // (vertex + pixel, or the stage-16 compute); the draw is dropped until
+    // it is made. Any other program is never made in null mode: named once.
+    let Some(made) = make::made_now(p) else {
+        super::uikeep::NOT_MADE.fetch_add(1, Relaxed);
+        let (stages, name) = make::programs(p);
+        let plain = stages.iter().all(|s| matches!(*s, "vertex" | "pixel")) || stages == ["compute"];
+        // While the loading renderer runs (kept freely) also the front
+        // end's own two blits, by name (never cached as UI class: in the
+        // world they are not made).
+        let front = how == super::uikeep::Kept::Free && stages != ["compute"] && name.as_deref().is_some_and(super::uikeep::front_name);
+        if named && (ui || front || consumer) && plain {
+            make::make_kept(p);
+            // The instrument sees the draw as kept before its pipeline is made.
+            if stages != ["compute"] {
+                super::uikeep::drew(Arc::as_ptr(d) as usize, movie_kind(p), || make::label_of(p));
+            }
+        } else if make::first_note(p) && super::uikeep::note_not_ui() {
+            xnw_core::info!("null ui: kept command at stage {} has a program not of the UI class: not made in null mode: {}", stage.map_or("outside".to_string(), |s| s.to_string()), make::label_of(p));
+        }
         return None;
     };
-    if super::uikeep::stage_in_pass() == Some(30) && !*d.ui_class.get_or_init(|| made.stages.last().and_then(|s| s.shader.pack_name()).is_none_or(|n| super::uikeep::ui_name(&n))) {
-        super::uikeep::NOT_UI.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return None;
+    if super::uikeep::dumping() {
+        let names: Vec<String> = made.stages.iter().map(|s| s.shader.pack_name().unwrap_or_else(|| format!("{} {:032x}", s.shader.stage, s.shader.hash))).collect();
+        xnw_core::info!("null ui: world frame {} kept {} at stage {}: {}", super::uikeep::world_frame(), if made.compute { "dispatch" } else { "draw" }, stage.map_or("outside".to_string(), |s| s.to_string()), names.join(" + "));
+    }
+    if !made.compute {
+        super::uikeep::drew(Arc::as_ptr(d) as usize, movie_kind(p), || make::label_of(p));
     }
     Some(made)
+}
+
+/// What a kept draw is to the movie chain (uikeep.rs): 1 the Bink draw, 2
+/// the unnamed fill pair, 0 anything else.
+fn movie_kind(p: &Arc<make::Pending>) -> u8 {
+    if make::last_hash(p).is_some_and(super::uikeep::ui_hash) {
+        2
+    } else if make::programs(p).1.is_some_and(|n| n.rsplit(':').next().unwrap_or(&n).starts_with("PS_Bink")) {
+        1
+    } else {
+        0
+    }
+}
+
+/// KEEP1: the texture views (root parameter, table offset in dwords) the
+/// programs of title pipeline `this` read through tables, from their
+/// translations; `None` while one is not translated.
+pub(crate) fn texture_tables(this: This) -> Option<Vec<(u8, u32)>> {
+    if this.is_null() {
+        return None;
+    }
+    make::texture_tables(pending(&pipeline(this).desc))
+}
+
+/// KEEP1: the programs of title pipeline `this` by pack name (for a log line).
+pub(crate) fn names_of(this: This) -> String {
+    if this.is_null() {
+        return "no pipeline".into();
+    }
+    make::label_of(pending(&pipeline(this).desc))
 }
 
 /// Base pipeline.rs 274 (the form draw.rs calls): the host pipeline of the
@@ -1143,8 +1226,14 @@ static READY: AtomicU64 = AtomicU64::new(0);
 /// Failures by reason: count and the first pipeline or shader.
 static FAILURES: Mutex<Option<HashMap<String, (u64, String)>>> = Mutex::new(None);
 
+thread_local! {
+    /// The last failure noted on this thread (the card sweep's reason).
+    static LAST_FAILURE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
 /// Counts a failure; the first of each reason is logged.
 pub(crate) fn note_failure(reason: &str, what: &str) {
+    LAST_FAILURE.with(|l| reason.clone_into(&mut l.borrow_mut()));
     let mut f = FAILURES.lock().unwrap_or_else(|e| e.into_inner());
     let entry = f.get_or_insert_with(HashMap::new).entry(reason.to_owned()).or_insert_with(|| (0, what.to_owned()));
     entry.0 += 1;

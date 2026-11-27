@@ -473,6 +473,101 @@ pub struct Runner<'h> {
     pub seconds: f64,
     /// Seconds one submission may take before the runner gives up.
     pub limit: f64,
+    /// HAIR7 (the live strand chain): an input buffer with a title address
+    /// and no bytes is bound in place in title memory (`XNW_ZEROCOPY`,
+    /// `xnw_gpu::shared::world_range`) where its page window is open; else
+    /// zeros, as before. Views bound in place since the last [`Runner::forget`].
+    pub in_place: bool,
+    pub placed: u32,
+    /// FACE1: dispatches recorded into one command list ([`Runner::batch`]),
+    /// submitted once (`flush`) before anything reads or holds.
+    batch: Option<Batch>,
+    /// Submissions (each a fence wait) since the last [`Runner::forget`].
+    submissions: std::cell::Cell<u32>,
+    /// FACE1: a batch's descriptor heaps and upload buffers, reused once its
+    /// list has run (~190 dispatches a head, each making two heaps
+    /// and its uploads, cost 400-1000 ms a frame of driver calls on the card).
+    pool: Pool,
+}
+
+/// Descriptor heaps (type, capacity) and upload buffers (capacity) free for
+/// a batch, and those a batch took (back to free when its list has run).
+#[derive(Default)]
+struct Pool {
+    heaps: std::cell::RefCell<Vec<(i32, u32, ID3D12DescriptorHeap)>>,
+    uploads: std::cell::RefCell<Vec<(u64, ID3D12Resource)>>,
+    taken_heaps: std::cell::RefCell<Vec<(i32, u32, ID3D12DescriptorHeap)>>,
+    taken_uploads: std::cell::RefCell<Vec<(u64, ID3D12Resource)>>,
+    /// Objects made (not taken from the free lists) since the last [`Runner::forget`].
+    made: std::cell::Cell<u32>,
+}
+
+/// Free objects kept at most, per kind.
+const POOL_MAX: usize = 4096;
+
+impl Pool {
+    fn heap(&self, dev: &ID3D12Device, ty: D3D12_DESCRIPTOR_HEAP_TYPE, n: u32) -> Result<ID3D12DescriptorHeap, String> {
+        let n = n.max(1);
+        let mut free = self.heaps.borrow_mut();
+        let got = match free.iter().position(|h| h.0 == ty.0 && h.1 >= n) {
+            Some(i) => free.swap_remove(i),
+            None => {
+                let cap = n.next_power_of_two().max(64);
+                // SAFETY: a plain creation call.
+                let h: ID3D12DescriptorHeap = unsafe { dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: ty, NumDescriptors: cap, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, ..Default::default() }) }.map_err(|e| e.message().to_string())?;
+                self.made.set(self.made.get() + 1);
+                (ty.0, cap, h)
+            }
+        };
+        let h = got.2.clone();
+        self.taken_heaps.borrow_mut().push(got);
+        Ok(h)
+    }
+
+    /// As [`upload`]: `bytes` at offset 0, zeros to `size` (at least 256).
+    fn upload(&self, dev: &ID3D12Device, bytes: &[u8], size: u64) -> Result<ID3D12Resource, String> {
+        let need = size.max(256).max(bytes.len() as u64);
+        let mut free = self.uploads.borrow_mut();
+        let got = match free.iter().position(|u| u.0 >= need) {
+            Some(i) => free.swap_remove(i),
+            None => {
+                let cap = need.next_power_of_two();
+                self.made.set(self.made.get() + 1);
+                (cap, bridge::buffer(dev, cap, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ)?)
+            }
+        };
+        let mut at = std::ptr::null_mut();
+        // SAFETY: an upload buffer of `got.0` >= `need` bytes, mapped here; no list in flight uses it (taken lists come back after their fence).
+        unsafe {
+            got.1.Map(0, None, Some(&mut at)).map_err(|e| e.message().to_string())?;
+            std::ptr::write_bytes(at.cast::<u8>(), 0, need as usize);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), at.cast::<u8>(), bytes.len().min(need as usize));
+            got.1.Unmap(0, None);
+        }
+        let r = got.1.clone();
+        self.taken_uploads.borrow_mut().push(got);
+        Ok(r)
+    }
+
+    /// The taken objects back to the free lists (their list has run).
+    fn recycle(&self) {
+        let mut h = self.heaps.borrow_mut();
+        h.append(&mut self.taken_heaps.borrow_mut());
+        h.truncate(POOL_MAX);
+        let mut u = self.uploads.borrow_mut();
+        u.append(&mut self.taken_uploads.borrow_mut());
+        u.truncate(POOL_MAX);
+    }
+}
+
+/// A command list the dispatches of a batch are recorded into, and what
+/// they use until it is submitted.
+struct Batch {
+    _alloc: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    keep: Vec<ID3D12Resource>,
+    heaps: Vec<ID3D12DescriptorHeap>,
+    recorded: u32,
 }
 
 fn content(bytes: &[u8]) -> u64 {
@@ -480,6 +575,12 @@ fn content(bytes: &[u8]) -> u64 {
     let mut h = std::hash::DefaultHasher::new();
     h.write(bytes);
     h.finish()
+}
+
+/// A UAV barrier over every resource: the dispatches before it finish their
+/// unordered writes before the ones after it start.
+fn uav_all() -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE, Anonymous: D3D12_RESOURCE_BARRIER_0 { UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }) } }
 }
 
 fn barrier(r: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_BARRIER {
@@ -541,7 +642,63 @@ impl<'h> Runner<'h> {
     pub fn new(host: &'h xnw_gpu::host::Host) -> Result<Runner<'h>, String> {
         bridge::title_programs_here(host)?;
         let limit = if host.caps.software { 600.0 } else { 2.0 };
-        Ok(Runner { host, kept: HashMap::new(), pipes: HashMap::new(), dropped: BTreeMap::new(), ran: 0, seconds: 0.0, limit })
+        Ok(Runner { host, kept: HashMap::new(), pipes: HashMap::new(), dropped: BTreeMap::new(), ran: 0, seconds: 0.0, limit, in_place: false, placed: 0, batch: None, submissions: std::cell::Cell::new(0), pool: Pool::default() })
+    }
+
+    /// FACE1: `on`: the dispatches from here on are recorded into one
+    /// command list, ordered by UAV barriers, and submitted once (one fence
+    /// wait) when something reads, holds or hands out a resource, or at
+    /// `batch(false)`; their GPU seconds are the submission's wall time
+    /// ([`Runner::seconds`]), not per dispatch. `off`: submits what is recorded.
+    pub fn batch(&mut self, on: bool) -> Result<(), String> {
+        if on {
+            if self.batch.is_none() {
+                let (alloc, list) = self.list()?;
+                self.batch = Some(Batch { _alloc: alloc, list, keep: Vec::new(), heaps: Vec::new(), recorded: 0 });
+            }
+            return Ok(());
+        }
+        self.flush()?;
+        self.batch = None;
+        Ok(())
+    }
+
+    /// Submits the batch's recorded dispatches (if any) and starts a new list.
+    fn flush(&mut self) -> Result<(), String> {
+        let Some(b) = self.batch.as_ref().filter(|b| b.recorded > 0) else { return Ok(()) };
+        let t = std::time::Instant::now();
+        let list = b.list.clone();
+        let sent = self.submit(&list);
+        self.seconds += t.elapsed().as_secs_f64();
+        // Its heaps and uploads are free again once it has run (not after a failure: the list may still hold them).
+        if sent.is_ok() {
+            self.pool.recycle();
+        }
+        let (alloc, list) = self.list()?;
+        self.batch = Some(Batch { _alloc: alloc, list, keep: Vec::new(), heaps: Vec::new(), recorded: 0 });
+        sent
+    }
+
+    /// Submissions (each with its fence wait) since the last [`Runner::forget`].
+    pub fn submissions(&self) -> u32 {
+        self.submissions.get()
+    }
+
+    /// Descriptor heaps and upload buffers a batch made since the last
+    /// [`Runner::forget`] (the rest came from its pool).
+    pub fn made(&self) -> u32 {
+        self.pool.made.get()
+    }
+
+    /// [`Runner::forget`], keeping the resources `keep` names (FACE1: the
+    /// head graph's large buffers, the same title object frame to frame,
+    /// stay on the device as the console's do).
+    pub fn forget_except(&mut self, keep: &dyn Fn(u64, Held) -> bool) {
+        self.kept.retain(|k, v| keep(*k, v.held));
+        self.dropped.clear();
+        (self.ran, self.seconds, self.placed) = (0, 0.0, 0);
+        self.submissions.set(0);
+        self.pool.made.set(0);
     }
 
     /// Drops every kept resource and the counts; the pipelines stay (HAIR6:
@@ -549,7 +706,27 @@ impl<'h> Runner<'h> {
     pub fn forget(&mut self) {
         self.kept.clear();
         self.dropped.clear();
-        (self.ran, self.seconds) = (0, 0.0);
+        (self.ran, self.seconds, self.placed) = (0, 0.0, 0);
+        self.submissions.set(0);
+    }
+
+    /// HAIR7: the resource kept at title address `key`, left in the common
+    /// state (a submission of its barrier when it was in another): the strand
+    /// draws read the chain's pool there, on the device, without a copy.
+    pub fn resource(&mut self, key: u64) -> Result<Option<bridge::DeviceBuffer>, String> {
+        self.flush()?;
+        let Some(k) = self.kept.get(&key) else { return Ok(None) };
+        let (res, state) = (k.res.clone(), k.state);
+        if state != D3D12_RESOURCE_STATE_COMMON {
+            let (_alloc, list) = self.list()?;
+            // SAFETY: a barrier on a live resource the runner keeps.
+            unsafe { list.ResourceBarrier(&[barrier(&res, state, D3D12_RESOURCE_STATE_COMMON)]) };
+            self.submit(&list)?;
+            if let Some(k) = self.kept.get_mut(&key) {
+                k.state = D3D12_RESOURCE_STATE_COMMON;
+            }
+        }
+        Ok(Some(bridge::DeviceBuffer(res)))
     }
 
     /// What the runner holds at title address `key`.
@@ -608,6 +785,7 @@ impl<'h> Runner<'h> {
     }
 
     fn submit(&self, list: &ID3D12GraphicsCommandList) -> Result<(), String> {
+        self.submissions.set(self.submissions.get() + 1);
         let e = |e: windows::core::Error| e.message().to_string();
         // SAFETY: plain COM calls on live objects.
         unsafe {
@@ -644,6 +822,7 @@ impl<'h> Runner<'h> {
     /// a [`Res`] gives them): an input the chain reads that no dispatch of
     /// it writes (a captured texture, a stand-in).
     pub fn hold(&mut self, r: &Res) -> Result<(), String> {
+        self.flush()?;
         let (_alloc, list) = self.list()?;
         let mut keep = Vec::new();
         self.make(&list, r, &mut keep)?;
@@ -736,8 +915,14 @@ impl<'h> Runner<'h> {
                 let before: Vec<u64> = self.kept.keys().copied().collect();
                 let ran = self.run(shader, pipe, uses, job, &b);
                 if ran.is_err() {
-                    // Resources made for a list that never ran hold nothing: forget them.
-                    self.kept.retain(|k, _| before.contains(k));
+                    // Resources made for a list that never ran hold nothing: forget them
+                    // (in a batch, alive until its list is submitted: its copies name them).
+                    let gone: Vec<u64> = self.kept.keys().filter(|k| !before.contains(k)).copied().collect();
+                    for k in gone {
+                        if let (Some(v), Some(b)) = (self.kept.remove(&k), self.batch.as_mut()) {
+                            b.keep.push(v.res);
+                        }
+                    }
                 }
                 // A failure on a removed device carries the validation layer's errors.
                 // SAFETY: a plain query.
@@ -832,7 +1017,12 @@ impl<'h> Runner<'h> {
             }
         }
         items.extend(job.heap.iter().map(|(k, x)| (*k, *x, false)));
-        let (_alloc, list) = self.list()?;
+        // FACE1: in a batch, recorded into its list and submitted later.
+        let (_alloc, list) = match &self.batch {
+            Some(b) => (None, b.list.clone()),
+            None => self.list().map(|(a, l)| (Some(a), l))?,
+        };
+        let batched = self.batch.is_some();
         let mut keep: Vec<ID3D12Resource> = Vec::new();
         let mut ran = Ran::default();
         // Kept resources first: made on first sight (a UAV, or any view
@@ -845,7 +1035,15 @@ impl<'h> Runner<'h> {
         // SAFETY: D3D12 calls with descriptions that outlive them; every
         // resource lives in `keep` or `self.kept` until the fence says the GPU is done.
         unsafe {
-            let heap = |ty, n: u32| -> Result<ID3D12DescriptorHeap, String> { dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: ty, NumDescriptors: n.max(1), Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, ..Default::default() }).map_err(e) };
+            // FACE1: a batch takes its heaps and uploads from the pool.
+            let pool = &self.pool;
+            let heap = |ty, n: u32| -> Result<ID3D12DescriptorHeap, String> {
+                if batched {
+                    return pool.heap(&dev, ty, n);
+                }
+                dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: ty, NumDescriptors: n.max(1), Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, ..Default::default() }).map_err(e)
+            };
+            let upload = |dev: &ID3D12Device, bytes: &[u8], size: u64| if batched { pool.upload(dev, bytes, size) } else { upload(dev, bytes, size) };
             let views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, b.views.heap_slots)?;
             let samplers = heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, b.sampler_slots)?;
             let step = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
@@ -881,6 +1079,29 @@ impl<'h> Runner<'h> {
                         };
                         let kind = if x.uav && x.kind == Kind::Raw { Kind::RawUav { len: len.min(u64::from(u32::MAX)) as u32 } } else { x.kind };
                         let Some((size, n)) = kind.extent(len) else { continue };
+                        // HAIR7: an input with an address and no bytes, in title memory in place.
+                        let placed = if self.in_place && kept.is_none() && !x.uav && x.bytes.is_empty() && x.key != 0 && kind != Kind::Cbv {
+                            xnw_gpu::shared::world_range(x.key, size).filter(|t| t.offset.is_multiple_of(bridge::unit(kind)))
+                        } else {
+                            None
+                        };
+                        if let Some(t) = placed {
+                            let first = t.offset / bridge::unit(kind);
+                            let srv_first = |format, n: u32, stride: u32, flags, first: u64| D3D12_SHADER_RESOURCE_VIEW_DESC { Format: format, ViewDimension: D3D12_SRV_DIMENSION_BUFFER, Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Buffer: D3D12_BUFFER_SRV { FirstElement: first, NumElements: n, StructureByteStride: stride, Flags: flags } } };
+                            let raw_n = (size / 4).min(u64::from(u32::MAX)) as u32;
+                            match kind {
+                                Kind::Raw => dev.CreateShaderResourceView(&t.buffer, Some(&srv_first(DXGI_FORMAT_R32_TYPELESS, n, 0, D3D12_BUFFER_SRV_FLAG_RAW, t.offset / 4)), at(*s)),
+                                Kind::Structured(stride) => dev.CreateShaderResourceView(&t.buffer, Some(&srv_first(DXGI_FORMAT_UNKNOWN, n, stride.max(4), D3D12_BUFFER_SRV_FLAG_NONE, first)), at(*s)),
+                                Kind::Typed { format, .. } => dev.CreateShaderResourceView(&t.buffer, Some(&srv_first(DXGI_FORMAT(format), n, 0, D3D12_BUFFER_SRV_FLAG_NONE, first)), at(*s)),
+                                Kind::Cbv | Kind::RawUav { .. } => {}
+                            }
+                            if twin != 0 {
+                                dev.CreateShaderResourceView(&t.buffer, Some(&srv_first(DXGI_FORMAT_R32_TYPELESS, raw_n, 0, D3D12_BUFFER_SRV_FLAG_RAW, t.offset / 4)), at(twin - 1));
+                            }
+                            self.placed += 1;
+                            keep.push(t.buffer);
+                            continue;
+                        }
                         let res = match kept {
                             Some(k) => k.res.clone(),
                             None if x.uav => {
@@ -1085,6 +1306,20 @@ impl<'h> Runner<'h> {
             if shader.reads_heap_bounds() {
                 list.SetComputeRoot32BitConstants(param, 8, b.views.bounds.as_ptr().cast(), 0);
             }
+            if batched {
+                // After the dispatches recorded before it (they may write what it reads).
+                list.ResourceBarrier(&[uav_all()]);
+                list.Dispatch(job.groups[0], job.groups[1], job.groups[2]);
+                let b = self.batch.as_mut().expect("batch");
+                b.keep.extend(keep);
+                b.heaps.extend([views, samplers]);
+                b.recorded += 1;
+                ran.wrote.sort_unstable();
+                ran.wrote.dedup();
+                ran.read_kept.sort_unstable();
+                ran.read_kept.dedup();
+                return Ok(ran);
+            }
             let stamps: ID3D12QueryHeap = {
                 let mut h: Option<ID3D12QueryHeap> = None;
                 dev.CreateQueryHeap(&D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: 2, NodeMask: 0 }, &mut h).map_err(e)?;
@@ -1122,6 +1357,7 @@ impl<'h> Runner<'h> {
     /// The bytes held at `key`: a buffer's whole length, a texture's mip 0
     /// as unpadded rows, slices in order (the layout [`Image::texels`] takes).
     pub fn read(&mut self, key: u64) -> Result<Vec<u8>, String> {
+        self.flush()?;
         let (_alloc, list) = self.list()?;
         let dev = self.host.device.clone();
         let e = |e: windows::core::Error| e.message().to_string();

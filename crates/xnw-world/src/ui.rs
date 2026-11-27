@@ -88,34 +88,52 @@ pub struct Layer {
     pub seconds: f64,
 }
 
-/// Draws `rows` in order into one layer of `size`, on one command list, on
-/// `host` (the title's programs: [`bridge::title_programs_here`]); a row
-/// that cannot be set up is a line and is left out. `limit`: seconds the
-/// submission may take.
-pub fn draw_layer(host: &xnw_gpu::host::Host, rows: &[Row], size: (u32, u32), limit: f64) -> Result<Layer, String> {
-    bridge::title_programs_here(host)?;
-    let e = |e: windows::core::Error| e.message().to_string();
+/// LIVE1: the rows' pipelines by content (both programs' DXIL, blend,
+/// cull, input layout), made once for the run instead of every frame.
+struct PipesCache(std::collections::HashMap<u128, std::sync::Arc<Pipes>>);
+// SAFETY: D3D12 objects are free-threaded; the cache is used under its lock.
+unsafe impl Send for PipesCache {}
+static PIPES: std::sync::Mutex<Option<PipesCache>> = std::sync::Mutex::new(None);
+
+fn pipes_of(dev: &ID3D12Device, r: &Row, elems: &[D3D12_INPUT_ELEMENT_DESC]) -> Result<std::sync::Arc<Pipes>, String> {
+    let layout: Vec<u8> = r.inputs.iter().flat_map(|x| [x.name.as_bytes(), &x.index.to_le_bytes(), &x.format.to_le_bytes(), &x.slot.to_le_bytes(), &x.offset.to_le_bytes(), &[u8::from(x.per_instance)], &x.step.to_le_bytes()].concat()).collect();
+    let state: Vec<u8> = r.blend.iter().chain(&[r.cull]).flat_map(|w| w.to_le_bytes()).collect();
+    let device = (windows::core::Interface::as_raw(dev) as usize).to_le_bytes();
+    let key = xnw_core::hash128(&[&r.programs.ms.dxil, &r.programs.ps.dxil, &layout, &state, format!("{:?}", r.programs.vertex).as_bytes(), &device]);
+    let mut g = PIPES.lock().unwrap_or_else(|e| e.into_inner());
+    let cache = &mut g.get_or_insert_with(|| PipesCache(std::collections::HashMap::new())).0;
+    if let Some(p) = cache.get(&key) {
+        return Ok(p.clone());
+    }
+    let p = std::sync::Arc::new(Pipes::new_ia(dev, r.programs, LAYER, blend_desc(r.blend), D3D12_CULL_MODE(r.cull.max(1) as i32), elems)?);
+    if cache.len() > 4096 {
+        cache.clear();
+    }
+    cache.insert(key, p.clone());
+    Ok(p)
+}
+
+/// What a recorded layer keeps alive until its fence: pipelines, uploads.
+#[derive(Default)]
+struct Held {
+    pipes: Vec<(std::sync::Arc<Pipes>, bridge::Uploaded)>,
+    keep: Vec<ID3D12Resource>,
+}
+
+/// Records `rows` in order onto `list` into the target `rtv` of `size`
+/// (cleared first): the rows drawn; a row that cannot be set up is a line.
+///
+/// # Safety
+/// `list` is open; `rtv` names a target of `size` in the render-target state.
+unsafe fn record_rows(host: &xnw_gpu::host::Host, list: &ID3D12GraphicsCommandList, rtv: D3D12_CPU_DESCRIPTOR_HANDLE, rows: &[Row], size: (u32, u32), lines: &mut Vec<String>, held: &mut Held) -> Result<usize, String> {
     let dev = &host.device;
     let (w, h) = size;
-    let mut lines = Vec::new();
-    // SAFETY: D3D12 calls with descriptions that outlive them; every
-    // resource lives until the fence says the GPU is done.
+    let mut drawn = 0;
+    // SAFETY: the caller's open list; descriptions outlive each call.
     unsafe {
-        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
-        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(e)?;
-        let rt = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        let clear = D3D12_CLEAR_VALUE { Format: LAYER, Anonymous: D3D12_CLEAR_VALUE_0 { Color: [0.0; 4] } };
-        let desc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: u64::from(w), Height: h, DepthOrArraySize: 1, MipLevels: 1, Format: LAYER, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, ..Default::default() };
-        let colour = bridge::committed(dev, &desc, D3D12_HEAP_TYPE_DEFAULT, rt, Some(&clear))?;
-        let rtvs: ID3D12DescriptorHeap = dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: 1, ..Default::default() }).map_err(e)?;
-        let rtv = rtvs.GetCPUDescriptorHandleForHeapStart();
-        dev.CreateRenderTargetView(&colour, None, rtv);
         list.ClearRenderTargetView(rtv, &[0.0; 4], None);
         let records = bridge::buffer(dev, 256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)?;
         let mut shared = Shared::default();
-        let mut keep: Vec<ID3D12Resource> = Vec::new();
-        let mut held = Vec::new();
-        let mut drawn = 0;
         for (i, r) in rows.iter().enumerate() {
             if let Some(gap) = bridge::gap(&host.caps, &r.programs.needs()) {
                 lines.push(format!("  ui row {i}: not run: {gap}"));
@@ -136,14 +154,14 @@ pub fn draw_layer(host: &xnw_gpu::host::Host, rows: &[Row], size: (u32, u32), li
                     InstanceDataStepRate: x.step,
                 })
                 .collect();
-            let pipes = match Pipes::new_ia(dev, r.programs, LAYER, blend_desc(r.blend), D3D12_CULL_MODE(r.cull.max(1) as i32), &elems) {
+            let pipes = match pipes_of(dev, r, &elems) {
                 Ok(p) => p,
                 Err(x) => {
                     lines.push(format!("  ui row {i}: no pipeline: {x}"));
                     continue;
                 }
             };
-            let up = match bridge::upload(dev, &list, &r.binding, &pipes, &mut shared) {
+            let up = match bridge::upload(dev, list, &r.binding, &pipes, &mut shared) {
                 Ok(u) => u,
                 Err(x) => {
                     lines.push(format!("  ui row {i}: binding not uploaded: {x}"));
@@ -156,31 +174,81 @@ pub fn draw_layer(host: &xnw_gpu::host::Host, rows: &[Row], size: (u32, u32), li
                 let size = (bytes.len() as u64).next_multiple_of(256);
                 let b = bridge::upload_bytes(dev, bytes, size)?;
                 vbs[slot as usize] = D3D12_VERTEX_BUFFER_VIEW { BufferLocation: b.GetGPUVirtualAddress(), SizeInBytes: bytes.len() as u32, StrideInBytes: stride };
-                keep.push(b);
+                held.keep.push(b);
             }
             let ibv = match r.indices {
                 Some((bytes, format)) => {
                     let b = bridge::upload_bytes(dev, bytes, (bytes.len() as u64).next_multiple_of(256))?;
                     let v = D3D12_INDEX_BUFFER_VIEW { BufferLocation: b.GetGPUVirtualAddress(), SizeInBytes: bytes.len() as u32, Format: DXGI_FORMAT(format as i32) };
-                    keep.push(b);
+                    held.keep.push(b);
                     Some(v)
                 }
                 None => None,
             };
-            let first = rtv;
-            list.OMSetRenderTargets(1, Some(&first), true, None);
+            list.OMSetRenderTargets(1, Some(&rtv), true, None);
             list.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: w as f32, Height: h as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
             list.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 }]);
-            bridge::record_ia_draw(&list, &pipes, &up, records.GetGPUVirtualAddress(), &vbs, ibv.as_ref(), r.draw, r.strip);
+            bridge::record_ia_draw(list, &pipes, &up, records.GetGPUVirtualAddress(), &vbs, ibv.as_ref(), r.draw, r.strip);
             drawn += 1;
-            held.push((pipes, up));
+            held.pipes.push((pipes, up));
         }
+        held.keep.push(records);
+    }
+    Ok(drawn)
+}
+
+/// A layer target of `size` with its render-target view.
+fn target(dev: &ID3D12Device, size: (u32, u32)) -> Result<(ID3D12Resource, ID3D12DescriptorHeap), String> {
+    let e = |e: windows::core::Error| e.message().to_string();
+    let clear = D3D12_CLEAR_VALUE { Format: LAYER, Anonymous: D3D12_CLEAR_VALUE_0 { Color: [0.0; 4] } };
+    let desc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: u64::from(size.0), Height: size.1, DepthOrArraySize: 1, MipLevels: 1, Format: LAYER, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, ..Default::default() };
+    let colour = bridge::committed(dev, &desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_RENDER_TARGET, Some(&clear))?;
+    // SAFETY: plain descriptor heap creation and a view of our resource.
+    unsafe {
+        let rtvs: ID3D12DescriptorHeap = dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: 1, ..Default::default() }).map_err(e)?;
+        dev.CreateRenderTargetView(&colour, None, rtvs.GetCPUDescriptorHandleForHeapStart());
+        Ok((colour, rtvs))
+    }
+}
+
+/// Copies `colour` (render-target state) into the buffer `to` as rows of
+/// `pitch` bytes, and puts `colour` back in the render-target state.
+///
+/// # Safety
+/// `list` is open; `to` is a buffer of `pitch * height` bytes in the copy-destination state (or promotable).
+unsafe fn copy_out(list: &ID3D12GraphicsCommandList, colour: &ID3D12Resource, to: &ID3D12Resource, size: (u32, u32), pitch: u32) {
+    let rt = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    // SAFETY: the caller's list and resources.
+    unsafe {
+        list.ResourceBarrier(&[bridge::barrier(colour, rt, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+        let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(to), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: 0, Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: LAYER, Width: size.0, Height: size.1, Depth: 1, RowPitch: pitch } } } };
+        let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(colour), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+        list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        list.ResourceBarrier(&[bridge::barrier(colour, D3D12_RESOURCE_STATE_COPY_SOURCE, rt)]);
+    }
+}
+
+/// Draws `rows` in order into one layer of `size`, on one command list, on
+/// `host` (the title's programs: [`bridge::title_programs_here`]); a row
+/// that cannot be set up is a line and is left out. `limit`: seconds the
+/// submission may take. The layer is read back (the replay's way).
+pub fn draw_layer(host: &xnw_gpu::host::Host, rows: &[Row], size: (u32, u32), limit: f64) -> Result<Layer, String> {
+    bridge::title_programs_here(host)?;
+    let e = |e: windows::core::Error| e.message().to_string();
+    let dev = &host.device;
+    let (w, h) = size;
+    let mut lines = Vec::new();
+    // SAFETY: D3D12 calls with descriptions that outlive them; every
+    // resource lives until the fence says the GPU is done.
+    unsafe {
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(e)?;
+        let (colour, rtvs) = target(dev, size)?;
+        let mut held = Held::default();
+        let drawn = record_rows(host, &list, rtvs.GetCPUDescriptorHandleForHeapStart(), rows, size, &mut lines, &mut held)?;
         let pitch = (w * 4).next_multiple_of(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
         let back = bridge::buffer(dev, u64::from(pitch) * u64::from(h), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST)?;
-        list.ResourceBarrier(&[bridge::barrier(&colour, rt, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-        let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&back), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: 0, Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: LAYER, Width: w, Height: h, Depth: 1, RowPitch: pitch } } } };
-        let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&colour), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
-        list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        copy_out(&list, &colour, &back, size, pitch);
         list.Close().map_err(e)?;
         let queue = &host.queue;
         let t0 = std::time::Instant::now();
@@ -204,8 +272,148 @@ pub fn draw_layer(host: &xnw_gpu::host::Host, rows: &[Row], size: (u32, u32), li
             rgba.extend_from_slice(std::slice::from_raw_parts(from.cast::<u8>().add(y * pitch as usize), (w * 4) as usize));
         }
         back.Unmap(0, None);
-        drop((held, keep, records, colour));
+        drop((held, colour));
         Ok(Layer { rgba, lines, drawn, seconds })
+    }
+}
+
+/// LIVE1: a layer that stays on the GPU: a buffer of `size` RGBA8 pixels
+/// (rows of width * 4 bytes, as [`UiPass`] reads the uploaded bytes),
+/// written by a submission on the UI host's queue that signals `fence` to
+/// `value`. Our pass waits for it on its own queue (`queue.Wait`), then
+/// composes it: no readback, no upload.
+pub struct GpuLayer {
+    pub buf: ID3D12Resource,
+    pub fence: ID3D12Fence,
+    pub value: u64,
+    pub size: (u32, u32),
+}
+
+// SAFETY: D3D12 objects are free-threaded; the layer is only read.
+unsafe impl Send for GpuLayer {}
+unsafe impl Sync for GpuLayer {}
+
+/// A frame's UI layer as the pass takes it: bytes (the replay, the burst)
+/// or a [`GpuLayer`] (the live path).
+pub enum UiLayer {
+    Bytes { size: (u32, u32), rgba: Vec<u8> },
+    Gpu(GpuLayer),
+}
+
+impl std::fmt::Debug for UiLayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UiLayer::Bytes { size, rgba } => write!(f, "UiLayer::Bytes({}x{}, {} B)", size.0, size.1, rgba.len()),
+            UiLayer::Gpu(g) => write!(f, "UiLayer::Gpu({}x{}, fence {})", g.size.0, g.size.1, g.value),
+        }
+    }
+}
+
+impl UiLayer {
+    pub fn size(&self) -> (u32, u32) {
+        match self {
+            UiLayer::Bytes { size, .. } => *size,
+            UiLayer::Gpu(g) => g.size,
+        }
+    }
+
+    /// Makes `queue` wait for the layer's submission (bytes: nothing to wait for).
+    pub fn wait_on(&self, queue: &ID3D12CommandQueue) -> Result<(), String> {
+        if let UiLayer::Gpu(g) = self {
+            // SAFETY: our queue and the layer's fence.
+            unsafe { queue.Wait(&g.fence, g.value) }.map_err(|e| e.message().to_string())?;
+        }
+        Ok(())
+    }
+}
+
+/// Slots of the GPU layer ring: a slot is written again only once its last
+/// submission ended and three newer layers were made (our pass composes
+/// the newest, at most a frame behind).
+const RING: usize = 4;
+
+struct Slot {
+    colour: ID3D12Resource,
+    rtvs: ID3D12DescriptorHeap,
+    buf: ID3D12Resource,
+    alloc: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    value: u64,
+    held: Held,
+}
+
+struct Ring {
+    device: usize,
+    size: (u32, u32),
+    fence: ID3D12Fence,
+    value: u64,
+    slots: Vec<Slot>,
+    next: usize,
+}
+
+// SAFETY: D3D12 objects are free-threaded; the ring is used under its lock.
+unsafe impl Send for Ring {}
+static GPU_RING: std::sync::Mutex<Option<Ring>> = std::sync::Mutex::new(None);
+
+/// LIVE1: as [`draw_layer`], but the layer stays on the GPU ([`GpuLayer`]):
+/// the rows are recorded and sent on `host`'s queue without a wait (the
+/// slot's earlier submission is waited for only when it is still running,
+/// at most `limit` seconds), with the pipelines kept for the run.
+pub fn draw_layer_gpu(host: &xnw_gpu::host::Host, rows: &[Row], size: (u32, u32), limit: f64) -> Result<(GpuLayer, Vec<String>, usize), String> {
+    bridge::title_programs_here(host)?;
+    let e = |e: windows::core::Error| e.message().to_string();
+    let dev = &host.device;
+    let (w, h) = size;
+    let pitch = w * 4;
+    let mut lines = Vec::new();
+    let mut g = GPU_RING.lock().unwrap_or_else(|e| e.into_inner());
+    let device = windows::core::Interface::as_raw(dev) as usize;
+    // SAFETY: D3D12 calls with descriptions that outlive them; a slot's
+    // resources live until its fence value is reached.
+    unsafe {
+        if g.as_ref().is_none_or(|r| r.device != device || r.size != size) {
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
+            let mut slots = Vec::with_capacity(RING);
+            for _ in 0..RING {
+                let (colour, rtvs) = target(dev, size)?;
+                // Common state: the copy promotes it, the list's end decays it, our pass's read promotes it.
+                let buf = bridge::buffer(dev, u64::from(pitch) * u64::from(h), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON)?;
+                let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
+                let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(e)?;
+                list.Close().map_err(e)?;
+                slots.push(Slot { colour, rtvs, buf, alloc, list, value: 0, held: Held::default() });
+            }
+            *g = Some(Ring { device, size, fence, value: 0, slots, next: 0 });
+        }
+        let ring = g.as_mut().ok_or("no ring")?;
+        let k = ring.next;
+        ring.next = (k + 1) % RING;
+        let fence = ring.fence.clone();
+        let slot = &mut ring.slots[k];
+        let t0 = std::time::Instant::now();
+        while fence.GetCompletedValue() < slot.value {
+            dev.GetDeviceRemovedReason().map_err(|x| format!("ui layer: an earlier submission: {}", e(x)))?;
+            if t0.elapsed().as_secs_f64() > limit {
+                return Err(format!("ui layer: an earlier submission took over {limit} s"));
+            }
+            std::thread::yield_now();
+        }
+        slot.held = Held::default();
+        slot.alloc.Reset().map_err(e)?;
+        slot.list.Reset(&slot.alloc, None).map_err(e)?;
+        let list = slot.list.clone();
+        let mut held = Held::default();
+        let drawn = record_rows(host, &list, slot.rtvs.GetCPUDescriptorHandleForHeapStart(), rows, size, &mut lines, &mut held)?;
+        copy_out(&list, &slot.colour, &slot.buf, size, pitch);
+        list.Close().map_err(e)?;
+        host.queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).map_err(e)?)]);
+        ring.value += 1;
+        let value = ring.value;
+        host.queue.Signal(&fence, value).map_err(e)?;
+        let slot = &mut ring.slots[k];
+        slot.value = value;
+        slot.held = held;
+        Ok((GpuLayer { buf: slot.buf.clone(), fence, value, size }, lines, drawn))
     }
 }
 
@@ -274,6 +482,19 @@ impl UiPass {
         }
     }
 
+    /// Records `layer` over the bound colour target of `l` (open): bytes are
+    /// uploaded, a [`GpuLayer`]'s buffer is read in place (the queue waited
+    /// for it: [`UiLayer::wait_on`]).
+    pub fn record_layer(&mut self, device: &ID3D12Device, l: &ID3D12GraphicsCommandList, layer: &UiLayer) -> Result<(), String> {
+        match layer {
+            UiLayer::Bytes { size, rgba } => self.record(device, l, rgba, *size),
+            UiLayer::Gpu(g) => {
+                self.compose(l, g.buf.clone(), g.size);
+                Ok(())
+            }
+        }
+    }
+
     /// Records the layer `rgba` (premultiplied RGBA8 at `size`) over the
     /// bound colour target of `l` (open).
     pub fn record(&mut self, device: &ID3D12Device, l: &ID3D12GraphicsCommandList, rgba: &[u8], size: (u32, u32)) -> Result<(), String> {
@@ -282,6 +503,12 @@ impl UiPass {
             return Err(format!("layer of {} bytes for {}x{}", rgba.len(), size.0, size.1));
         }
         let buf = bridge::upload_bytes(device, rgba, bytes.next_multiple_of(256))?;
+        self.compose(l, buf, size);
+        Ok(())
+    }
+
+    /// The plane blend of the pixels in `buf` (rows of width * 4 bytes).
+    fn compose(&mut self, l: &ID3D12GraphicsCommandList, buf: ID3D12Resource, size: (u32, u32)) {
         // SAFETY: an open list and our live objects.
         unsafe {
             let k = [size.0, size.1, 0, 0];
@@ -296,7 +523,6 @@ impl UiPass {
         while self.bufs.len() > 3 {
             self.bufs.pop_front();
         }
-        Ok(())
     }
 }
 

@@ -319,12 +319,16 @@ pub fn run(args: &[String]) -> Res<()> {
     unsafe { crate::titlemeter::install(title.base()) };
     // SAFETY: as above (`XNW_LOD_SCALE`: the LOD scale getter's call sites; off when unset).
     unsafe { crate::levers::lod_install(title.base()) };
+    // SAFETY: as above (`XNW_ENCODE_TIME`, `XNW_PATCH=noencode`: the geometry draws' inner call sites; off when unset).
+    unsafe { crate::encode::install(title.base()) };
     // SAFETY: as above.
     unsafe { crate::watch::start(title.base()) };
     // SAFETY: as above (`XNW_DWATCH`, a DR0 write watch; off when unset).
     unsafe { crate::dwatch::start(title.base()) };
     // SAFETY: as above.
     unsafe { crate::worldprobe::start(title.base()) };
+    // SW1: the live switches' start values, the key map, the control file's poll.
+    crate::live::start();
     // SAFETY: as above.
     unsafe { crate::dirtyfilter::start(title.base()) };
     let late = LATE.get_or_init(|| Late { game: game.clone(), cache: cache.clone(), filters, dlls: Mutex::new(dlls.clone()), lock: LoaderLock::default() });

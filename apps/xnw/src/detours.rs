@@ -16,8 +16,8 @@
 //! `stages`: the runner of the title's render stage callbacks,
 //! `title+0x43c3890` (`stagemeter.rs`: `XNW_STAGE_TIME`, `XNW_STAGE_SKIP`).
 //!
-//! `clock`: the game clock's tick `title+0x15120b0` (`levers.rs`: `XNW_CLOCK`).
-//! `cine`: the cinematic instance tick `title+0x50f89c0` (`levers.rs`: `XNW_CINE`).
+//! `clock`: the game clock's tick `title+0x15120b0` (`levers.rs`: `XNW_CLOCK`, `XNW_SAVE_AT`).
+//! `cine`: the cinematic instance tick `title+0x50f89c0` (`levers.rs`: `XNW_CINE`, `XNW_INTRO`).
 //! `fencewait`: the title's wait for a fence token `title+0x4fb0ad0`
 //! (`fencewait.rs`: `XNW_FENCE_WAIT`).
 
@@ -118,7 +118,7 @@ fn jump(to: usize) -> [u8; 14] {
 }
 
 /// Installs the detours wanted (`XNW_ROLES=lock`: `lock`; `XNW_STAGE_TIME`,
-/// `XNW_STAGE_SKIP`, `XNW_AB` or `XNW_STOP_WORLD_FRAMES`: `stages`; `XNW_CLOCK`: `clock`; `XNW_CINE`: `cine`;
+/// `XNW_STAGE_SKIP`, `XNW_AB`, `XNW_STOP_WORLD_FRAMES`, `XNW_SAVE_AT`, `XNW_ENCODE_TIME`, `XNW_ENCODE_CHECK` or `XNW_PATCH=noencode`: `stages`; `XNW_CLOCK` or `XNW_SAVE_AT`: `clock`; `XNW_CINE` or `XNW_INTRO`: `cine`;
 /// `XNW_FENCE_WAIT`: `fencewait`) on the title at `base`.
 ///
 /// # Safety
@@ -126,14 +126,19 @@ fn jump(to: usize) -> [u8; 14] {
 pub unsafe fn install(base: usize) {
     // SAFETY: forwarded.
     let stamp = unsafe { crate::patches::timestamp(base) };
+    // SAFETY: the mapped title of this build (its code is read only then).
+    let save = stamp == BUILD_1_0_2_1 && unsafe { crate::levers::save_configure(base) };
     let wanted = [
         ("lock", xnw_gpu::d3d12x::roles_lock()),
-        // Both read (no short cut): the meter's switches, then the A/B and stop ones that count its frames.
-        ("stages", crate::stagemeter::configure(base) | (stamp == BUILD_1_0_2_1 && crate::ab::configure(base))),
-        // SAFETY: the mapped title of this build (its code is read only then).
-        ("clock", stamp == BUILD_1_0_2_1 && unsafe { crate::levers::clock_configure(base) }),
+        // All read (no short cut): the meter's switches, then the A/B, stop, save and encode ones that count its frames.
+        (
+            "stages",
+            crate::stagemeter::configure(base) | (stamp == BUILD_1_0_2_1 && crate::ab::configure(base)) | save | crate::encode::configure(),
+        ),
+        // SAFETY: as above. `XNW_SAVE_AT` asks from the clock tick too.
+        ("clock", (stamp == BUILD_1_0_2_1 && unsafe { crate::levers::clock_configure(base) }) | save),
         // SAFETY: as above.
-        ("cine", stamp == BUILD_1_0_2_1 && unsafe { crate::levers::cine_configure(base) }),
+        ("cine", stamp == BUILD_1_0_2_1 && unsafe { crate::levers::cine_configure(base) | crate::levers::intro_configure(base) }),
         // SAFETY: as above.
         ("fencewait", stamp == BUILD_1_0_2_1 && unsafe { crate::fencewait::configure(base) }),
     ];

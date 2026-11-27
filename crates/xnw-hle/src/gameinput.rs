@@ -1102,6 +1102,8 @@ mod host {
                 // mouse buttons (below 0x08).
                 let held: Vec<u8> = (0x08..=0xFE_u8)
                     .filter(|vk| !(0x10..=0x12).contains(vk) && !down.contains(vk))
+                    // SW1: F1-F12 are the live switches' keys (window.rs), not the title's.
+                    .filter(|&vk| !(crate::window::live_keys() && crate::window::LIVE_VK.contains(&usize::from(vk))))
                     // SAFETY: plain queries.
                     .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
                     .collect();
@@ -1262,6 +1264,11 @@ enum RuleKind {
     /// after its watched value last changed (a new screen settles first);
     /// never again once `until` has held after `while` first held.
     Every { period: Duration, during: Option<Cond>, until: Option<Cond> },
+    /// `hold:<key>[ while:<cond>][ until:<cond>]`: the key stays down for as
+    /// long as `while` holds (always without it), and is let go for good
+    /// once `until` has held after `while` first held (FAST1: holding Enter
+    /// skips an in-world cinematic; a press of [`KEY_HOLD`] does not).
+    Hold { during: Option<Cond>, until: Option<Cond> },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1300,6 +1307,15 @@ impl Rule {
             return false;
         }
         match &self.kind {
+            RuleKind::Hold { during, until } => {
+                if self.started && until.as_ref().is_some_and(|u| u.holds(look)) {
+                    self.done = true;
+                    return false;
+                }
+                let on = during.as_ref().is_none_or(|w| w.holds(look));
+                self.started |= on;
+                on
+            }
             RuleKind::Once { cond, delay } => {
                 if self.armed.is_none() && cond.holds(look) {
                     self.armed = Some(now);
@@ -1351,9 +1367,13 @@ impl Rule {
             };
             return Some(Rule::new(RuleKind::Once { cond: Cond::parse(cond)?, delay }, vec![key]));
         }
-        let rest = entry.strip_prefix("every:")?;
-        let (ms, rest) = rest.split_once(':')?;
-        let period = Duration::from_millis(ms.trim().parse().ok().filter(|&n: &u64| n > 0)?);
+        let (period, rest) = if let Some(rest) = entry.strip_prefix("hold:") {
+            (None, rest)
+        } else {
+            let rest = entry.strip_prefix("every:")?;
+            let (ms, rest) = rest.split_once(':')?;
+            (Some(Duration::from_millis(ms.trim().parse().ok().filter(|&n: &u64| n > 0)?)), rest)
+        };
         let mut parts = rest.split([' ', ';']).filter(|p| !p.is_empty());
         let keys: Option<Vec<u8>> = parts.next()?.split('|').map(key_code).collect();
         let keys = keys?;
@@ -1367,7 +1387,16 @@ impl Rule {
                 return None;
             }
         }
-        Some(Rule::new(RuleKind::Every { period, during, until }, keys))
+        if period.is_none() && keys.len() != 1 {
+            return None;
+        }
+        Some(Rule::new(
+            match period {
+                Some(period) => RuleKind::Every { period, during, until },
+                None => RuleKind::Hold { during, until },
+            },
+            keys,
+        ))
     }
 }
 
@@ -1394,7 +1423,9 @@ enum When {
 /// - `every:<ms>:<key>[|<key>...][ while:<cond>][ until:<cond>]` (clauses
 ///   separated by a space or `;`): every `<ms>` while `while` holds, the keys
 ///   in turn, restarting the period when its watched value changes, and
-///   never again once `until` held (after `while` first held).
+///   never again once `until` held (after `while` first held);
+/// - `hold:<key>[ while:<cond>][ until:<cond>]`: the key held down for as
+///   long as `while` holds, never again once `until` held.
 ///
 /// Entries that do not parse are dropped and listed in `refused` (logged).
 /// A key goes down at the first poll at or after its trigger (frames may
@@ -1454,7 +1485,7 @@ impl Script {
             }
             let before = entries.len();
             let t = entry.trim();
-            if t.starts_with("when:") || t.starts_with("every:") {
+            if t.starts_with("when:") || t.starts_with("every:") || t.starts_with("hold:") {
                 match Rule::parse(t) {
                     Some(r) => rules.push(r),
                     None => refused.push(t.to_owned()),
@@ -1510,6 +1541,19 @@ impl Script {
     fn tick(&mut self, now: Duration, frame: u64, look: &dyn Fn(&str) -> Option<u64>) -> (Vec<u8>, Vec<u8>) {
         let (mut down, mut fresh) = (Vec::new(), Vec::new());
         for r in &mut self.rules {
+            if matches!(r.kind, RuleKind::Hold { .. }) {
+                // Down at every poll its condition holds; fresh only as it goes down.
+                if r.tick(now, look) {
+                    if r.pressed.is_none() {
+                        fresh.push(r.key);
+                    }
+                    r.pressed = Some(now);
+                    down.push(r.key);
+                } else {
+                    r.pressed = None;
+                }
+                continue;
+            }
             if r.tick(now, look) {
                 r.next_key();
                 r.pressed = Some(now);
@@ -1596,6 +1640,41 @@ mod tests {
         // The old forms report what they drop too.
         let s = Script::parse("bad,f9:Nope,12:Enter");
         assert_eq!(s.refused, vec!["bad".to_string(), "f9:Nope".to_string()]);
+    }
+
+    #[test]
+    fn hold_keeps_its_key_down_while_its_condition_holds() {
+        let mut s = Script::parse("hold:Enter while:cine0_state==6|8 until:session_state==9");
+        assert!(s.refused.is_empty(), "{:?}", s.refused);
+        assert_eq!(s.rules[0].kind, RuleKind::Hold { during: Some(Cond::parse("cine0_state==6|8").unwrap()), until: Some(Cond::parse("session_state==9").unwrap()) });
+        let state = std::cell::Cell::new((5u64, 0u64));
+        let look = |n: &str| match n {
+            "cine0_state" => Some(state.get().0),
+            "session_state" => Some(state.get().1),
+            _ => None,
+        };
+        let ms = Duration::from_millis;
+        let mut at = |t: u64, cine: u64, sess: u64| {
+            state.set((cine, sess));
+            s.tick(ms(t), 0, &look)
+        };
+        assert_eq!(at(0, 5, 0), (vec![], vec![]), "not playing: up");
+        assert_eq!(at(100, 6, 0), (vec![0x0D], vec![0x0D]), "playing: down, fresh");
+        for t in [400, 900, 5000] {
+            assert_eq!(at(t, 8, 0), (vec![0x0D], vec![]), "still playing at {t} ms: held, not pressed again");
+        }
+        assert_eq!(at(5100, 10, 0), (vec![], vec![]), "ended: let go at once");
+        assert_eq!(at(5200, 6, 0), (vec![0x0D], vec![0x0D]), "the next cinematic: down again");
+        assert_eq!(at(5300, 6, 9), (vec![], vec![]), "until: let go");
+        assert_eq!(at(5400, 6, 0), (vec![], vec![]), "and never again");
+        // One key only; the clauses as every's.
+        for bad in ["hold:Up|Enter while:x==1", "hold:Nope", "hold:Enter sometimes:x==1", "hold:Enter while:"] {
+            assert!(!Script::parse(bad).refused.is_empty(), "{bad}");
+        }
+        // Without while: down from the first poll until `until`.
+        let mut h = Script::parse("hold:a until:session_state==0");
+        assert_eq!(h.tick(ms(0), 0, &|_| Some(1)), (vec![b'A'], vec![b'A']));
+        assert_eq!(h.tick(ms(50), 0, &|_| Some(0)), (vec![], vec![]));
     }
 
     #[test]

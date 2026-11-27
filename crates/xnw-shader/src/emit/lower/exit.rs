@@ -22,10 +22,14 @@ impl<'a> Lower<'a> {
             if !(e.done && self.s.pixel) {
                 return Err("a conditional export");
             }
-            let t = self.s.m.bool(true);
-            let kill = self.s.m.bin(c, Bin::Xor, g, t);
-            self.s
-                .op(c, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
+            // XNW (KILL1): `Stub::kill` leaves the discard out.
+            crate::emit::stub_site("kill", 0);
+            if !crate::emit::STUB.with(std::cell::Cell::get).kill {
+                let t = self.s.m.bool(true);
+                let kill = self.s.m.bin(c, Bin::Xor, g, t);
+                self.s
+                    .op(c, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
+            }
         }
         if mesh && e.target == Target::Primitive {
             if self.s.fallback {
@@ -169,8 +173,16 @@ impl<'a> Lower<'a> {
             (true, false) => ("storeVertexOutput", 171),
             (true, true) => ("storePrimitiveOutput", 172),
         };
+        // XNW (KILL1): `Stub::export` stores 0.5 in a colour target's channels.
+        let stubbed = match e.target {
+            Target::Color(n) if self.s.pixel => {
+                crate::emit::stub_site("export", u32::from(n));
+                crate::emit::STUB.with(std::cell::Cell::get).exports >> n.min(7) & 1 != 0
+            }
+            _ => false,
+        };
         for (id, col, value, half) in stores {
-            let mut x = self.i32_of(value)?;
+            let mut x = if stubbed { self.s.m.i32(0.5f32.to_bits()) } else { self.i32_of(value)? };
             if let Some(high) = half {
                 // An f16 half, declared a 32-bit float on the host.
                 let c = self.cur;
@@ -194,8 +206,8 @@ impl<'a> Lower<'a> {
                 9 if half.is_some() => (".f32", self.as_float(x)),
                 9 => {
                     let f = match self.floats.get(&value) {
-                        Some(&f) => f,
-                        None => self.as_float(x),
+                        Some(&f) if !stubbed => f,
+                        _ => self.as_float(x),
                     };
                     (".f32", f)
                 }
@@ -299,6 +311,17 @@ impl<'a> Lower<'a> {
             } => {
                 // A negated condition branches the other way round.
                 let (cond, taken, not_taken) = match self.x.st.bools.node(when) {
+                    // Wave-wide (FACE1, `Structured::wide`): the wave takes
+                    // it when every lane would.
+                    _ if self.x.st.wide[b] => {
+                        let c = self
+                            .boolean(when, self.cur)
+                            .map_err(|w| unsupported(offset, w))?;
+                        self.s.flags |= flags::WAVE_OPS;
+                        let i1 = self.s.t.i1;
+                        let all = self.s.op(self.cur, "waveAllTrue", Attr::NoUnwind, i1, 114, &[c]);
+                        (all, taken, not_taken)
+                    }
                     Some((atom, Bool::TRUE, Bool::FALSE)) => {
                         let a = self
                             .atom(atom, self.cur)
@@ -350,7 +373,10 @@ impl<'a> Lower<'a> {
                 Term::CondBr(cond, t, f)
             }
             LaneExit::End => {
-                if self.s.pixel && !self.exported[b] && !self.has_done_export(b) {
+                if self.s.pixel && !self.exported[b] && !self.has_done_export(b) && {
+                    crate::emit::stub_site("kill", 0);
+                    !crate::emit::STUB.with(std::cell::Cell::get).kill
+                } {
                     // A lane leaving without its final export was killed.
                     let t = self.s.m.bool(true);
                     self.s

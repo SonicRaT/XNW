@@ -364,6 +364,8 @@ impl Host {
         // unless XNW_DESC=gpu).
         super::descriptor::host::table_catch_up();
         let &(primary, _, _) = planes.first()?;
+        // FLK2: the UI plane over ours, for the flicker counter's named frames.
+        xnw_core::live::note_ui(planes.get(1).map_or(0, |p| windows::core::Interface::as_raw(p.0) as u64));
         // SAFETY: live resources.
         let primary_desc = unsafe { primary.GetDesc() };
         let show = super::draw::shown_target().is_some();
@@ -416,6 +418,8 @@ impl Host {
         }
         let p = presenter.as_mut()?;
         if (p.width, p.height, p.format) != (width, height, format) {
+            // PASS1: the last compose (sent without a wait) has run.
+            p.copy.settle();
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe { p.swap_chain.ResizeBuffers(BUFFERS, width, height, format, p.flags) };
             match resized {
@@ -509,7 +513,20 @@ impl Host {
             };
             drop(_crumb);
             p.copy.close();
-            self.execute(&[&p.copy]);
+            // PASS1 (`showwait=off`, the default): the compose is sent and
+            // retired at its fence: the next reset of this list waits for it
+            // (before the compositor's views are written again), our pass
+            // thread before it writes the picture it read (`wait_shown`). A
+            // readback reads the result here: waited.
+            let composing = std::time::Instant::now();
+            if capture.is_none() && !super::uikeep::show_wait() && let Some(host) = super::host::host() {
+                if let Some(value) = host.execute_nowait(&[&p.copy], false) {
+                    super::host::LAST_SHOW.store(value, std::sync::atomic::Ordering::Release);
+                }
+            } else {
+                self.execute(&[&p.copy]);
+            }
+            xnw_core::framewall::add(xnw_core::framewall::SHOW_COMPOSE, composing.elapsed().as_nanos() as u64);
             super::crumbs::presenter_blit(p.copy.crumbs().slot(), frame);
             use_read_back(frame, capture);
             // Each title frame for its number of refreshes (frame.rs).
@@ -519,7 +536,9 @@ impl Host {
             } else {
                 (super::frame::sync_interval(), DXGI_PRESENT(0))
             };
+            let swapping = std::time::Instant::now();
             let _ = p.swap_chain.Present(interval, flags);
+            xnw_core::framewall::add(xnw_core::framewall::SHOW_SWAP, swapping.elapsed().as_nanos() as u64);
             super::crumbs::presenting(0, frame);
             super::frame::host_presented(&p.swap_chain);
             p.meter.frame(planes.len());

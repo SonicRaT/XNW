@@ -107,7 +107,7 @@ mod threading;
 pub mod validator;
 #[cfg(all(test, windows))]
 mod valu_tests;
-mod wave;
+pub(crate) mod wave;
 #[cfg(all(test, windows))]
 mod world_tests;
 #[cfg(all(test, windows))]
@@ -115,13 +115,16 @@ mod null_kind_tests;
 // XNW: the non-uniform heap index on the software adapter.
 #[cfg(all(test, windows))]
 mod heap_uniform_tests;
+// XNW (BND1): a confined program reads its own views or a null.
+#[cfg(all(test, windows))]
+mod confine_tests;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
-pub use shader::{ADDRESS_MAP_SPACE, DESCRIPTOR_WORDS_SPACE, HEAP_BOUNDS_SPACE, PAGE_TABLE_SPACE, ROOT_CBV_SPACE, ROOT_LEN_SPACE, RawWindow, SAMPLER_SPACE, STRIDE_SPACE, StrideEntry, USER_DATA_SPACE};
+pub use shader::{ADDRESS_MAP_SPACE, CONFINE_KINDS, DESCRIPTOR_WORDS_SPACE, HEAP_BOUNDS_SPACE, PAGE_TABLE_SPACE, ROOT_CBV_SPACE, ROOT_LEN_SPACE, RawWindow, SAMPLER_SPACE, STRIDE_SPACE, StrideEntry, USER_DATA_SPACE};
 
 /// XNW (page table): bits 20-31 of dword 3 of a buffer-view record
 /// that is a GFX10 V# over console memory, read through the page table
@@ -198,7 +201,10 @@ pub mod host_copies {
 /// 28: victory-fork 578d459's lane-mask phi joins (`phi_masks`) where an
 /// edge's mask has no entry of its own: retries the refusals (no program
 /// that translated changes).
-pub const VERSION: u32 = 28;
+/// 29: (FACE1) in compute, an `s_cbranch_execz` that skips a whole-wave
+/// section stays wave-wide, the region guarded (`Structured::wide`):
+/// breaking for the programs with one.
+pub const VERSION: u32 = 29;
 
 /// Part of every shader-cache key: raise it when programs that
 /// already translated must be translated again (see [`VERSION`]).
@@ -211,7 +217,8 @@ pub const VERSION: u32 = 28;
 /// bounded). 7: merged at `VERSION` 26 (non-uniform heap indices).
 /// 8: merged at `VERSION` 27 (half views, the cache record gains them;
 /// a comparison sampler replaces the reduction).
-pub const VERSION_BREAKING: u32 = 8;
+/// 9: at `VERSION` 29 (wave-wide branches around whole-wave sections).
+pub const VERSION_BREAKING: u32 = 9;
 
 /// The mesh fallback's own translator version, part of the cache key of
 /// mesh programs only (a `VERSION` change retranslates every program,
@@ -245,6 +252,10 @@ pub const DEFAULT_PIXEL_LOOP_LIMIT: u32 = 256;
 /// them. A limit is part of the translation, so the shader cache keys on
 /// [`loop_limit_key`].
 pub fn loop_limit_for(stage: HwStage, fallback: bool) -> u32 {
+    // [`Options::loop_limit`] of the translation on this thread first.
+    if let Some(n) = LOOP_LIMIT.with(std::cell::Cell::get) {
+        return n;
+    }
     limits()[limit_slot(stage, fallback)]
 }
 
@@ -424,7 +435,52 @@ pub struct Options {
     /// between lanes (the hardware adapter: its compiler reads the first
     /// active lane). `XNW_ADAPTER=warp`, or `XNW_HEAP_UNIFORMITY=masked`.
     pub masked_lanes: bool,
+    /// XNW (KILL1): every return of the program leaves through one block
+    /// (`bitcode::Module::join_returns`), the shape DXC gives a function.
+    /// WARP 1.0.22 ends the device (no fault: DXGI_ERROR_DEVICE_REMOVED at
+    /// the next call) when a pixel shader with two `ret` blocks is drawn by
+    /// a pipeline with the depth test on: the 8 title families whose kill
+    /// path leaves early (`s_cbranch_scc0` to `exp null ... s_endpgm`,
+    /// 070aaba8 0x2f8 -> 0x1344), each cut down to this by `xnw
+    /// shader-reduce` (`code=oneret` stopped it, as did `depth=off`; no
+    /// input, target or image read did). The bridge sets it for its pixel
+    /// programs (`xnw-world` `bridged::translate`); off elsewhere: the
+    /// output of every other translation is as before (no cache key holds
+    /// it; the shader gate reads `XNW_ONE_RETURN=1` to check the joined form).
+    pub one_return: bool,
+    /// XNW (BND1): the program's heap views are confined to what its own
+    /// draw binds ([`shader::Shader::confined`]). A descriptor it picks
+    /// from the view heap by an index it computes (a `ResourceHeap`
+    /// parameter: bindless) is read only where the index names a slot of
+    /// the draw's own block that holds a view of the dimension the
+    /// instruction declares: the confinement words (`b1` in
+    /// [`HEAP_BOUNDS_SPACE`]) give the block's first slot and, per image
+    /// dimension, the mask of its slots holding such a view. Any other
+    /// index (below the block, past it, a slot of another dimension, a
+    /// buffer or constant view picked this way) reads the heap's
+    /// permanent null of the instruction's kind and dimension, by a
+    /// select on the index, no branch. A table descriptor is read at a
+    /// fixed slot the program names (the host's block reaches past those)
+    /// or not at all: one past them reads the null, one at a computed
+    /// offset is refused. Without it a heap index is bounded from above
+    /// only, by the draw's last slot: in a heap shared by many draws a
+    /// title index from data the host does not rewrite names another
+    /// draw's descriptor of any kind. The bridge sets it
+    /// for its programs (`xnw-world` `bridged::translate`); off elsewhere:
+    /// every other translation is as before (no cache key holds it; the
+    /// shader gate reads `XNW_CONFINE=1`).
+    pub confine: bool,
+    /// XNW (BND1): the back edges one invocation of this program may take
+    /// ([`loop_limit_for`]) instead of its stage's. The bridge gives its
+    /// pixel programs [`BRIDGED_PIXEL_LOOP_LIMIT`]. None: the stage's.
+    pub loop_limit: Option<u32>,
 }
+
+/// The loop budget of a bridged pixel program ([`Options::loop_limit`]):
+/// WIDE2 measured 16 and 2 giving the 256 picture for the road programs
+/// (pk8a f1030); a count from title memory then costs 16 bodies a pixel,
+/// not 256.
+pub const BRIDGED_PIXEL_LOOP_LIMIT: u32 = 16;
 
 thread_local! {
     /// [`Options::nonuniform_heap`] of the translation on this thread.
@@ -432,6 +488,22 @@ thread_local! {
     /// [`Options::keep_uniform_heap`] and [`Options::masked_lanes`] of the
     /// translation on this thread.
     pub(crate) static HEAP_UNIFORMITY: std::cell::Cell<(bool, bool)> = const { std::cell::Cell::new((false, false)) };
+    /// [`Options::one_return`] of the translation on this thread.
+    pub(crate) static ONE_RETURN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// [`Options::confine`] of the translation on this thread.
+    pub(crate) static CONFINE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// [`Options::loop_limit`] of the translation on this thread.
+    pub(crate) static LOOP_LIMIT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    /// SKIN2 diagnostic ([`first_lane_own`]): `v_readfirstlane_b32` reads the lane's own value.
+    pub(crate) static FIRST_LANE_OWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// SKIN2 (a reducer's diagnostic, `xnw-world` `XNW_REDUCE=..,code=ms-rfl`):
+/// the translations on this thread until it is set back lower
+/// `v_readfirstlane_b32` to the lane's own value, not `WaveReadLaneFirst`
+/// (the same where the value is wave-uniform). Off by default.
+pub fn first_lane_own(on: bool) {
+    FIRST_LANE_OWN.with(|f| f.set(on));
 }
 
 /// `XNW_HEAP_UNIFORMITY`: `off` ([`Options::keep_uniform_heap`]), `masked`
@@ -563,6 +635,13 @@ impl HostShader {
         self.psv_lists_kind(HEAP_BOUNDS_SPACE, 2)
     }
 
+    /// XNW (BND1): whether the program reads the confinement words (`b1`
+    /// in [`HEAP_BOUNDS_SPACE`], [`Options::confine`]): its PSV0 lists
+    /// that CBV.
+    pub fn reads_confine(&self) -> bool {
+        self.psv_lists_at(HEAP_BOUNDS_SPACE, 2, 1)
+    }
+
     /// Whether `PSV0` lists a raw SRV at `t0` in `space`.
     fn psv_lists(&self, space: u32) -> bool {
         self.psv_lists_kind(space, 4)
@@ -571,6 +650,11 @@ impl HostShader {
     /// Whether `PSV0` lists register 0 of PSV resource type `kind` (2 CBV,
     /// 4 raw SRV) in `space`.
     fn psv_lists_kind(&self, space: u32, kind: u32) -> bool {
+        self.psv_lists_at(space, kind, 0)
+    }
+
+    /// [`HostShader::psv_lists_kind`] for register `register`.
+    fn psv_lists_at(&self, space: u32, kind: u32, register: u32) -> bool {
         let Ok(c) = Container::parse(&self.dxil) else { return false };
         let Some(psv) = c.part(FourCC::PSV0) else { return false };
         let d = psv.data;
@@ -580,7 +664,7 @@ impl HostShader {
         let (Some(n), Some(size)) = (word(at), word(at + 4)) else { return false };
         (0..n as usize).any(|k| {
             let e = at + 8 + k * size as usize;
-            word(e + 4) == Some(space) && word(e) == Some(kind) && word(e + 8) == Some(0)
+            word(e + 4) == Some(space) && word(e) == Some(kind) && word(e + 8) == Some(register)
         })
     }
 
@@ -643,6 +727,11 @@ pub fn runtime_options(stage: &str, hash: u128, probe: bool, loop_counts: Option
         nonuniform_heap: nonuniform_heap_for(hash),
         keep_uniform_heap: uniformity.0,
         masked_lanes: uniformity.1,
+        // The bridge's pixel programs only (KILL1); see the field.
+        one_return: false,
+        // The bridge's programs only (BND1); see the fields.
+        confine: false,
+        loop_limit: None,
     }
 }
 
@@ -679,6 +768,18 @@ pub fn last_insts() -> usize {
 /// and all heap handles (0, 0, 0 with the pass off).
 pub fn last_nonuniform() -> (usize, usize, usize) {
     shader::NONUNIFORM_MARKED.with(std::cell::Cell::get)
+}
+
+/// XNW (SWEEP1): keep, on this thread, the names of the functions each
+/// finished module calls (off by default; the card sweep turns it on).
+pub fn collect_ops(on: bool) {
+    shader::COLLECT_OPS.with(|c| c.set(on));
+}
+
+/// XNW (SWEEP1): the functions the last module this thread finished
+/// calls (`dx.op.*`), sorted; empty unless [`collect_ops`] is on.
+pub fn last_ops() -> Vec<String> {
+    shader::OPS.with(|o| o.borrow().clone())
 }
 
 thread_local! {
@@ -721,6 +822,51 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 /// evaluation in each), for the sake of 9 that did not translate.
 pub fn translate_with(container: &[u8], opts: Options) -> Result<HostShader, ShaderError> {
     translate_patched(container, opts, &[])
+}
+
+/// XNW (KILL1, `xnw shader-reduce`): one feature of a pixel program left
+/// out of its translation, for bisecting a program the host fails on. Not
+/// an [`Options`] field: no cache key or runtime path carries it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Stub {
+    /// No `discard` (the kill path's lanes return like the others).
+    pub kill: bool,
+    /// The image operation at this code offset gives a constant (0.5; a
+    /// level of detail 0, a size 1) and reads no descriptor.
+    pub image: Option<u32>,
+    /// Every image operation does.
+    pub images: bool,
+    /// Colour exports `mrt<n>` (bit n) store 0.5 in their channels.
+    pub exports: u8,
+}
+
+/// What a pixel program has for [`Stub`] to leave out: (kind, value) in
+/// code order: `kill` (0), `image` (code offset), `export` (target).
+pub type StubSites = Vec<(&'static str, u32)>;
+
+thread_local! {
+    /// The [`Stub`] of the translation on this thread, and the sites it met.
+    pub(crate) static STUB: std::cell::Cell<Stub> = const { std::cell::Cell::new(Stub { kill: false, image: None, images: false, exports: 0 }) };
+    pub(crate) static STUB_SITES: std::cell::RefCell<StubSites> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A site of the program being lowered ([`StubSites`]).
+pub(crate) fn stub_site(kind: &'static str, value: u32) {
+    STUB_SITES.with(|s| {
+        let mut s = s.borrow_mut();
+        if !s.contains(&(kind, value)) {
+            s.push((kind, value));
+        }
+    });
+}
+
+/// [`translate_with`] with `stub` left out, and the program's sites.
+pub fn translate_stubbed(container: &[u8], opts: Options, stub: Stub) -> (Result<HostShader, ShaderError>, StubSites) {
+    STUB.with(|s| s.set(stub));
+    STUB_SITES.with(|s| s.borrow_mut().clear());
+    let r = translate_with(container, opts);
+    STUB.with(|s| s.set(Stub::default()));
+    (r, STUB_SITES.with(|s| std::mem::take(&mut *s.borrow_mut())))
 }
 
 /// `translate_with` over code with `words` (byte offset, instruction word)
@@ -776,7 +922,9 @@ fn translate_plain(container: &[u8], opts: Options, words: &[(u32, u32)]) -> Res
     let io = res.and_then(|res| Ok((res, io::raise(&p, &native)?)));
     lap("resources+io", t);
     let (res, io) = io?;
-    let st = structure::structure(&p)?;
+    // FACE1: compute keeps branches around whole-wave sections wave-wide.
+    let wave_wide = native.stage == HwStage::Cs;
+    let st = structure::structure_with(&p, wave_wide)?;
     let original = emit_with(&c, &native, &p, &st, &io, &res, opts);
     // victory-fork 578d459 (emit/mod.rs, GPL-3.0-or-later): refused
     // programs only, again with the joins of uniform diamonds whose next
@@ -791,7 +939,7 @@ fn translate_plain(container: &[u8], opts: Options, words: &[(u32, u32)]) -> Res
         return original;
     }
     let p = ir::thread_edges(&p, &edges)?;
-    let st = structure::structure(&p)?;
+    let st = structure::structure_with(&p, wave_wide)?;
     let res = resource::track_with(&p, &native.layout, native.stage, opts.descriptors == Descriptors::Gpu)?;
     let io = io::raise(&p, &native)?;
     emit_with(&c, &native, &p, &st, &io, &res, opts)
@@ -886,6 +1034,9 @@ pub fn emit_with(
     };
     NONUNIFORM_HEAP.with(|f| f.set(opts.nonuniform_heap));
     HEAP_UNIFORMITY.with(|f| f.set((opts.keep_uniform_heap, opts.masked_lanes)));
+    ONE_RETURN.with(|f| f.set(opts.one_return));
+    CONFINE.with(|f| f.set(opts.confine));
+    LOOP_LIMIT.with(|f| f.set(opts.loop_limit.filter(|n| *n > 0)));
     let l = lower::lower(&lower::Parts {
         native,
         p,
@@ -906,6 +1057,7 @@ pub fn emit_with(
     });
     NONUNIFORM_HEAP.with(|f| f.set(false));
     HEAP_UNIFORMITY.with(|f| f.set((false, false)));
+    ONE_RETURN.with(|f| f.set(false));
     let l = l?;
     Ok(HostShader {
         stage: native.stage,

@@ -232,5 +232,5 @@ pub fn subset(frame: &pg::PreskinFrame, rows: &[usize]) -> pg::PreskinFrame {
         return pg::PreskinFrame::default();
     }
     let draws = frame.draws.iter().filter_map(|&(d, item, normals)| rows.iter().position(|&r| r == d as usize).map(|p| (p as u32, item, normals))).collect();
-    pg::PreskinFrame { items: frame.items.clone(), draws, unreadable: frame.unreadable, read_ms: frame.read_ms, reads: frame.reads.clone() }
+    pg::PreskinFrame { items: frame.items.clone(), draws, unreadable: frame.unreadable, read_ms: frame.read_ms, reads: frame.reads.clone(), held: 0 }
 }

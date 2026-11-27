@@ -17,6 +17,14 @@
 //! lane that reaches it; what it cannot prove stays as the instruction's
 //! guard, a per-lane `if` around it.
 //!
+//! One exception (FACE1, compute only: [`structure_with`]): an `s_cbranch_execz` that skips a whole-wave
+//! section (one reachable from the branch's fall-through but not from its
+//! target) stays wave-wide, as on the console: the wave takes it when no
+//! lane is in the mask ([`Structured::wide`]), every lane stays, and the
+//! skipped lanes run the region under guards. The section's wave
+//! operations then see every lane, as the console's do; WARP 1.0.22's
+//! `WaveSize` waves get them wrong where only some lanes run.
+//!
 //! The control-flow graph keeps its shape and must be reducible (DXIL's
 //! only requirement). Helper lanes of a pixel shader count as live: on PC
 //! their side effects are dropped too, and what they compute is only read
@@ -403,14 +411,59 @@ pub struct Structured {
     /// Incoming lane boolean per predecessor edge (in block predecessor order)
     /// for each [`Atom::Phi`] id.
     pub phi_masks: HashMap<Value, Vec<Bool>>,
+    /// Per block: its closing branch is wave-wide (FACE1): taken when every
+    /// lane's `when` holds (no lane in the console's mask), not per lane.
+    pub wide: Vec<bool>,
+}
+
+/// Blocks ending in an `s_cbranch_execz` that skips a whole-wave section:
+/// one reachable from the fall-through but not from the target. Those
+/// branches stay wave-wide (module doc).
+fn wide_branches(p: &Program) -> Vec<bool> {
+    let n = p.blocks.len();
+    let opens = |b: usize| {
+        p.blocks[b].insts.iter().any(|i| {
+            matches!(i.name(), "s_or_saveexec_b64" | "s_or_saveexec_b32" | "s_nand_saveexec_b64" | "s_nand_saveexec_b32")
+        })
+    };
+    let section: Vec<bool> = (0..n).map(|b| opens(b) && !crate::emit::wave::sections(p, b).is_empty()).collect();
+    if !section.contains(&true) {
+        return vec![false; n];
+    }
+    let reach = |from: usize| {
+        let (mut seen, mut stack) = (vec![false; n], vec![from]);
+        while let Some(b) = stack.pop() {
+            if !std::mem::replace(&mut seen[b], true) {
+                stack.extend(p.blocks[b].exit.successors());
+            }
+        }
+        seen
+    };
+    (0..n)
+        .map(|b| match p.blocks[b].exit {
+            Exit::Branch { taken, not_taken }
+                if p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz") =>
+            {
+                let (t, f) = (reach(taken), reach(not_taken));
+                (0..n).any(|s| section[s] && f[s] && !t[s])
+            }
+            _ => false,
+        })
+        .collect()
 }
 
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
+    structure_with(program, false)
+}
+
+/// [`structure`]; `wave_wide`: branches skipping a whole-wave section stay
+/// wave-wide ([`Structured::wide`]; compute programs, module doc).
+pub fn structure_with(program: &Program, wave_wide: bool) -> Result<Structured, ShaderError> {
     use crate::emit::lap;
     use std::time::Instant;
     let t = Instant::now();
-    let mut l = Lanes::new(program)?;
+    let mut l = Lanes::new(program, wave_wide)?;
     lap("st.new", t);
     loop {
         let t = Instant::now();
@@ -480,6 +533,8 @@ struct Lanes<'a> {
     when: Vec<Option<Bool>>,
     /// See [`Structured::active`].
     active: HashSet<Value>,
+    /// See [`Structured::wide`]: these branches narrow no lane's knowledge.
+    wide: Vec<bool>,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -514,7 +569,7 @@ struct SopMasks {
 const MAX_ROUNDS: usize = 256;
 
 impl<'a> Lanes<'a> {
-    fn new(p: &'a Program) -> Result<Self, ShaderError> {
+    fn new(p: &'a Program, wave_wide: bool) -> Result<Self, ShaderError> {
         let blocks = &p.blocks;
         let order = crate::ir::reverse_postorder(blocks);
         let mut index = vec![usize::MAX; blocks.len()];
@@ -557,6 +612,7 @@ impl<'a> Lanes<'a> {
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
             active: HashSet::new(),
+            wide: if wave_wide { wide_branches(p) } else { vec![false; blocks.len()] },
         })
     }
 
@@ -631,6 +687,9 @@ impl<'a> Lanes<'a> {
 
     /// `c` narrowed by the branch at the end of `q` towards one successor.
     fn edge(&mut self, c: Bool, q: usize, taken: bool) -> Bool {
+        if self.wide[q] {
+            return c;
+        }
         match self.when[q] {
             Some(w) if taken => self.b.and(c, w),
             Some(w) => {
@@ -784,6 +843,7 @@ impl<'a> Lanes<'a> {
             bools: self.b,
             exits,
             guards,
+            wide: self.wide,
         })
     }
 
@@ -1386,7 +1446,7 @@ fn check_reducible(p: &Program, order: &[usize], index: &[usize]) -> Result<(), 
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::ir;
 
@@ -1430,6 +1490,57 @@ mod tests {
             s.bools.node(when),
             Some((Atom::Lane(cmp), Bool::TRUE, Bool::FALSE))
         );
+        assert_eq!(guarded(&s), 0, "{:?}", s.guards);
+    }
+
+    /// FACE1: 168936d7's shape (0x58-0x1e8): `v_cmpx; s_cbranch_execz` to
+    /// the end around a wave64 f16 sum. The branch stays wave-wide, the
+    /// region's vector instructions are guarded, the section is not.
+    pub(crate) const SKIPPED_SECTION: [u32; 24] = [
+        0x7DA8_0809, // v_cmpx_gt_u32 exec, s9, v4
+        0xBF88_0015, // s_cbranch_execz -> s_endpgm
+        0x7E0E_0280, // v_mov_b32 v7, 0
+        0xBE84_25C1, // s_or_saveexec_b64 s[4:5], -1
+        0xD501_0001,
+        0x0012_0E80, // v_cndmask_b32 v1, 0, v7, s[4:5]
+        0x6402_02E9,
+        0xDE54_C101, // v_add_f16 v1, v1, v1 dpp8:[1,0,3,2,5,4,7,6]
+        0x6402_02E9,
+        0x9360_1201, // dpp8:[2,2,0,0,6,6,4,4]
+        0x6402_02E9,
+        0x0009_2401, // dpp8:[4,4,4,4,0,0,0,0]
+        0x6402_02FA,
+        0xFF09_4001, // v_add_f16 v1, v1, v1 row_mirror bound_ctrl:1
+        0xD778_0002,
+        0x0201_0101, // v_permlanex16_b32 v2, v1, 0, 0
+        0x6402_0302, // v_add_f16 v1, v2, v1
+        0xD760_0007,
+        0x0001_4101, // v_readlane_b32 s7, v1, 32
+        0x6402_0207, // v_add_f16 v1, s7, v1
+        0xD760_0007,
+        0x0001_0101, // v_readlane_b32 s7, v1, 0
+        0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+        S_ENDPGM,
+    ];
+
+    #[test]
+    fn a_branch_skipping_a_whole_wave_section_stays_wave_wide() {
+        let p = build(&SKIPPED_SECTION, true);
+        assert!(!structure(&p).unwrap().wide.contains(&true), "per lane unless asked");
+        let s = structure_with(&p, true).unwrap();
+        assert!(s.wide[0], "{:?}", s.wide);
+        assert!(matches!(s.exits[0], LaneExit::Branch { .. }), "{:?}", s.exits);
+        let region = &p.blocks[1].insts;
+        assert_eq!(region[0].name(), "v_mov_b32");
+        assert!(s.guards[1][0].is_some(), "skipped lanes run the region: guarded");
+        let cnd = region.iter().position(|i| i.name() == "v_cndmask_b32").unwrap();
+        assert_eq!(s.guards[1][cnd], None, "the section runs in every lane");
+        // Without the section the same branch is per lane, unguarded.
+        let mut plain = SKIPPED_SECTION[..3].to_vec();
+        plain[1] = 0xBF88_0001;
+        plain.push(S_ENDPGM);
+        let s = structure_with(&build(&plain, true), true).unwrap();
+        assert!(!s.wide.contains(&true));
         assert_eq!(guarded(&s), 0, "{:?}", s.guards);
     }
 

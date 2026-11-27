@@ -14,16 +14,19 @@
 //! cover: bit 0 variants 8/9 without their maps, bit 1 every face from its
 //! bind shape. Every read is fault-safe: a dispatch that cannot be read is
 //! counted by reason, never a fault; dispatches of the standard variants
-//! our pass does not run are counted by variant.
+//! our pass does not run are counted by variant. FACE1 (`head=on`): a face
+//! read neutral keeps its t74 address and b6; when the frame's head graph
+//! filled a table at that address (`headlive::table_at`), the face takes its
+//! positions from it (the table step on the device, [`give_faces`]).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use xnw_formats::framepack::{RANGE_MASK, view};
 use xnw_gpu::d3d12x::tap::{self, TapDraw, TapRoot, TapView};
 use xnw_world::preskin::{self as ps, Inputs};
-use xnw_world::preskin_gpu::{Item, MASK_RECORD, PreskinFrame, Reads, WHY_FACE, address_key, covered, rule_for, screen_bits, screen_switch, takes_delta};
+use xnw_world::preskin_gpu::{Hold, Item, MASK_RECORD, PreskinFrame, Reads, WHY_FACE, address_key, covered, face_table, hold_switch, rule_for, screen_bits, screen_switch, takes_delta};
 use xnw_world::{FrameList, NO_PALETTE};
 
 /// `preskin=on` (read once).
@@ -65,7 +68,8 @@ fn rule_of(pipeline: usize) -> Option<u32> {
 }
 
 fn want(pipeline: usize) -> bool {
-    rule_of(pipeline).is_some()
+    // PERF4 `capskip`: no reads for a frame not captured (`frame_for` drops older open frames).
+    !super::cap_skipped_now() && rule_of(pipeline).is_some()
 }
 
 /// The PreSkinD mesh programs (163 in shaders.rpf: every name holding
@@ -151,17 +155,33 @@ pub fn join_line(frame: u64, words: &[(Option<u32>, Option<u32>)], joined: usize
     let n: Vec<u64> = SINK_N.iter().map(|a| a.swap(0, Ordering::Relaxed)).collect();
     let own = words.iter().filter(|w| w.0.is_some()).count();
     let other = words.iter().filter(|w| w.0.is_some_and(|o| w.1.is_none_or(|h| h & RANGE_MASK != o & RANGE_MASK))).count();
-    format!("world render: frame {frame}: pre-skin join: PreSkinD sinks (60 frames) {}, given to their draw {}, no hook draw {}, no record {}; this frame rows with their own record {own}, of them the hook's record names another range {other}; rows joined {joined}", n[0], n[1], n[2], n[3])
+    let miss = miss_text(MISS_N.swap(0, Ordering::Relaxed), MISS_NEAR.swap(i64::MIN, Ordering::Relaxed));
+    format!(
+        "world render: frame {frame}: pre-skin join: PreSkinD sinks (60 frames) {}, given to their draw {}, no hook draw {}, no record {}; this frame rows with their own record {own}, of them the hook's record names another range {other}; rows joined {joined}{miss}",
+        n[0], n[1], n[2], n[3]
+    )
+}
+
+/// The join line's tail: lists with no reads of their frame's
+/// dispatches and the last one's nearest open frame (`near`: its frame
+/// minus the list's, i64::MIN none open).
+fn miss_text(miss: u64, near: i64) -> String {
+    let near = if near == i64::MIN { "none open".to_string() } else { format!("{near:+}") };
+    format!("; lists without their frame's dispatch reads (60 frames) {miss} (the last one's nearest open frame {near})")
 }
 
 /// Frames with items not yet joined to their list (oldest first).
 struct Open {
     frame: u64,
     items: Vec<Item>,
+    /// FACE1: neutral faces by item index: their t74 address (alias off) and b6.
+    faces: Vec<Face>,
     unreadable: u32,
     ns: u64,
     reads: Reads,
 }
+
+type Face = (usize, u64, Vec<u8>);
 
 const OPEN_MAX: usize = 8;
 static OPEN: Mutex<Vec<Open>> = Mutex::new(Vec::new());
@@ -199,6 +219,7 @@ fn on_dispatch(d: &TapDraw) {
         Some(v) if covered(v, bits()) => Some(item_of(&Title(d), frame, v, bits(), &mut new)),
         _ => None,
     };
+    let face = (rule_of(d.pipeline) == Some(11) && super::headlive::on()).then(|| face_ref(&Title(d))).flatten();
     let ns = t0.elapsed().as_nanos() as u64;
     let mut open = lock(&OPEN);
     let k = match open.iter().position(|o| o.frame == frame) {
@@ -207,7 +228,7 @@ fn on_dispatch(d: &TapDraw) {
             if open.len() >= OPEN_MAX {
                 open.remove(0);
             }
-            open.push(Open { frame, items: Vec::new(), unreadable: 0, ns: 0, reads: Reads::default() });
+            open.push(Open { frame, items: Vec::new(), faces: Vec::new(), unreadable: 0, ns: 0, reads: Reads::default() });
             open.len() - 1
         }
     };
@@ -216,7 +237,12 @@ fn on_dispatch(d: &TapDraw) {
     o.reads.max_ms = o.reads.max_ms.max(ns as f64 / 1e6);
     (o.reads.new, o.reads.new_kb, o.reads.new_ms) = (o.reads.new + new.streams, o.reads.new_kb + new.bytes / 1024, o.reads.new_ms + new.ns as f64 / 1e6);
     match item {
-        Some(Ok(i)) => o.items.push(i),
+        Some(Ok(i)) => {
+            if let Some((at, b6)) = face.filter(|_| i.neutral) {
+                o.faces.push((o.items.len(), at, b6));
+            }
+            o.items.push(i)
+        }
         Some(Err(why)) => {
             o.unreadable += 1;
             o.reads.count(why);
@@ -321,6 +347,75 @@ fn face_unfilled(src: &dyn Source) -> Result<(), &'static str> {
     if ps::table_unfilled(&Inputs { b6: &b6, t74: &head, ..Default::default() }) { Ok(()) } else { Err("face table filled") }
 }
 
+/// FACE1: the faces read so far for frame `frame` (pre-skin dispatches of
+/// variant 11 naming a table; None when the frame is not open, as when the
+/// list runs behind the title). The head graph runs only for a frame that
+/// draws a face.
+pub fn faces_read(frame: u64) -> Option<usize> {
+    lock(&OPEN).iter().find(|o| o.frame == frame).map(|o| o.faces.len())
+}
+
+/// FACE1: a face's t74 address (alias off: the head graph's key) and its
+/// 16-B b6, when b6 names the table (b6+0xc set; not the delta step).
+fn face_ref(src: &dyn Source) -> Option<(u64, Vec<u8>)> {
+    let _site = super::fault_site(super::SITE_PRESKIN_FACE);
+    let b6 = src.table(1, 9).and_then(|v| view_read(src, &v, 0, 16)).filter(|b| b.len() == 16 && le32(b, 0xc) != 0)?;
+    let t74 = src.table(1, 0)?;
+    Some((xnw_frame::compute::key(t74.addr), b6))
+}
+
+/// FACE1: the neutral faces whose t74 holds a table the head graph filled
+/// (`table_at`: the newest for that address, a test run: one table per frame,
+/// two addresses taking turns) take their positions from it: the item's
+/// table step ([`face_table`] over its b6, b7 and vertex view).
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Given {
+    pub given: u32,
+    /// No table at the face's address.
+    pub none: u32,
+    /// The table's header for the face (at b6+0) has a zero scale.
+    pub unfilled: u32,
+    /// The table step reads nothing (b6 names no entry inside the table).
+    pub empty: u32,
+    /// The first face not given, for the line: its address, base, and what the table held there.
+    pub first: String,
+}
+
+fn give_faces(items: &mut [Item], faces: &[Face], table_at: &dyn Fn(u64) -> Option<Arc<Vec<u8>>>) -> Given {
+    let mut g = Given::default();
+    for (i, at, b6) in faces {
+        let base = le32(b6, 0);
+        let Some(t) = table_at(*at) else {
+            g.none += 1;
+            if g.first.is_empty() {
+                g.first = format!("face t74 {at:#x} base {base:#x}: no table there");
+            }
+            continue;
+        };
+        let Some(it) = items.get_mut(*i) else { continue };
+        let (tab, normals) = face_table(&Inputs { b6, b7: &it.b7, vb: &it.vb, t74: &t, ..Default::default() });
+        // The header read alone, as `face_unfilled` reads it: the table at offset 0.
+        let mut at0 = b6.clone();
+        at0[..4].fill(0);
+        let unfilled = !tab.is_empty() && ps::table_unfilled(&Inputs { b6: &at0, t74: &tab[..tab.len().min(28)], ..Default::default() });
+        if tab.is_empty() || unfilled {
+            if tab.is_empty() {
+                g.empty += 1;
+            } else {
+                g.unfilled += 1;
+            }
+            if g.first.is_empty() {
+                let hdr: Vec<String> = (0..7).map(|k| format!("{:.3}", f32::from_bits(le32(&t, base as usize + 4 * k)))).collect();
+                g.first = format!("face t74 {at:#x} base {base:#x} b6 {:x?}: table {} B, {} non-zero, header there [{}], step {} B", b6.chunks_exact(4).map(|w| le32(w, 0)).collect::<Vec<_>>(), t.len(), t.iter().filter(|x| **x != 0).count(), hdr.join(" "), tab.len());
+            }
+            continue;
+        }
+        (it.table, it.table_normals, it.neutral) = (tab, normals, false);
+        g.given += 1;
+    }
+    g
+}
+
 /// Vertex views past this are refused (the capture's buffer cap).
 const VB_MAX: u64 = 16 << 20;
 const REMAP_MAX: u64 = 1 << 20;
@@ -380,11 +475,21 @@ pub fn item_of(src: &dyn Source, frame: u64, variant: u32, bits: u32, new: &mut 
 /// the ped flag are left out (a vehicle's rec+0x54 is a bone offset).
 pub fn frame_for(frame: u64, list: &FrameList, range: impl Fn(usize) -> u32) -> PreskinFrame {
     let mut open = lock(&OPEN);
-    let Some(k) = open.iter().position(|o| o.frame == frame) else { return PreskinFrame::default() };
-    let o = open.remove(k);
+    let Some(k) = open.iter().position(|o| o.frame == frame) else {
+        // A list with no reads of its frame's dispatches (the nearest open frame, for the join line).
+        MISS_N.fetch_add(1, Ordering::Relaxed);
+        let near = open.iter().map(|o| o.frame as i64 - frame as i64).min_by_key(|d| d.abs()).unwrap_or(i64::MIN);
+        MISS_NEAR.store(near, Ordering::Relaxed);
+        return PreskinFrame::default();
+    };
+    let mut o = open.remove(k);
     open.retain(|x| x.frame > frame);
     drop(open);
     sweep(frame);
+    if !o.faces.is_empty() && super::headlive::shown() {
+        let g = give_faces(&mut o.items, &o.faces, &super::headlive::table_at);
+        super::headlive::faces_given(o.faces.len() as u32, &g);
+    }
     let by_word: HashMap<u32, u32> = o.items.iter().enumerate().map(|(i, it)| (it.word() & RANGE_MASK, i as u32)).collect();
     let draws = list
         .draws
@@ -397,7 +502,30 @@ pub fn frame_for(frame: u64, list: &FrameList, range: impl Fn(usize) -> u32) -> 
             Some((row as u32, item, ps::range(w).3))
         })
         .collect();
-    PreskinFrame { items: o.items, draws, unreadable: o.unreadable, read_ms: o.ns as f64 / 1e6, reads: o.reads }
+    PreskinFrame { items: o.items, draws, unreadable: o.unreadable, read_ms: o.ns as f64 / 1e6, reads: o.reads, held: 0 }
+}
+
+/// Lists with no reads of their own frame's dispatches since the last
+/// join line, and the last one's nearest open frame (its frame minus the
+/// list's; i64::MIN: none open).
+static MISS_N: AtomicU64 = AtomicU64::new(0);
+static MISS_NEAR: AtomicI64 = AtomicI64::new(i64::MIN);
+
+/// `pedhold=N` (read once; [`Hold`]).
+pub fn hold_n() -> u32 {
+    static N: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| hold_switch(&std::env::var("XNW_WORLD_RENDER").unwrap_or_default()));
+    *N
+}
+
+static HOLD: Mutex<Option<Hold>> = Mutex::new(None);
+
+/// `pedhold`: `list`'s ped rows without an item this frame take their
+/// last one (up to [`hold_n`] lists old). Returns the rows held.
+pub fn hold(list: &mut FrameList) -> u32 {
+    let mut pre = std::mem::take(&mut list.preskin);
+    let n = lock(&HOLD).get_or_insert_with(Hold::default).apply(list, &mut pre, hold_n());
+    list.preskin = pre;
+    n
 }
 
 /// Drops kept streams unused for KEEP_FRAMES (every KEEP_FRAMES frames).
@@ -534,6 +662,41 @@ mod tests {
         assert_eq!((v8.rule, v8.neutral, v8.unmapped), (Bones::Eight, false, true));
     }
 
+    /// FACE1: a neutral face whose t74 is the head graph's table takes the
+    /// table (its entries through the last one its vertices name, rebased),
+    /// and is no longer neutral; another address, or a table whose header
+    /// for that face is still zero, leaves it neutral.
+    #[test]
+    fn neutral_faces_take_the_head_table_at_their_address() {
+        let mut b7 = vec![0u8; 96];
+        put(&mut b7, 0xc, 16 | 0x40 << 8);
+        put(&mut b7, 0x38, 1);
+        let mut vb = vec![0u8; 0x50];
+        // Vertex 0: tag 0xb6, entry (2 >> 16 form) 1 - 1 = 0.
+        put(&mut vb, 0x44, 1 << 16);
+        put(&mut vb, 0x4c, 0xb600_0000);
+        let item = || Item { b7: b7.clone(), vb: Arc::new(vb.clone()), remap: Arc::new(Vec::new()), palette: Vec::new(), mask: None, rule: Bones::FourAll, neutral: true, unmapped: false, vb_key: 1, remap_key: 1, delta: Vec::new(), table: Vec::new(), table_normals: 0 };
+        let mut b6 = vec![0u8; 16];
+        put(&mut b6, 0, 0x20);
+        put(&mut b6, 4, 0x40);
+        put(&mut b6, 0xc, 1);
+        let mut t = vec![0u8; 0x80];
+        put(&mut t, 0x20 + 16, 1f32.to_bits());
+        let t = Arc::new(t);
+        let faces = vec![(0usize, 0x1000u64, b6.clone()), (1, 0x2000, b6.clone())];
+        let mut items = vec![item(), item()];
+        let at = |a: u64| (a == 0x1000).then(|| t.clone());
+        let g = give_faces(&mut items, &faces, &at);
+        assert_eq!((g.given, g.none), (1, 1));
+        assert!(!items[0].neutral && items[1].neutral && items[1].table.is_empty());
+        assert_eq!((&items[0].table[..], items[0].table_normals), (&t[0x20..0x64], 0x40));
+        let mut items = vec![item()];
+        let g = give_faces(&mut items, &faces[..1], &|_| Some(Arc::new(vec![0u8; 0x80])));
+        assert_eq!((g.given, g.none, g.unfilled), (0, 0, 1), "{}", g.first);
+        assert!(items[0].neutral);
+        assert_eq!(give_faces(&mut items, &faces[..1], &|_| None).none, 1);
+    }
+
     /// The join: a row with a palette or the ped flag whose range word
     /// names an item; the normals by the row's own primary bit.
     #[test]
@@ -546,7 +709,7 @@ mod tests {
         };
         // Below the first sweep (frame 600): the other test's kept streams stay.
         let frame = 500;
-        lock(&OPEN).push(Open { frame, items: vec![it(0x6000_0010), it(0x2100_0020)], unreadable: 1, ns: 2_000_000, reads: Reads::default() });
+        lock(&OPEN).push(Open { frame, items: vec![it(0x6000_0010), it(0x2100_0020)], faces: Vec::new(), unreadable: 1, ns: 2_000_000, reads: Reads::default() });
         let rec = |ped: bool, palette: u32| DrawRecord { geom: GeomKey::default(), world: [0.0; 16], viewport: 1, effect: 0, albedo: Albedo::Flat([1.0; 3]), palette, stage: 67, inst_first: 0, inst_count: 0, bone_first: 0, bone_count: 0, material: Material::default(), state: None, remap: NO_REMAP, ped };
         let list = FrameList { draws: vec![rec(true, NO_PALETTE), rec(false, 3), rec(false, NO_PALETTE), rec(true, NO_PALETTE)], ..Default::default() };
         let words = [0x2000_0010u32, 0x4100_0020, 0x6000_0010, u32::MAX];
@@ -577,10 +740,15 @@ mod tests {
         SINK_N[3].store(1, Ordering::Relaxed);
         // Own 0x6000_0123: the hook's 0x2000_0123 is the same range (bits 30-31 are format), 0x6000_0456 another; no hook word: another.
         let words = [(Some(0x6000_0123), Some(0x2000_0123)), (Some(0x6000_0123), Some(0x6000_0456)), (Some(0x6000_0123), None), (None, Some(1))];
-        assert_eq!(
-            join_line(60, &words, 3),
-            "world render: frame 60: pre-skin join: PreSkinD sinks (60 frames) 3, given to their draw 2, no hook draw 0, no record 1; this frame rows with their own record 3, of them the hook's record names another range 2; rows joined 3"
+        // The miss tail's counter is shared with the join test (run in parallel): its own test below.
+        let line = join_line(60, &words, 3);
+        assert!(
+            line.starts_with("world render: frame 60: pre-skin join: PreSkinD sinks (60 frames) 3, given to their draw 2, no hook draw 0, no record 1; this frame rows with their own record 3, of them the hook's record names another range 2; rows joined 3; lists without their frame's dispatch reads (60 frames) "),
+            "{line}"
         );
         assert!(SINK_N.iter().all(|a| a.load(Ordering::Relaxed) == 0));
+        assert_eq!(miss_text(2, -1), "; lists without their frame's dispatch reads (60 frames) 2 (the last one's nearest open frame -1)");
+        assert_eq!(miss_text(1, 2), "; lists without their frame's dispatch reads (60 frames) 1 (the last one's nearest open frame +2)");
+        assert_eq!(miss_text(0, i64::MIN), "; lists without their frame's dispatch reads (60 frames) 0 (the last one's nearest open frame none open)");
     }
 }

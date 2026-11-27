@@ -829,6 +829,10 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.select(c, is, a, old);
                 int(self, r)
             }
+            "v_readfirstlane_b32" if crate::emit::FIRST_LANE_OWN.with(std::cell::Cell::get) => {
+                let a = s(self, 0)?;
+                int(self, a)
+            }
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
                 self.s.flags |= flags::WAVE_OPS;

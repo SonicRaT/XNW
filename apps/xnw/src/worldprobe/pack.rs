@@ -48,6 +48,17 @@ const HEAD_UAV_CAP: u64 = 32 << 20;
 const TB_DRAW: u8 = 0;
 const TB_DISPATCH: u8 = 1;
 const TB_HEAD: u8 = 2;
+/// LIVE1: a live UI row's table: as a draw's, only the slots its programs
+/// name, no bindless table.
+const TB_UI: u8 = 3;
+/// HAIR7, the live hair mode: a strand-chain dispatch's table (as
+/// TB_DISPATCH) and a strand draw's (as TB_DRAW, no bindless table); a buffer view of at least [`IN_PLACE_MIN`] bytes in either is
+/// recorded by address only (reason IN_PLACE): the title's thread copies
+/// and hashes none of it (LIVE1: 149-256 ms a frame, 16 MB cut views hashed).
+const TB_HAIR_DISPATCH: u8 = 4;
+const TB_HAIR_DRAW: u8 = 5;
+/// HAIR7: buffer views from this length on are left in place in a live hair sink.
+const IN_PLACE_MIN: u64 = 64 << 10;
 /// Frames being recorded (not yet sent to the writer), at most; past it
 /// the oldest is skipped and counted. A sent frame's data moves into its
 /// capture (`take`), so a slow writer never costs a frame: an earlier fault was
@@ -265,7 +276,70 @@ pub(super) fn set_preskin_lists(heads: u64) {
 /// counted for its frame; a sink when the frame is recorded and the
 /// pipeline's compute program is one of PED_SKINNING.
 fn want_dispatch(pipeline: usize) -> bool {
-    want_dispatch_at(super::frame_key(), pipeline, |p| tap::stages(p).iter().filter(|s| s.name == "compute").map(|s| pipe_class(s.hash)).max().unwrap_or(PIPE_NONE))
+    let t = std::time::Instant::now();
+    let class = |p: usize| tap::stages(p).iter().filter(|s| s.name == "compute").map(|s| pipe_class(s.hash)).max().unwrap_or(PIPE_NONE);
+    // FACE1 (15-36 us a call, 16-41 ms a frame): a live mode decides
+    // by the pipeline alone, from this thread's own table, before the
+    // frame's record and its lock (held by other threads' sinks) are touched.
+    let w = if live() && !live_class_wanted(pipeline, CLASS.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.len() > 4096 {
+            m.clear();
+        }
+        *m.entry(pipeline).or_insert_with(|| class(pipeline))
+    })) {
+        false
+    } else {
+        want_dispatch_at(super::frame_key(), pipeline, class)
+    };
+    probe(0, t);
+    w
+}
+
+thread_local! {
+    /// FACE1: pipeline object -> its dispatch class, per title thread (no lock).
+    static CLASS: std::cell::RefCell<HashMap<usize, u8>> = std::cell::RefCell::new(HashMap::new());
+}
+
+/// Whether a live mode records a dispatch of `class` (the live part of
+/// `want_dispatch_at`'s rule).
+fn live_class_wanted(pipeline: usize, class: u8) -> bool {
+    class != PIPE_NONE && (hair_live() && (matches!(class, PIPE_HAIR | PIPE_HAIR_ORDER) || (class == PIPE_PED && face_pipeline(pipeline))) || head_live() && class == PIPE_HEAD && super::headlive::shown())
+}
+
+/// FACE1 probe (the live head mode cost ~42 ms a frame recording
+/// nothing, and its line stopped in the world): calls and ns of the pack's
+/// title-thread callbacks (dispatch want, sink, live draw want), live takes
+/// that found their frame and that did not, and the frames of the open
+/// records at the last take. [`live_probe`] takes them.
+static PROBE: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+/// The last take's list stamp and the gap to the record it paired with (record - list).
+static LIST_STAMP: AtomicU64 = AtomicU64::new(0);
+static STAMP_GAP: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+fn probe(k: usize, t: std::time::Instant) {
+    PROBE[2 * k].fetch_add(1, Ordering::Relaxed);
+    PROBE[2 * k + 1].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
+/// FACE1: the probe line's text since the last call (live modes).
+pub(super) fn live_probe() -> String {
+    let [dn, dns, sn, sns, wn, wns, hit, miss, newer, same, near] = PROBE.each_ref().map(|a| a.swap(0, Ordering::Relaxed));
+    let (open, lo, hi, slo, shi) = {
+        let accs = lock(&ACCS);
+        let st = || accs.iter().map(|a| a.stamp).filter(|s| *s != 0);
+        (accs.len(), accs.iter().map(|a| a.frame).min().unwrap_or(0), accs.iter().map(|a| a.frame).max().unwrap_or(0), st().min().unwrap_or(0), st().max().unwrap_or(0))
+    };
+    format!(
+        "dispatch want {dn} calls {:.1} ms, sinks {sn} {:.1} ms, draw want {wn} {:.1} ms; live takes found {hit} (of them a newer finished frame {newer}; paired on the present stamp: equal {same}, nearest {near}, last gap {}), missed {miss}; open records {open} (frames {lo}..{hi}, stamps {slo}..{shi}), list stamp {}, sent {}, late {}",
+        dns as f64 / 1e6,
+        sns as f64 / 1e6,
+        wns as f64 / 1e6,
+        STAMP_GAP.load(Ordering::Relaxed),
+        LIST_STAMP.load(Ordering::Relaxed),
+        SENT.load(Ordering::Relaxed),
+        LATE.load(Ordering::Relaxed)
+    )
 }
 
 fn want_dispatch_at(frame: u64, pipeline: usize, class: impl Fn(usize) -> u8) -> bool {
@@ -275,7 +349,7 @@ fn want_dispatch_at(frame: u64, pipeline: usize, class: impl Fn(usize) -> u8) ->
         acc.dispatches_seen += 1;
     }
     let c = *lock(&DISPATCH_PIPES).get_or_insert_with(HashMap::new).entry(pipeline).or_insert_with(|| class(pipeline));
-    c != PIPE_NONE && (!live() || hair_live() && (matches!(c, PIPE_HAIR | PIPE_HAIR_ORDER) || (c == PIPE_PED && face_pipeline(pipeline))))
+    !live() && c != PIPE_NONE || live_class_wanted(pipeline, c)
 }
 
 /// Pipeline object -> its compute program is the face pre-skin (variant 11):
@@ -298,6 +372,23 @@ pub(super) fn hair_live() -> bool {
     HAIR_LIVE.load(Ordering::Relaxed)
 }
 
+/// HAIR10, the live guide ribbons (`XNW_WORLD_RENDER=...,hairribbon=on`
+/// without a capture; `hair=on` wins): the writer records every frame only
+/// the main-view strand draws, each with its root constants, the frame
+/// table's worlds and group records (slots 18 and 21) and its view block
+/// (root 1 slot 1: the camera its worlds are relative to; [`RIBBON_SLOTS`]) and,
+/// once a frame per record buffer, each group record's remap and strand
+/// asset (heap views at +0xe0, +0x120) and its current palette window
+/// (`strand_groups` lean): no chain dispatch, no face pre-skin, no pool.
+static RIBBON_LIVE: AtomicBool = AtomicBool::new(false);
+
+pub(super) fn ribbon_live() -> bool {
+    RIBBON_LIVE.load(Ordering::Relaxed)
+}
+
+/// HAIR10: the table slots a live ribbon strand draw reads (worlds, group records, the view block).
+const RIBBON_SLOTS: [(u16, u32); 3] = [(0, 18), (0, 21), (1, 1)];
+
 /// Pipeline object -> it draws with the main-view strand vertex program.
 static STRAND_PIPES: Mutex<Option<HashMap<usize, bool>>> = Mutex::new(None);
 
@@ -315,9 +406,21 @@ pub(super) fn ui_live() -> bool {
     UI_LIVE.load(Ordering::Relaxed)
 }
 
-/// A live mode (hair or UI) is on: the writer records only its sinks.
+/// FACE1, the live head graph (`XNW_WORLD_RENDER=...,head=on` without a
+/// capture): the writer records every frame's head-graph dispatches
+/// (HEAD_PROGRAMS: `compute_graph_ops:*`, `ped_standard_head_cs:*`) as a
+/// capture does (TB_HEAD: their unordered buffers read, the network's
+/// arena with the title's inputs in it); [`take_live`] hands the frame
+/// over as for hair.
+static HEAD_LIVE: AtomicBool = AtomicBool::new(false);
+
+pub(super) fn head_live() -> bool {
+    HEAD_LIVE.load(Ordering::Relaxed)
+}
+
+/// A live mode (hair, UI or head) is on: the writer records only its sinks.
 pub(super) fn live() -> bool {
-    hair_live() || ui_live()
+    hair_live() || ui_live() || head_live() || ribbon_live()
 }
 
 /// Container -> program name, for the UI test (set by [`enable_ui`]).
@@ -335,9 +438,56 @@ fn ui_draw_want(pipeline: usize) -> bool {
     w
 }
 
+/// LIVE1: pipeline object -> the table slots (root, slot) a UI pipeline's
+/// vertex and pixel programs name (`xnw_frame::bridge::named`, what the
+/// replay binds); None: not known (the row's tables are read whole).
+static UI_NAMED: Mutex<Option<HashMap<usize, Option<std::sync::Arc<Vec<(u16, u32)>>>>>> = Mutex::new(None);
+
+fn ui_named(pipeline: usize) -> Option<std::sync::Arc<Vec<(u16, u32)>>> {
+    if let Some(n) = lock(&UI_NAMED).as_ref().and_then(|m| m.get(&pipeline)) {
+        return n.clone();
+    }
+    let mut used = HashMap::new();
+    let mut wave = 32;
+    let stages = tap::stages(pipeline);
+    let all = stages.iter().enumerate().filter(|(_, s)| s.name == "vertex" || s.name == "pixel").all(|(i, _)| tap::stage_bytes(pipeline, i).is_some_and(|b| xnw_frame::bridge::named(&b, &mut used, &mut wave).is_ok()));
+    let named = (all && stages.iter().any(|s| s.name == "pixel")).then(|| {
+        let mut v: Vec<(u16, u32)> = used.into_keys().collect();
+        v.sort_unstable();
+        std::sync::Arc::new(v)
+    });
+    lock(&UI_NAMED).get_or_insert_with(HashMap::new).insert(pipeline, named.clone());
+    named
+}
+
+/// HAIR7: pipeline object -> the table slots a strand pipeline's vertex
+/// program names (the replay draws strands through it alone, depth only);
+/// None: not known (every texture of its tables is read).
+static STRAND_NAMED: Mutex<Option<HashMap<usize, Option<std::sync::Arc<Vec<(u16, u32)>>>>>> = Mutex::new(None);
+
+fn strand_named(pipeline: usize) -> Option<std::sync::Arc<Vec<(u16, u32)>>> {
+    if let Some(n) = lock(&STRAND_NAMED).as_ref().and_then(|m| m.get(&pipeline)) {
+        return n.clone();
+    }
+    let (mut used, mut wave) = (HashMap::new(), 32);
+    let stages = tap::stages(pipeline);
+    let named = stages.iter().position(|s| s.name == "vertex").and_then(|i| tap::stage_bytes(pipeline, i)).filter(|b| xnw_frame::bridge::named(b, &mut used, &mut wave).is_ok()).map(|_| {
+        let mut v: Vec<(u16, u32)> = used.into_keys().collect();
+        v.sort_unstable();
+        std::sync::Arc::new(v)
+    });
+    lock(&STRAND_NAMED).get_or_insert_with(HashMap::new).insert(pipeline, named.clone());
+    named
+}
+
 /// The live modes' draw filter (tap.rs `set_tap_want`).
 fn live_draw_want(pipeline: usize) -> bool {
-    (hair_live() && strand_draw_want(pipeline)) || (ui_live() && ui_draw_want(pipeline))
+    let t = std::time::Instant::now();
+    let want = ((hair_live() || ribbon_live()) && strand_draw_want(pipeline)) || (ui_live() && ui_draw_want(pipeline));
+    // ENG8: the answer classes the draw's program set for `XNW_PATCH=noencode` (a no-op when that is off).
+    crate::encode::learn(want);
+    probe(2, t);
+    want
 }
 
 /// Registers the sink tap in the live UI mode (once; not with a capture's
@@ -364,38 +514,94 @@ pub(super) fn enable_hair() {
     xnw_core::info!("world probe: pack: live hair mode: strand chain dispatches and strand draws read every frame, kept in memory (no frame written)");
 }
 
+/// HAIR10: registers the sink tap in the live ribbon mode (once; not with a
+/// capture's `pack=2`; with `hair=on` its mode records all a ribbon reads).
+pub(super) fn enable_ribbon() {
+    if ON.load(Ordering::Relaxed) && !live() {
+        return;
+    }
+    RIBBON_LIVE.store(true, Ordering::Relaxed);
+    tap::set_tap_want(Some(live_draw_want));
+    enable();
+    xnw_core::info!("world probe: pack: live ribbon mode: main-view strand draws read every frame (worlds, group records, their remaps, assets and palette windows), kept in memory (no frame written)");
+}
+
+/// Registers the sink tap in the live head mode (once; not with a capture's `pack=2`).
+pub(super) fn enable_head() {
+    if ON.load(Ordering::Relaxed) && !live() {
+        return;
+    }
+    HEAD_LIVE.store(true, Ordering::Relaxed);
+    tap::set_tap_want(Some(live_draw_want));
+    enable();
+    xnw_core::info!("world probe: pack: live head mode: head-graph dispatches read every frame, kept in memory (no frame written)");
+}
+
 /// The live hair mode's frame `frame`: its pack and blobs, in memory (older
 /// open frames dropped). Its blobs are not counted as stored: the next
 /// frame keeps its own copy of what it reads.
-pub(super) fn take_live(frame: u64) -> Option<(FramePack, HashMap<u128, Vec<u8>>)> {
+pub(super) fn take_live(frame: u64, stamp: u32) -> Option<(FramePack, HashMap<u128, Vec<u8>>)> {
     if !live() {
         return None;
     }
     let mut accs = lock(&ACCS);
     SENT.fetch_max(frame.saturating_add(1), Ordering::Relaxed);
     let mut taken = None;
+    // FACE1 (the open records ran 5-25 frames ahead of the list's
+    // frame, 46 of 60 takes missed): in the head mode alone (it needs the
+    // newest inputs, not this frame's draws), a missing frame takes the
+    // newest finished record instead: the newest but one (the newest may
+    // still be recording); older ones go.
+    // FACE1 (the two frame keys drifted 824 apart): the head mode
+    // pairs on ENG11's present counter, read at the list's first hook
+    // (`stamp`) and at each record's first sink: the finished record with
+    // the nearest stamp (equal when both saw the same present).
+    let head_only = head_live() && !hair_live() && !ui_live() && !ribbon_live();
+    let newest = accs.iter().map(|a| a.frame).max().unwrap_or(0);
+    let by_stamp = (head_only && stamp != 0).then(|| accs.iter().filter(|a| a.stamp != 0 && a.frame < newest).min_by_key(|a| (i64::from(a.stamp) - i64::from(stamp)).abs()).map(|a| (a.frame, a.stamp))).flatten();
+    if let Some((_, s)) = by_stamp {
+        PROBE[if s == stamp { 9 } else { 10 }].fetch_add(1, Ordering::Relaxed);
+        STAMP_GAP.store(i64::from(s) - i64::from(stamp), Ordering::Relaxed);
+    }
+    LIST_STAMP.store(u64::from(stamp), Ordering::Relaxed);
+    let want = match by_stamp {
+        Some((f, _)) => f,
+        None if !accs.iter().any(|a| a.frame == frame) && head_only => accs.iter().map(|a| a.frame).filter(|f| *f < newest).max().unwrap_or(frame),
+        None => frame,
+    };
+    if want != frame {
+        PROBE[8].fetch_add(1, Ordering::Relaxed);
+    }
     accs.retain_mut(|a| {
-        if a.frame == frame {
+        if a.frame == want {
             taken = Some(std::mem::take(a));
             false
         } else {
-            a.frame > frame
+            a.frame > want
         }
     });
     drop(accs);
     // The resolved tables by content grow with the run: start again past a bound.
     {
         let mut run = lock(&RUN);
-        if run.as_ref().is_some_and(|r| r.resolved.len() + r.texels.len() > 16_384) {
+        if run.as_ref().is_some_and(|r| r.resolved.len() + r.texels.len() + r.live_texels.len() > 16_384) {
             *run = None;
         }
     }
-    let acc = taken?;
+    PROBE[if taken.is_some() { 6 } else { 7 }].fetch_add(1, Ordering::Relaxed);
+    let mut acc = taken?;
+    // `refs_of` searches sorted records (refs.bin is written sorted): unsorted,
+    // a sink's IA, IA_DATA and tables and the frame's GSTATE were not found
+    // (a test run 'no IA bytes or pipeline state', a test run 'no pool view at slot 36').
+    fp::sort_refs(&mut acc.refs);
     let sinks: Vec<fp::Sink> = acc.sinks.iter().enumerate().map(|(i, s)| fp::Sink { index: i as u32, thread: s.thread, hook_draw: None, op: s.op, count: s.count, pipeline: s.pipeline }).collect();
     let mut textures: Vec<fp::Texture> = acc.textures.into_values().collect();
     textures.sort_by_key(|t| t.at);
     let manifest = fp::Manifest { version: fp::VERSION, frame, ..Default::default() };
-    let blobs: HashMap<u128, Vec<u8>> = acc.blobs.into_iter().map(|(h, (_, b))| (h, b)).collect();
+    let mut blobs: HashMap<u128, Vec<u8>> = acc.blobs.into_iter().map(|(h, (_, b))| (h, b)).collect();
+    for (h, b) in acc.shared {
+        blobs.entry(h).or_insert_with(|| b.to_vec());
+    }
     Some((FramePack { manifest, refs: acc.refs, sinks, programs: acc.programs, textures }, blobs))
 }
 
@@ -429,7 +635,10 @@ pub(super) fn on() -> bool {
 /// At the hook: a new draw on this thread in `frame`; its sequence number
 /// (what the recorded draw keeps as `pack_seq`).
 pub(super) fn hook_entry(frame: u64) -> u32 {
-    if !on() {
+    // LIVE1: a live mode records sinks only; the hook's records (palette
+    // spans, model and handler heads per skinned draw) are a capture's (they
+    // cost a test run's hook 288-604 ms a frame: reads, hashing, the frame's lock).
+    if !on() || live() {
         return 0;
     }
     let seq = SEQ.fetch_add(1, Ordering::Relaxed).wrapping_add(1).max(1);
@@ -725,6 +934,8 @@ struct SinkRaw {
 #[derive(Default)]
 struct Acc {
     frame: u64,
+    /// FACE1: ENG11's present counter at the frame's first sink (0: unknown).
+    stamp: u32,
     /// Recorded (the writer will want it); else a marker that records nothing.
     wanted: bool,
     sinks: Vec<SinkRaw>,
@@ -807,6 +1018,9 @@ struct Acc {
     hook_globals_done: bool,
     /// Displacement map records: with a view, without.
     disp_maps: [u32; 2],
+    /// LIVE1: texel blobs shared with the run's live cache (merged into the
+    /// blobs by `take_live`, off the title's thread).
+    shared: HashMap<u128, std::sync::Arc<Vec<u8>>>,
 }
 
 /// One sent frame's pack data, moved into its capture (`take`).
@@ -821,7 +1035,16 @@ struct Run {
     stored: HashSet<u128>,
     resolved: HashMap<u128, (u128, Vec<SlotView>)>,
     texels: HashMap<(u64, u64, u64), u128>,
+    /// LIVE1, a live mode: texels read in earlier frames by (address, bytes,
+    /// fill), with their bytes (a frame hands them over without reading or
+    /// hashing them again: pk10ui2's 4 MB glyph cache, every frame); strand
+    /// assets by (address, bytes, u64::MAX).
+    live_texels: HashMap<(u64, u64, u64), (u128, std::sync::Arc<Vec<u8>>)>,
+    live_texel_bytes: u64,
 }
+
+/// LIVE1: live texel bytes kept across frames, at most.
+const LIVE_TEXEL_CAP: u64 = 256 << 20;
 
 static ACCS: Mutex<Vec<Acc>> = Mutex::new(Vec::new());
 static RUN: Mutex<Option<Run>> = Mutex::new(None);
@@ -882,7 +1105,9 @@ fn slot_view(slot: u32, v: &TapView) -> SlotView {
 
 /// The list sink (title thread).
 fn on_sink(d: &TapDraw) {
+    let t = std::time::Instant::now();
     sink_at(super::frame_key(), d);
+    probe(1, t);
 }
 
 fn sink_at(frame: u64, d: &TapDraw) {
@@ -897,15 +1122,39 @@ fn sink_at(frame: u64, d: &TapDraw) {
     // A dispatch is not a draw: never paired with this thread's hook draw.
     let hook = if hf == frame && !compute { hs } else { 0 };
     let thread = THREAD.with(|t| *t);
+    // LIVE1: a live UI row reads only what the replay binds of it.
+    let draw = matches!(d.op, fp::op::DRAW | fp::op::INDEXED);
+    // HAIR7: a live strand draw's tables leave their large views in place
+    // and read only the textures its vertex program names. Its other small
+    // views are read: with the named slots alone (UI1's cut) WARP's device
+    // was removed in the first strand draw (pk8a f1028, with
+    // XNW_HAIR_DEVICE=off too); the replay binds every small view besides
+    // the named ones (`xnw_frame::bridge::load`), and no unnamed texture.
+    let strand = hair_live() && draw && strand_draw_want(d.pipeline);
+    // HAIR10: a live ribbon strand draw (without `hair=on`) reads its worlds and group records alone.
+    let ribbon = ribbon_live() && !hair_live() && draw && strand_draw_want(d.pipeline);
+    let named = if ribbon {
+        Some(std::sync::Arc::new(RIBBON_SLOTS.to_vec()))
+    } else if ui_live() && draw && ui_draw_want(d.pipeline) {
+        ui_named(d.pipeline)
+    } else {
+        None
+    };
     let mut accs = lock(&ACCS);
     let Some(acc) = acc_of(&mut accs, frame) else { return };
+    // FACE1: the record's present stamp (ENG11), at its first sink.
+    if acc.stamp == 0 && live() {
+        acc.stamp = super::present_stamp();
+    }
     let mut run_g = lock(&RUN);
     let run = run_g.get_or_insert_with(Run::default);
     let owner = acc.sinks.len() as u32;
     acc.sinks.push(SinkRaw { thread, hook, op: d.op, count: d.count, pipeline: d.pipeline as u64 });
+    let tp = live().then(std::time::Instant::now);
     if acc.pipelines.insert(d.pipeline as u64) {
         programs(acc, run, d.pipeline);
     }
+    let tr = lap(&tp, 0);
     for (i, r) in d.roots.iter().enumerate() {
         let slot = i as u16;
         match *r {
@@ -919,12 +1168,23 @@ fn sink_at(frame: u64, d: &TapDraw) {
             TapRoot::View(a) => {
                 let (at, full, alias, how) = root_view_at(a, tap::buffer_left, |x| stream_left(&acc.streams, x));
                 let len = full.min(BUF_CAP);
+                // HAIR7: a live hair sink's large root view is left in place too.
+                if (strand || (hair_live() && matches!(class, PIPE_HAIR | PIPE_HAIR_ORDER))) && len >= IN_PLACE_MIN {
+                    LIVE_IN_PLACE[0].fetch_add(1, Ordering::Relaxed);
+                    LIVE_IN_PLACE[1].fetch_add(len, Ordering::Relaxed);
+                    acc.refs.push(reference(owner, kind::ROOT_VIEW, slot, at, len, Err(reason::IN_PLACE)));
+                    continue;
+                }
                 let got = buffer(acc, run, at, len);
                 acc.alias[0] += u32::from(alias);
                 acc.alias[1] += u32::from(got.is_err());
                 acc.alias[2] += u32::from(how == ROOT_STREAM);
                 acc.alias[3] += u32::from(how == ROOT_WINDOWED);
                 acc.refs.push(reference_cut(owner, kind::ROOT_VIEW, slot, at, len, got, full > len || how == ROOT_WINDOWED));
+            }
+            TapRoot::Table { handle, slots, .. } if named.is_some() => {
+                let only: Vec<u32> = named.iter().flat_map(|n| n.iter()).filter(|n| n.0 == slot).map(|n| n.1).collect();
+                table_named(acc, run, owner, slot, handle, slots.min(tap::TABLE_SLOTS), d.view_heap, &only, TB_UI);
             }
             TapRoot::Table { handle, slots, .. } => {
                 // The frame table (root 0) to tap::TABLE_SLOTS for draws and
@@ -937,15 +1197,24 @@ fn sink_at(frame: u64, d: &TapDraw) {
                     _ => DISPATCH_SLOTS,
                 };
                 let mode = match (compute, class) {
+                    (false, _) if strand => TB_HAIR_DRAW,
                     (false, _) => TB_DRAW,
                     (true, PIPE_HEAD) => TB_HEAD,
+                    (true, PIPE_HAIR | PIPE_HAIR_ORDER) if hair_live() => TB_HAIR_DISPATCH,
                     _ => TB_DISPATCH,
                 };
-                table(acc, run, owner, slot, handle, slots.min(cap), d.view_heap, mode)
+                let textures = if strand { strand_named(d.pipeline) } else { None };
+                let tt = live().then(std::time::Instant::now);
+                table(acc, run, owner, slot, handle, slots.min(cap), d.view_heap, mode, textures.as_deref().map(|n| (slot, &n[..])));
+                match mode {
+                    TB_HAIR_DRAW => lap(&tt, 5),
+                    TB_HAIR_DISPATCH => lap(&tt, 6),
+                    _ => None,
+                };
             }
         }
     }
-    if !compute {
+    if !compute && named.is_none() {
         let words = match d.roots.first() {
             Some(TapRoot::Table { handle, slots, .. }) if WORDS_SLOT < *slots => Some(slot_view(WORDS_SLOT, &tap::view(handle + tap::SLOT * u64::from(WORDS_SLOT)))),
             _ => None,
@@ -955,9 +1224,13 @@ fn sink_at(frame: u64, d: &TapDraw) {
             _ => None,
         };
         let heap = d.view_heap;
+        let tw = live().then(std::time::Instant::now);
         draw_words(acc, run, owner, words_at(words, off), &|w| tap::heap_slot(heap, w).map(|(start, h)| (start, slot_view(w, &tap::view(h)))));
+        lap(&tw, 7);
     }
+    let ts = lap(&tr, 1);
     samplers(acc, run, owner, d.sampler_heap, tap::sampler_heap(d.sampler_heap), &tap::sampler);
+    let ti = lap(&ts, 2);
     if let Some(&(base_slot, meshlet_slot)) = acc.wheels.get(&(d.pipeline as u64)) {
         wheel_windows(acc, run, owner, d.count, wheel_views(d, base_slot, meshlet_slot));
     }
@@ -977,6 +1250,7 @@ fn sink_at(frame: u64, d: &TapDraw) {
         if let Some(ia) = tap::ia() {
             ia_records(acc, run, owner, d, ia, &read);
         }
+        lap(&ti, 3);
     }
     acc.head_sinks += u32::from(class == PIPE_HEAD);
     acc.sky_sinks += u32::from(class == PIPE_SKY);
@@ -1001,14 +1275,21 @@ fn sink_at(frame: u64, d: &TapDraw) {
     if class == PIPE_HAIR || class == PIPE_HAIR_ORDER {
         acc.hair[usize::from(class == PIPE_HAIR_ORDER)] += 1;
     }
-    if class == PIPE_HAIR {
+    if class == PIPE_HAIR || ribbon {
+        let tg = live().then(std::time::Instant::now);
         let at = |slot: u32| match d.roots.first() {
             Some(TapRoot::Table { handle, slots, .. }) if slot < *slots => Some(slot_view(slot, &tap::view(handle + tap::SLOT * u64::from(slot)))),
             _ => None,
         };
         let heap = d.view_heap;
-        let inputs = StrandInputs { records: at(STRAND_SLOT), palette: at(PALETTE_SLOT), shapes: at(SHAPES_SLOT) };
-        strand_groups(acc, run, owner, inputs, &|i| tap::heap_slot(heap, i).and_then(|(_, h)| read(h, tap::SLOT).ok().map(|_| (h, slot_view(i, &tap::view(h))))));
+        let inputs = StrandInputs { records: at(STRAND_SLOT), palette: at(PALETTE_SLOT), shapes: if ribbon { None } else { at(SHAPES_SLOT) } };
+        // HAIR10: a ribbon draw's own group: root 2 dword 3 (`xnw_world::hair::Draw`).
+        let group = match d.roots.get(2) {
+            Some(TapRoot::Constants(c)) => c.get(3).copied().unwrap_or(u32::MAX),
+            _ => u32::MAX,
+        };
+        strand_groups_as(acc, run, owner, inputs, &|i| tap::heap_slot(heap, i).and_then(|(_, h)| read(h, tap::SLOT).ok().map(|_| (h, slot_view(i, &tap::view(h))))), ribbon.then_some(group));
+        lap(&tg, 4);
     }
     if let Some(t0) = t0 {
         if class == PIPE_PED {
@@ -1016,6 +1297,28 @@ fn sink_at(frame: u64, d: &TapDraw) {
         }
         acc.dispatch_ns += t0.elapsed().as_nanos() as u64;
     }
+}
+
+/// LIVE1: a live mode's sink time by part (programs, roots and tables,
+/// samplers, IA records), ns; [`live_parts`] takes them.
+static LIVE_NS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// Adds the time since `t` to part `k`; the time now (None: not timed).
+fn lap(t: &Option<std::time::Instant>, k: usize) -> Option<std::time::Instant> {
+    let t = (*t)?;
+    let now = std::time::Instant::now();
+    LIVE_NS[k].fetch_add((now - t).as_nanos() as u64, Ordering::Relaxed);
+    Some(now)
+}
+
+/// HAIR7: views left in place by live hair sinks (count, bytes) since the last [`live_parts`].
+static LIVE_IN_PLACE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// The live sink time by part since the last call (ms).
+pub(super) fn live_parts() -> String {
+    let ms = LIVE_NS.each_ref().map(|a| a.swap(0, Ordering::Relaxed) as f64 / 1e6);
+    let [n, b] = LIVE_IN_PLACE.each_ref().map(|a| a.swap(0, Ordering::Relaxed));
+    format!("programs {:.2} ms, roots and tables {:.2} ms, samplers {:.2} ms, IA {:.2} ms, strand records {:.2} ms (tables: strand draws {:.2} ms, chain dispatches {:.2} ms, draw words {:.2} ms); hair views left in place {n} ({:.1} MiB)", ms[0], ms[1], ms[2], ms[3], ms[4], ms[5], ms[6], ms[7], b as f64 / f64::from(1 << 20))
 }
 
 /// The scene-light array (real addresses: array base, buffer index
@@ -1205,6 +1508,12 @@ fn bones_reached(remap: Option<&SlotView>, at: u32) -> u64 {
     }
 }
 
+/// [`strand_groups_as`] without `lean` (the tests' form).
+#[cfg(test)]
+fn strand_groups(acc: &mut Acc, run: &mut Run, owner: u32, inputs: StrandInputs, resolve: &dyn Fn(u32) -> Option<(u64, SlotView)>) {
+    strand_groups_as(acc, run, owner, inputs, resolve, None);
+}
+
 /// A hair input dispatch's STRAND_VIEW / STRAND_BYTES records: for each
 /// strand group record of `records` (`fp::STRAND_RECORD` bytes each, at
 /// most `STRAND_MAX`), the views at the heap indices in its
@@ -1212,13 +1521,33 @@ fn bones_reached(remap: Option<&SlotView>, at: u32) -> u64 {
 /// bytes; once per frame per record buffer content (later sinks naming
 /// the same records add nothing). Counts: records, views with bytes,
 /// without.
-fn strand_groups(acc: &mut Acc, run: &mut Run, owner: u32, inputs: StrandInputs, resolve: &dyn Fn(u32) -> Option<(u64, SlotView)>) {
+/// `lean` (HAIR10, a live ribbon strand draw): record
+/// `lean` alone (the draw's group), once a frame per record buffer address
+/// and record (no read or hash again), only the remap and asset words
+/// (`fp::STRAND_WORDS` 0 and 1) and the current palette window, no
+/// collision span. Slots are numbered by the record's index as before.
+fn strand_groups_as(acc: &mut Acc, run: &mut Run, owner: u32, inputs: StrandInputs, resolve: &dyn Fn(u32) -> Option<(u64, SlotView)>, lean: Option<u32>) {
     let Some(v) = inputs.records.filter(|v| matches!(v.kind, view::BUFFER | view::PLACED_BUFFER)) else {
         acc.refs.push(reference(owner, kind::STRAND_VIEW, 0, 0, 0, Err(reason::NULL)));
         return;
     };
     let n = (v.bytes as usize / fp::STRAND_RECORD).min(STRAND_MAX);
-    let bytes = if n == 0 { Err(reason::IMPLAUSIBLE) } else { read(v.addr, (n * fp::STRAND_RECORD) as u64) };
+    let first = match lean {
+        Some(g) if (g as usize) < n => {
+            if !acc.strand_seen.insert(u128::from(v.addr) << 32 | u128::from(g) | 1 << 127) {
+                return;
+            }
+            g as usize
+        }
+        Some(_) => {
+            acc.refs.push(reference(owner, kind::STRAND_VIEW, 0, v.addr, 0, Err(reason::IMPLAUSIBLE)));
+            return;
+        }
+        None => 0,
+    };
+    let (lean, n) = (lean.is_some(), if lean.is_some() { 1 } else { n });
+    let at = v.addr + (first * fp::STRAND_RECORD) as u64;
+    let bytes = if n == 0 { Err(reason::IMPLAUSIBLE) } else { read(at, (n * fp::STRAND_RECORD) as u64) };
     let bytes = match bytes {
         Ok(b) => b,
         Err(why) => {
@@ -1226,12 +1555,13 @@ fn strand_groups(acc: &mut Acc, run: &mut Run, owner: u32, inputs: StrandInputs,
             return;
         }
     };
-    if !acc.strand_seen.insert(xnw_core::hash128(&[&v.addr.to_le_bytes(), &bytes])) {
+    if !lean && !acc.strand_seen.insert(xnw_core::hash128(&[&v.addr.to_le_bytes(), &bytes])) {
         return;
     }
     for (r, rec) in bytes.chunks_exact(fp::STRAND_RECORD).enumerate() {
+        let r = first + r;
         acc.hair[2] += 1;
-        for (k, &o) in fp::STRAND_WORDS.iter().enumerate() {
+        for (k, &o) in fp::STRAND_WORDS.iter().enumerate().take(if lean { 2 } else { fp::STRAND_WORDS.len() }) {
             let index = u32::from_le_bytes([rec[o], rec[o + 1], rec[o + 2], rec[o + 3]]);
             let slot = (r * 8 + k) as u16;
             let before = acc.refs.len();
@@ -1239,17 +1569,19 @@ fn strand_groups(acc: &mut Acc, run: &mut Run, owner: u32, inputs: StrandInputs,
             let ok = acc.refs[before..].iter().all(|r| reason::has_bytes(r.reason));
             acc.hair[if ok { 3 } else { 4 }] += 1;
         }
-        strand_extras(acc, run, owner, r as u16, rec, &inputs, resolve);
+        strand_extras(acc, run, owner, r as u16, rec, &inputs, resolve, lean);
     }
 }
 
 /// One group record's STRAND_PALETTE windows (the bones at its two
 /// palette bases) and its STRAND_SPAN (the collision shapes it names).
-fn strand_extras(acc: &mut Acc, run: &mut Run, owner: u32, r: u16, rec: &[u8], inputs: &StrandInputs, resolve: &dyn Fn(u32) -> Option<(u64, SlotView)>) {
+/// `lean`: the current window alone, no span.
+#[allow(clippy::too_many_arguments)]
+fn strand_extras(acc: &mut Acc, run: &mut Run, owner: u32, r: u16, rec: &[u8], inputs: &StrandInputs, resolve: &dyn Fn(u32) -> Option<(u64, SlotView)>, lean: bool) {
     let remap = resolve(le32(rec, fp::STRAND_WORDS[0])).map(|(_, v)| v);
     let bones = bones_reached(remap.as_ref(), le32(rec, REC_REMAP_AT));
     let bone = fp::BONE_BYTES as u64;
-    for (j, &o) in REC_BASES.iter().enumerate() {
+    for (j, &o) in REC_BASES.iter().enumerate().take(if lean { 1 } else { REC_BASES.len() }) {
         let base = u64::from(le32(rec, o));
         let slot = 2 * r + j as u16;
         let r = match view_range(inputs.palette.as_ref(), base * bone, bones * bone) {
@@ -1258,6 +1590,9 @@ fn strand_extras(acc: &mut Acc, run: &mut Run, owner: u32, r: u16, rec: &[u8], i
         };
         acc.strand_extra[if reason::has_bytes(r.reason) { 0 } else { 1 }] += 1;
         acc.refs.push(r);
+    }
+    if lean {
+        return;
     }
     let count = u64::from(le32(rec, REC_SHAPE_COUNT) >> 24);
     let off = u64::from(le32(rec, REC_SHAPE_AT));
@@ -1271,8 +1606,11 @@ fn strand_extras(acc: &mut Acc, run: &mut Run, owner: u32, r: u16, rec: &[u8], i
     acc.refs.push(r);
 }
 
-/// The offset between a buffer's GPU address and its CPU address.
-const GPU_ALIAS: u64 = 0x4_0000_0000;
+/// The offset between a buffer's GPU address and its CPU address: the
+/// paired reservation's, as xmem published it (ALIAS1), else 0x4_0000_0000.
+fn gpu_alias() -> u64 {
+    xnw_core::pair::pair().alias()
+}
 
 /// A root view with no buffer object or stream behind it: this much of
 /// the title memory there (the device binds such a view as the memory
@@ -1294,16 +1632,16 @@ fn stream_left(streams: &BTreeMap<u64, u64>, address: u64) -> Option<u64> {
 
 /// Where a root view's bytes are read: (address, bytes to read, through
 /// the CPU alias, how). A root view names a GPU address: the title's
-/// pages are mapped twice (paired reservation, CPU view + `GPU_ALIAS` =
+/// pages are mapped twice (paired reservation, CPU view + `gpu_alias()` =
 /// GPU view [V a run's log: 'paired reservation 0x100000000 <->
 /// 0x500000000']); its vertex streams lie in its own pages, in no buffer
 /// object (one captured frame: 2,449 of 2,449 root views at 0x5..0x9_xxxx_xxxx,
-/// 2,389 of them at their hook draw's vertex stream + `GPU_ALIAS`).
+/// 2,389 of them at their hook draw's vertex stream + `gpu_alias()`).
 /// In order: a buffer object (`left`) at the address, then at the
-/// address - `GPU_ALIAS`; a hook stream (`stream`) at either; else a
+/// address - `gpu_alias()`; a hook stream (`stream`) at either; else a
 /// window at the address (the memory is mapped at both).
 pub(super) fn root_view_at(a: u64, left: impl Fn(u64) -> Option<u64>, stream: impl Fn(u64) -> Option<u64>) -> (u64, u64, bool, u8) {
-    let cpu = a.checked_sub(GPU_ALIAS).filter(|&c| c >= 0x1_0000);
+    let cpu = a.checked_sub(gpu_alias()).filter(|&c| c >= 0x1_0000);
     if let Some(n) = left(a) {
         return (a, n, false, ROOT_BUFFER);
     }
@@ -1572,6 +1910,29 @@ fn heap_view_as(acc: &mut Acc, run: &mut Run, owner: u32, kinds: [u16; 2], k: u1
         view::BUFFER | view::PLACED_BUFFER if v.kind == view::BUFFER && v.layout == view::UNORDERED => {
             acc.refs.push(reference(owner, kb, k, v.addr, v.bytes.min(u64::from(u32::MAX)), Err(reason::GPU_OUTPUT)));
         }
+        // LIVE1: a strand asset (record word +0x120, read-only: HAIR4) in a live
+        // mode: read once for the run, outside the frame's buffer budget (pk8a
+        // f1027's budget left three out: ten chain dispatches not run).
+        view::BUFFER | view::PLACED_BUFFER if live() && kb == kind::STRAND_BYTES && k % 8 == 1 => {
+            let len = v.bytes.min(BUF_CAP);
+            let got = match run.live_texels.get(&(v.addr, len, u64::MAX)) {
+                Some((h, b)) => {
+                    acc.shared.insert(*h, b.clone());
+                    Ok(*h)
+                }
+                None => read(v.addr, len).map(|b| {
+                    let h = xnw_core::hash128(&[&b]);
+                    let b = std::sync::Arc::new(b);
+                    if run.live_texel_bytes + len <= LIVE_TEXEL_CAP {
+                        run.live_texel_bytes += len;
+                        run.live_texels.insert((v.addr, len, u64::MAX), (h, b.clone()));
+                    }
+                    acc.shared.insert(h, b);
+                    h
+                }),
+            };
+            acc.refs.push(reference_cut(owner, kb, k, v.addr, len, got, v.bytes > len));
+        }
         view::BUFFER | view::PLACED_BUFFER => {
             let len = v.bytes.min(BUF_CAP);
             let got = buffer(acc, run, v.addr, len);
@@ -1740,7 +2101,9 @@ fn wheel_windows(acc: &mut Acc, run: &mut Run, owner: u32, groups: u32, views: [
 
 /// A table root: its resolved slots (by raw content, run-wide), the bytes
 /// behind its constant buffers and its textures (once per content per frame).
-fn table(acc: &mut Acc, run: &mut Run, owner: u32, root: u16, handle: u64, slots: u32, view_heap: usize, mode: u8) {
+/// HAIR7 `textures`: (this root, the (root, slot)s named): a texture view
+/// no program names is not read (the replay binds none: `bridge::load`).
+fn table(acc: &mut Acc, run: &mut Run, owner: u32, root: u16, handle: u64, slots: u32, view_heap: usize, mode: u8, textures: Option<(u16, &[(u16, u32)])>) {
     let raw_len = u64::from(slots) * tap::SLOT;
     let raw = match read(handle, raw_len) {
         Ok(r) => r,
@@ -1777,6 +2140,43 @@ fn table(acc: &mut Acc, run: &mut Run, owner: u32, root: u16, handle: u64, slots
     };
     let first = acc.refs.len();
     acc.refs.push(reference(owner, kind::TABLE, root, handle, (views.len() * fp::SLOT_BYTES) as u64, Ok(hash)));
+    for v in views.iter().filter(|v| !matches!(v.kind, view::TEXTURE | view::PLACED) || textures.is_none_or(|(r, n)| n.contains(&(r, v.slot)))) {
+        view_bytes(acc, run, owner, root, v, view_heap, mode);
+    }
+    let refs = acc.refs[first..].to_vec();
+    acc.tables.insert(seen, refs);
+}
+
+/// LIVE1: a live UI row's table root `root`: the slots its programs name
+/// (`only`), their views and bytes as [`table`] records them (TB_UI: no
+/// bindless table); a root none of them names keeps an empty record.
+fn table_named(acc: &mut Acc, run: &mut Run, owner: u32, root: u16, handle: u64, slots: u32, view_heap: usize, only: &[u32], mode: u8) {
+    let only: Vec<u32> = only.iter().copied().filter(|k| *k < slots).collect();
+    let Some(&top) = only.iter().max() else {
+        let h = keep(acc, run, kind::TABLE, fp::encode_slots(&[]));
+        acc.refs.push(reference(owner, kind::TABLE, root, handle, 0, Ok(h)));
+        return;
+    };
+    let raw_len = u64::from(top + 1) * tap::SLOT;
+    let raw = match read(handle, raw_len) {
+        Ok(r) => r,
+        Err(why) => {
+            acc.refs.push(reference(owner, kind::TABLE, root, handle, raw_len, Err(why)));
+            return;
+        }
+    };
+    let words: Vec<u8> = only.iter().flat_map(|k| k.to_le_bytes()).collect();
+    let seen = xnw_core::hash128(&[&raw, &words]) ^ u128::from(mode);
+    if let Some(refs) = acc.tables.get(&seen) {
+        let slot = |r: &Ref| if r.kind == kind::TABLE { root } else { fp::table_slot(u32::from(root), fp::table_slot_of(r.slot).1) };
+        let again: Vec<Ref> = refs.iter().filter(|r| r.owner != fp::FRAME_SCOPE).map(|r| Ref { owner, slot: slot(r), ..*r }).collect();
+        acc.refs.extend(again);
+        return;
+    }
+    let views: Vec<SlotView> = only.iter().map(|&k| slot_view(k, &tap::view(handle + tap::SLOT * u64::from(k)))).filter(|v| v.kind != view::NONE).collect();
+    let h = keep(acc, run, kind::TABLE, fp::encode_slots(&views));
+    let first = acc.refs.len();
+    acc.refs.push(reference(owner, kind::TABLE, root, handle, (views.len() * fp::SLOT_BYTES) as u64, Ok(h)));
     for v in &views {
         view_bytes(acc, run, owner, root, v, view_heap, mode);
     }
@@ -1789,15 +2189,26 @@ fn table(acc: &mut Acc, run: &mut Run, owner: u32, root: u16, handle: u64, slots
 /// null GPU nothing does) and no view over the buffer cap, and has neither
 /// bindless table nor per-draw record.
 fn view_bytes(acc: &mut Acc, run: &mut Run, owner: u32, root: u16, v: &SlotView, view_heap: usize, mode: u8) {
-    let compute = mode != TB_DRAW;
+    let compute = !matches!(mode, TB_DRAW | TB_UI | TB_HAIR_DRAW);
     let slot = fp::table_slot(u32::from(root), v.slot);
     let plain_uav = v.kind == view::BUFFER && v.layout == view::UNORDERED;
+    // FACE1: a live head sink's large buffers (the network's 25 MB arena, its
+    // outputs, the weights) are left in place too, read or not: the arena and
+    // outputs hold nothing the CPU wrote (pk8a: 0 non-zero), and the list
+    // thread keeps the large ones on the device from frame to frame.
+    let head_place = mode == TB_HEAD && head_live() && matches!(v.kind, view::BUFFER | view::PLACED_BUFFER) && v.bytes >= IN_PLACE_MIN;
+    if head_place || matches!(mode, TB_HAIR_DISPATCH | TB_HAIR_DRAW) && matches!(v.kind, view::BUFFER | view::PLACED_BUFFER) && v.bytes >= IN_PLACE_MIN && !(compute && plain_uav) {
+        LIVE_IN_PLACE[0].fetch_add(1, Ordering::Relaxed);
+        LIVE_IN_PLACE[1].fetch_add(v.bytes, Ordering::Relaxed);
+        acc.refs.push(reference(owner, kind::BUFFER, slot, v.addr, v.bytes.min(u64::from(u32::MAX)), Err(reason::IN_PLACE)));
+        return;
+    }
     match v.kind {
         view::CONSTANT => {
             let len = v.bytes.min(CBV_CAP);
             let bytes = read(v.addr, len);
             if v.slot == BINDLESS_SLOT
-                && !compute
+                && mode == TB_DRAW
                 && let Ok(b) = &bytes
             {
                 bindless(acc, run, b, view_heap);
@@ -1925,15 +2336,19 @@ fn texture(acc: &mut Acc, run: &mut Run, v: &SlotView) {
     }
     let desc = keep(acc, run, kind::HEAP_SLOT, fp::encode_slots(&[SlotView { slot: 0, ..*v }]));
     let mut t = fp::Texture { desc, at: v.addr, len: v.bytes, ..fp::Texture::default() };
+    // REFFIX: the origin first, from the registry's own map (no read of the
+    // title's pages): a texture whose sampled windows fault (reason 2; pk8a
+    // f1030: 81 of the 256 slots of 07b19da9's rows, in the pair's GPU view)
+    // keeps it, and the replay reads its texels from the game files.
+    t.origin = xnw_formats::origin::origin_of(v.addr, 0x1000).map(|o| {
+        let name = xnw_formats::origin::file(o.file).and_then(|f| f.path.file_name().map(|n| n.to_string_lossy().into_owned()));
+        format!("{}#{}", name.unwrap_or_else(|| format!("file{}", o.file)), o.texture)
+    });
     let sampled: Result<Vec<u8>, u32> = Fill::windows(v.bytes as usize).iter().map(|&(o, n)| read(v.addr + o as u64, n as u64)).collect::<Result<Vec<_>, _>>().map(|p| p.concat());
     match sampled {
         Err(why) => t.reason = why,
         Ok(s) => {
             t.fill = Fill::of(&s);
-            t.origin = xnw_formats::origin::origin_of(v.addr, 0x1000).map(|o| {
-                let name = xnw_formats::origin::file(o.file).and_then(|f| f.path.file_name().map(|n| n.to_string_lossy().into_owned()));
-                format!("{}#{}", name.unwrap_or_else(|| format!("file{}", o.file)), o.texture)
-            });
             // Zero in the sampled windows: a small texture is read whole
             // before it is called zero-filled (a 64x320 hair width profile).
             let whole = if t.fill.empty() && v.bytes <= ZERO_CHECK { read(v.addr, v.bytes).ok().filter(|b| b.iter().any(|x| *x != 0)) } else { None };
@@ -1944,12 +2359,28 @@ fn texture(acc: &mut Acc, run: &mut Run, v: &SlotView) {
                 (t.texels, t.texel_bytes) = (keep(acc, run, u16::MAX, b), v.bytes);
             } else if t.origin.is_none() {
                 let k = (v.addr, v.bytes, t.fill.hash);
-                if let Some(h) = run.texels.get(&k).copied().filter(|h| held(acc, run, *h)) {
+                if live()
+                    && let Some((h, b)) = run.live_texels.get(&k)
+                {
+                    acc.shared.insert(*h, b.clone());
+                    (t.texels, t.texel_bytes) = (*h, v.bytes);
+                } else if let Some(h) = run.texels.get(&k).copied().filter(|h| held(acc, run, *h)) {
                     (t.texels, t.texel_bytes) = (h, v.bytes);
                 } else if v.bytes > TEX_CAP || acc.texel_bytes + v.bytes > FRAME_TEX_CAP {
                     t.reason = reason::BUDGET;
                 } else {
                     match read(v.addr, v.bytes) {
+                        Ok(b) if live() => {
+                            acc.texel_bytes += v.bytes;
+                            let h = xnw_core::hash128(&[&b]);
+                            let b = std::sync::Arc::new(b);
+                            if run.live_texel_bytes + v.bytes <= LIVE_TEXEL_CAP {
+                                run.live_texel_bytes += v.bytes;
+                                run.live_texels.insert(k, (h, b.clone()));
+                            }
+                            acc.shared.insert(h, b);
+                            (t.texels, t.texel_bytes) = (h, v.bytes);
+                        }
                         Ok(b) => {
                             acc.texel_bytes += v.bytes;
                             let h = keep(acc, run, u16::MAX, b);
@@ -2091,6 +2522,7 @@ pub(super) fn write(dir: &Path, frame: u64, seqs: &[u32], taken: Option<Taken>) 
         dispatches: [dispatches as u32, acc.dispatches_seen],
         bytes,
         reasons,
+        pair: xnw_core::pair::live().map(|p| [p.cpu, p.gpu, p.len]),
     };
     // Hook-side records: sequence number -> v1 draw (dropped when not captured).
     let refs: Vec<Ref> = acc
@@ -2385,7 +2817,7 @@ pub(super) mod tests {
         let loose = vec![0x77u8; ROOT_WINDOW as usize];
         let seq = hook_entry(frame);
         hook_views(frame, &[], &[(cpu, vb.len() as u64), (0, 64)]);
-        let roots = [TapRoot::None, TapRoot::None, TapRoot::View(cpu + 16 + GPU_ALIAS), TapRoot::View(loose.as_ptr() as u64)];
+        let roots = [TapRoot::None, TapRoot::None, TapRoot::View(cpu + 16 + gpu_alias()), TapRoot::View(loose.as_ptr() as u64)];
         sink_at(frame, &TapDraw { op: fp::op::INDIRECT_MESH, count: 1, pipeline: 0, yz: [0; 2], args: [0; 4], view_heap: 0, sampler_heap: 0, roots: &roots });
         {
             let mut accs = lock(&ACCS);
@@ -2584,22 +3016,22 @@ pub(super) mod tests {
         let cpu = vb.as_ptr() as u64;
         let left = |a: u64| (a == cpu).then_some(64);
         let none = |_: u64| None;
-        assert_eq!(root_view_at(cpu + GPU_ALIAS, left, none), (cpu, 64, true, ROOT_BUFFER));
+        assert_eq!(root_view_at(cpu + gpu_alias(), left, none), (cpu, 64, true, ROOT_BUFFER));
         assert_eq!(root_view_at(cpu, left, none), (cpu, 64, false, ROOT_BUFFER));
         assert_eq!(root_view_at(0x1234, left, none), (0x1234, ROOT_WINDOW, false, ROOT_WINDOWED));
         assert_eq!(root_view_at(0, left, none), (0, 0, false, ROOT_NONE));
         // The title's vertex streams are in no buffer object; the
-        // hook draw's stream is read at the GPU address - GPU_ALIAS, from
+        // hook draw's stream is read at the GPU address - gpu_alias(), from
         // inside it to its end; a buffer object comes first.
         let mut streams = BTreeMap::new();
         streams.insert(cpu, 64u64);
         let stream = |x: u64| stream_left(&streams, x);
         let no_buffer = |_: u64| None;
-        assert_eq!(root_view_at(cpu + GPU_ALIAS, no_buffer, stream), (cpu, 64, true, ROOT_STREAM));
-        assert_eq!(root_view_at(cpu + GPU_ALIAS + 16, no_buffer, stream), (cpu + 16, 48, true, ROOT_STREAM));
+        assert_eq!(root_view_at(cpu + gpu_alias(), no_buffer, stream), (cpu, 64, true, ROOT_STREAM));
+        assert_eq!(root_view_at(cpu + gpu_alias() + 16, no_buffer, stream), (cpu + 16, 48, true, ROOT_STREAM));
         assert_eq!(root_view_at(cpu + 8, no_buffer, stream), (cpu + 8, 56, false, ROOT_STREAM));
-        assert_eq!(root_view_at(cpu + GPU_ALIAS + 64, no_buffer, stream).3, ROOT_WINDOWED);
-        assert_eq!(root_view_at(cpu + GPU_ALIAS, |x: u64| (x == cpu + GPU_ALIAS).then_some(32), stream), (cpu + GPU_ALIAS, 32, false, ROOT_BUFFER));
+        assert_eq!(root_view_at(cpu + gpu_alias() + 64, no_buffer, stream).3, ROOT_WINDOWED);
+        assert_eq!(root_view_at(cpu + gpu_alias(), |x: u64| (x == cpu + gpu_alias()).then_some(32), stream), (cpu + gpu_alias(), 32, false, ROOT_BUFFER));
         let seq = hook_entry(frame);
         {
             let mut accs = lock(&ACCS);
@@ -2612,7 +3044,7 @@ pub(super) mod tests {
                 draw_words(acc, run, owner, at, &resolve);
                 samplers(acc, run, owner, if owner == 2 { 0 } else { 0x55 }, if owner == 2 { None } else { range }, &sresolve);
             }
-            let (at, full, alias, _) = root_view_at(cpu + GPU_ALIAS, left, none);
+            let (at, full, alias, _) = root_view_at(cpu + gpu_alias(), left, none);
             let got = buffer(acc, run, at, full);
             acc.refs.push(reference(0, kind::ROOT_VIEW, 3, at, full, got));
             assert_eq!((acc.draw_words, acc.sampler_counts, acc.sampler_heaps.len(), alias), ([2, 1, 4], [2, 1], 2, true));
@@ -2713,6 +3145,29 @@ pub(super) mod tests {
         let rec = fp::Ia::decode(&acc.blobs[&acc.refs[0].hash].1).unwrap();
         assert_eq!((rec.index, rec.vertex[0]), (ia.index, ia.vertex[0]));
         assert_eq!(acc.ia_sinks, 1);
+    }
+
+    /// HAIR7: a live hair sink's table keeps small views as bytes and leaves
+    /// large ones in place (address and length, no bytes); its unordered
+    /// views stay GPU outputs; another table mode reads as before.
+    #[test]
+    fn live_hair_tables_leave_large_views_in_place() {
+        let (mut acc, mut run) = (Acc::default(), Run::default());
+        let small: Vec<u8> = (0..200u8).collect();
+        let large = vec![7u8; IN_PLACE_MIN as usize];
+        let view = |slot: u32, b: &[u8]| SlotView { slot, kind: view::BUFFER, addr: b.as_ptr() as u64, bytes: b.len() as u64, ..SlotView::default() };
+        for mode in [TB_HAIR_DISPATCH, TB_HAIR_DRAW, TB_DISPATCH] {
+            acc.refs.clear();
+            acc.buffers.clear();
+            view_bytes(&mut acc, &mut run, 0, 0, &view(1, &small), 0, mode);
+            view_bytes(&mut acc, &mut run, 0, 0, &view(2, &large), 0, mode);
+            view_bytes(&mut acc, &mut run, 0, 0, &SlotView { layout: view::UNORDERED, ..view(3, &large) }, 0, mode);
+            let got: Vec<(u16, u32, u32)> = acc.refs.iter().map(|r| (r.slot, r.reason, r.len)).collect();
+            let large_reason = if mode == TB_DISPATCH { reason::OK } else { reason::IN_PLACE };
+            let uav = if mode == TB_HAIR_DRAW { reason::IN_PLACE } else { reason::GPU_OUTPUT };
+            assert_eq!(got, [(1, reason::OK, 200), (2, large_reason, IN_PLACE_MIN as u32), (3, uav, IN_PLACE_MIN as u32)], "mode {mode}");
+            assert!(acc.refs.iter().filter(|r| r.reason == reason::IN_PLACE).all(|r| r.addr == large.as_ptr() as u64 && r.hash == 0));
+        }
     }
 
     /// Strand hair: an input program's dispatch sink keeps

@@ -430,7 +430,7 @@ pub fn oracle(args: &[String]) -> Result<(), String> {
     let index = opt("--index").map(Path::new);
     let Some(pack) = Pack::open(dir)? else { return Err("preskin-oracle: no pack".into()) };
     let names = crate::audit::program_names(dir).ok_or("preskin-oracle: no shader-names.tsv above the frame")?;
-    let host = xnw_gpu::host::Host::new(None).map_err(|e| format!("preskin-oracle: device: {e}"))?;
+    let host = xnw_gpu::host::Host::new(crate::replay::hw_agility().as_deref()).map_err(|e| format!("preskin-oracle: device: {e}"))?;
     let mut programs: HashMap<u128, Result<(_, u32), String>> = HashMap::new();
     // Per variant: dispatches, vertices, vertices past EPS, largest difference, frame words differing, previous positions past EPS.
     let mut per: std::collections::BTreeMap<u32, (u32, u64, u64, f32, u64, u64)> = Default::default();

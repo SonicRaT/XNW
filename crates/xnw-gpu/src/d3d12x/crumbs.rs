@@ -153,10 +153,11 @@ impl ListCrumbs {
     }
 
     /// An indirect execution's argument bytes (`len` at title address
-    /// `at`), shown at report time.
-    pub(crate) fn note_args(&self, what: String, at: u64, len: usize) {
+    /// `at`), shown at report time. The text is made only with crumbs on
+    /// (PERF4: a `format!` on every ExecuteIndirect with crumbs off).
+    pub(crate) fn note_args(&self, what: impl FnOnce() -> String, at: u64, len: usize) {
         if on() {
-            self.ring.lock().unwrap_or_else(|e| e.into_inner()).push(Record { op: 0, text: what, args: Some((at, len)) });
+            self.ring.lock().unwrap_or_else(|e| e.into_inner()).push(Record { op: 0, text: what(), args: Some((at, len)) });
         }
     }
 

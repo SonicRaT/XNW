@@ -311,6 +311,29 @@ const PATCHES: &[Patch] = &[
         expect: &[0xE8, 0x10, 0x0D, 0xFE, 0x02],
         new: &[0x0F, 0x1F, 0x44, 0x00, 0x00],
     },
+    // `nolighting` (ENG8): stage 1, the lighting compute chain (callback
+    // `title+0x15b4aa0` -> body `title+0x15b4ab0`, 9,171 bytes: 190 callees,
+    // the indirect diffuse, reflection, irradiance cache and deferred light
+    // dispatches, both ray-tracing builds and one `drawlist_exec`; 4.4-5.0 ms
+    // of CPU a frame in a test run, and no hooked draw: ENG1). Its registrar
+    // `title+0x200e020` is one call, `drawlist_queue_stage(phase, 1,
+    // title+0x15b4aa0, 0, 0)`, which becomes a 5-byte nop: the stage is never
+    // queued, as `novfx` does for stage 13. Read outside its closure (ENG6):
+    // the light level at a point dword_14763B90C (a readback, empty under
+    // null), a history flag byte_14876F940, context and job state. Our
+    // screen pass lights from the timecycle (`ourlight`) and reads none of
+    // it; a capture for the bridged lighting programs (LIT) needs the
+    // stage and must not name this patch. Untested in a run: the run with
+    // `stskip` (`XNW_STAGE_SKIP=1`, the same thing through the stage meter)
+    // is the functional test.
+    Patch {
+        name: "nolighting",
+        what: "stage 1 (the lighting compute chain) is never queued",
+        rva: 0x200e038,
+        // call title+0x4ff02e0 (drawlist_queue_stage(phase, 1, title+0x15b4aa0, 0, 0))
+        expect: &[0xE8, 0xA3, 0x22, 0xFE, 0x02],
+        new: &[0x0F, 0x1F, 0x44, 0x00, 0x00],
+    },
     // `noprobecap` (ENG6): the probe cube capture, the second callback of
     // stage 36 (`title+0x4413b0` -> `title+0x15298e0`, 10,495 bytes; the
     // other one, the sky LUT callback `title+0xd3ac60`, is untouched). The
@@ -654,7 +677,8 @@ pub unsafe fn apply(base: usize) {
         return;
     }
     for name in &wanted {
-        if !PATCHES.iter().any(|p| p.name == name) {
+        // `noencode` and `noencodebatch` are made of hooks, not bytes (`encode.rs`, installed after the detours).
+        if !PATCHES.iter().any(|p| p.name == name) && !crate::encode::NAMES.contains(&name.as_str()) {
             xnw_core::warn!("XNW_PATCH: no patch named {name}");
         }
     }
@@ -703,7 +727,7 @@ pub unsafe fn apply(base: usize) {
 /// mid-run is what the B half of the run shows.
 pub(crate) const LIVE: &[&str] = &[
     "nolocalshadows", "noprepass", "noshadows", "noshadowscan", "nojitter", "features_nort", "noirradiance", "nopuddles", "volskip",
-    "volhist", "nobloom", "noflare", "directmesh", "exposure", "place_budget",
+    "volhist", "nobloom", "noflare", "directmesh", "exposure", "place_budget", "nolighting",
 ];
 
 /// The aligned word at `rva & !7` holding every byte `p` changes, if one does.
@@ -886,6 +910,29 @@ mod tests {
         // After the removed call the third call's arguments are set from rsi/rdi and constants only.
         assert_eq!(exe.at(0x200f5d0, 5), [0x40, 0x88, 0x7C, 0x24, 0x20], "mov [rsp+20h], dil");
         assert_eq!(exe.at(0x200f5dc, 3), [0x48, 0x89, 0xF1], "mov rcx, rsi");
+    }
+
+    /// `nolighting` removes the one call of the stage-1 registrar: the whole
+    /// function is `sub rsp, 28h; lea r8, callback; mov edx, 1; xor r9d, r9d;
+    /// mov byte [rsp+20h], 0; call drawlist_queue_stage; nop; add rsp, 28h;
+    /// ret`, and the callback is the thunk of the body ENG6 analysed.
+    #[test]
+    fn nolighting_removes_the_queueing_of_stage_1_only() {
+        let p = PATCHES.iter().find(|p| p.name == "nolighting").unwrap();
+        assert_eq!((p.rva, p.new), (0x200e038, &[0x0F, 0x1F, 0x44, 0x00, 0x00][..]), "one 5-byte nop");
+        assert_eq!(PATCHES.iter().filter(|p| p.name == "nolighting").count(), 1);
+        let Some(exe) = Exe::open() else {
+            eprintln!("no title executable here (XNW_TITLE_EXE): nolighting was not checked against it");
+            return;
+        };
+        assert_eq!(exe.at(0x200e020, 4), [0x48, 0x83, 0xEC, 0x28]);
+        let lea = exe.at(0x200e024, 7);
+        assert_eq!(lea[..3], [0x4C, 0x8D, 0x05]);
+        assert_eq!(0x200e02busize.wrapping_add(i32::from_le_bytes(lea[3..7].try_into().unwrap()) as isize as usize), 0x15b4aa0);
+        assert_eq!(exe.at(0x200e02b, 13), [0xBA, 1, 0, 0, 0, 0x45, 0x31, 0xC9, 0xC6, 0x44, 0x24, 0x20, 0x00], "mov edx, 1; xor r9d, r9d; mov byte [rsp+20h], 0");
+        assert_eq!((exe.at(0x200e038, 1)[0], exe.rel32_target(0x200e038)), (0xE8, 0x4ff02e0));
+        assert_eq!(exe.at(0x200e03d, 6), [0x90, 0x48, 0x83, 0xC4, 0x28, 0xC3], "nop; add rsp, 28h; ret");
+        assert_eq!((exe.at(0x15b4aa0, 1)[0], exe.rel32_target(0x15b4aa0)), (0xE9, 0x15b4ab0));
     }
 
     /// `notrail`: the phase vtable's slots are the ones read (view setup,

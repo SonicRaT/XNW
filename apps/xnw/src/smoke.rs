@@ -292,8 +292,8 @@ impl Profile {
             } else if let Some(name) = line.trim().strip_prefix("include ") {
                 // The grammar of tools/run_profile.sh: the named profile first.
                 let runs = self.runs.clone().ok_or_else(|| bad("include outside tools/runs".into()))?;
-                if self.depth >= 8 {
-                    return Err(bad("include depth over 8".into()).into());
+                if self.depth >= 12 {
+                    return Err(bad("include depth over 12".into()).into());
                 }
                 let file = runs.join(format!("{}.env", name.trim()));
                 let text = std::fs::read_to_string(&file).map_err(|e| bad(format!("{}: {e}", file.display())))?;
@@ -303,6 +303,9 @@ impl Profile {
                 r?;
             } else if let Some(k) = line.trim().strip_prefix("unset ") {
                 self.env.retain(|(key, _)| key != k.trim());
+            } else if let Some(n) = line.trim().strip_prefix("stop_after_world_frames ") {
+                // As tools/run_profile.sh: the title ends itself after n world frames.
+                self.env.push(("XNW_STOP_WORLD_FRAMES".to_owned(), n.trim().to_owned()));
             } else if ["secs ", "boot ", "expect ", "expectfile ", "forbid ", "forbid_after "].iter().any(|d| line.trim_start().starts_with(d)) {
                 // Checks of tools/run_profile.sh; this checker has `#expect`.
                 continue;

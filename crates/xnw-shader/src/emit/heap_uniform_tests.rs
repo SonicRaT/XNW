@@ -45,6 +45,11 @@ const S_ENDPGM: u32 = 0xBF81_0000;
 
 /// The program lowered as with [`super::Options::masked_lanes`] `masked`.
 fn build(masked: bool) -> HostShader {
+    build_with(masked, false)
+}
+
+/// [`build`], with [`super::Options::confine`] `confine` (BND1, `confine_tests`).
+pub(super) fn build_with(masked: bool, confine: bool) -> HostShader {
     let mut words = WORDS.to_vec();
     words.push(S_ENDPGM);
     let param = |root, user_data, slot| RootParam { root, table_offset_dwords: 0, sgprs: 1, base_register: 0, user_data, slot };
@@ -63,6 +68,7 @@ fn build(masked: bool) -> HostShader {
     let io = io::raise(&p, &native).expect("io::raise");
     let st = structure::structure(&p).expect("structure");
     super::HEAP_UNIFORMITY.with(|f| f.set((false, masked)));
+    super::CONFINE.with(|f| f.set(confine));
     let lowered = lower::lower(&lower::Parts {
         native: &native,
         p: &p,
@@ -82,6 +88,7 @@ fn build(masked: bool) -> HostShader {
         barycentrics: false,
     });
     super::HEAP_UNIFORMITY.with(|f| f.set((false, false)));
+    super::CONFINE.with(|f| f.set(false));
     let lowered = lowered.expect("lower");
     let (marked, varying, handles) = super::last_nonuniform();
     println!("masked rule {masked}: {marked} of {handles} heap handles non-uniform ({varying} varying)");

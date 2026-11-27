@@ -535,6 +535,22 @@ impl Module {
         self.blocks[block].term = Some(t);
     }
 
+    /// XNW (KILL1, [`super::Options::one_return`]): every `ret` through
+    /// one block, the shape DXC gives a function. Returns the blocks that
+    /// returned (0 or 1: nothing done).
+    pub(crate) fn join_returns(&mut self) -> usize {
+        let rets: Vec<usize> = (0..self.blocks.len()).filter(|&b| matches!(self.blocks[b].term, Some(Term::Ret))).collect();
+        if rets.len() < 2 {
+            return rets.len();
+        }
+        let exit = self.new_block();
+        self.terminate(exit, Term::Ret);
+        for &b in &rets {
+            self.terminate(b, Term::Br(exit));
+        }
+        rets.len()
+    }
+
     pub fn md_str(&mut self, s: &str) -> Md {
         self.mds.push(MdDef::Str(s.into()));
         Md(self.mds.len() as u32 - 1)
@@ -1241,6 +1257,27 @@ mod tests {
         assert!(live[ids(read)] && live[ids(sum)]);
         assert!(!live[ids(unread)] && !live[ids(cyc_a)] && !live[ids(cyc_b)]);
         assert_eq!(live, live_by_passes(&m));
+    }
+
+    /// KILL1: two returning blocks leave through one; a module with one return is left alone.
+    #[test]
+    fn returns_join_in_one_block() {
+        let mut m = Module::default();
+        let i1t = m.int(1);
+        let void = m.void();
+        let fty = m.func_ty(void, vec![]);
+        m.function("main", fty, None, true);
+        let (entry, killed, live) = (m.new_block(), m.new_block(), m.new_block());
+        let c = m.undef(i1t);
+        m.terminate(entry, Term::CondBr(c, killed, live));
+        m.terminate(killed, Term::Ret);
+        m.terminate(live, Term::Ret);
+        assert_eq!(m.join_returns(), 2);
+        let rets: Vec<usize> = (0..m.blocks.len()).filter(|&b| matches!(m.blocks[b].term, Some(Term::Ret))).collect();
+        assert_eq!(rets, [3], "one returning block, the new one");
+        assert!(matches!(m.blocks[killed].term, Some(Term::Br(3))) && matches!(m.blocks[live].term, Some(Term::Br(3))));
+        assert_eq!(m.join_returns(), 1, "nothing to join");
+        assert_eq!(m.blocks.len(), 4);
     }
 
     #[test]

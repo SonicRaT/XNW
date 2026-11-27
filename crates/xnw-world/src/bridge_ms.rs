@@ -393,7 +393,22 @@ pub const BRIDGE_MS_DEFAULT: &[u32] = &[
 /// `XNW_WORLD_RENDER=...,bridgems=on|off|<hash>+<hash>...` (default off; the
 /// last one wins): the mesh programs (first 32 bits of the container hash,
 /// hex) whose rows our pass draws through the title's mesh program.
+/// `cables=title` (default off, the last one wins) adds the cable
+/// program [`CABLE_MS`]: our own vertex path draws a cable's zero-width
+/// strip (nothing), the title's program widens it into a ribbon.
 pub fn parse_switch(v: &str) -> Vec<u32> {
+    let cables = v.split(',').filter_map(|p| p.trim().strip_prefix("cables=")).next_back() == Some("title");
+    let mut out = parse_list(v);
+    if cables && !out.contains(&CABLE_MS) {
+        out.push(CABLE_MS);
+    }
+    out
+}
+
+/// MSNC_VS_Cable (effect `cable`, G-buffer stage 67).
+pub const CABLE_MS: u32 = 0x5f03_02c7;
+
+fn parse_list(v: &str) -> Vec<u32> {
     let mut out = Vec::new();
     for p in v.split(',').filter_map(|p| p.trim().strip_prefix("bridgems=")) {
         out = match p {
@@ -416,6 +431,9 @@ mod tests {
         assert_eq!(parse_switch("bridgems=5f0302c7+b31c5ed5,bridgems=off"), Vec::<u32>::new());
         assert_eq!(parse_switch("bridgems=5f0302c7+0xb31c5ed5"), vec![0x5f03_02c7, 0xb31c_5ed5]);
         assert!(parse_switch("bridgeps=on").is_empty());
+        assert_eq!(parse_switch("screen,cables=title"), vec![CABLE_MS]);
+        assert_eq!(parse_switch("cables=title,bridgems=b31c5ed5,cables=off"), vec![0xb31c_5ed5]);
+        assert_eq!(parse_switch("bridgems=5f0302c7,cables=title"), vec![CABLE_MS]);
         let e = |name: &str, index, kind, row, col| Element { name: name.into(), index, kind, comp: 9, row, col, cols: 4 };
         let lay = Layout { max_vertices: 64, max_prims: 126, rows: 4, elements: vec![e("SV_Position", 0, 3, 0, 0), e("TEXCOORD", 0, 0, 2, 2), e("NORMAL", 0, 0, 3, 0), e("TEXCOORD", 1, 0, 1, 0)] };
         let j = Join::of(&lay).unwrap();

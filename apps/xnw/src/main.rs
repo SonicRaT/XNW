@@ -11,23 +11,28 @@
 //!   xnw translate <rpf> [--stage ..] [--validate] [--pipelines N] [--fma exact|fast]  pack to DXIL
 //!   xnw prebuild [--jobs N] [--shaders-only]  listed shaders and pipelines into the cache
 //!   xnw shader-warm [--drawn|--all]          the shaders only, for the drawn list (default) or all listed
+//!   xnw card-sweep [--drawn|--all|--list F|--from-log LOG] [--jobs N] [--timeout S]  host pipelines created one by one in child processes
 //!   xnw movie-info <movies.rpf> [--list] [--entry I --frame N --out f.bmp]  Bink movies, CPU decode
 //!   xnw texture-info <ttpf|dir|rpf> [--census] [--list N] [--dump N] [--sample K]  texture page files
 //!   xnw texture-pack <ttpf|dir|rpf> [--out DIR] [--drop-mips N] [--only-trace LOG] [--threads K]  host texture packs
 
 mod ab;
 mod bcpack;
+mod cardsweep;
 mod gpucheck;
 mod movie;
 mod packinfo;
 mod detours;
+mod encode;
 mod fencewait;
 mod dirtyfilter;
 mod patches;
 mod prebuild;
+mod reduce;
 mod run;
 mod dwatch;
 mod levers;
+mod live;
 mod watch;
 mod worldahead;
 mod worldprobe;
@@ -58,11 +63,13 @@ const USAGE: &str = "usage: xnw inspect <exe|dll> [--imports]
        xnw shader-match <rpf> <census dir>
        xnw pack-info <frame dir> [--pack <rpf>]
        xnw burst <capture dir> --adapter hw|warp [--from N] [--frames K] [--switches a,b=c] [--png DIR] [--png-at N,..]
+       xnw shader-reduce <pixel hash> --frame <capture dir> [--at N] [--row R] [--also h+h] [--steps bind,out,code] [--only a/b+c] [--stop] [--secs S] [--out DIR]
        xnw texture-info <ttpf|dir|rpf> [--census] [--list N] [--dump N] [--only HASH] [--sample K] [--out DIR]
        xnw texture-info --trace <dstorage log>
        xnw texture-pack <ttpf|dir|rpf> [--out DIR] [--drop-mips N] [--only-trace LOG] [--threads K] [--plan] [--verify N] [--dds N]
        xnw translate <rpf> [--stage vs|ps|cs|ms|gs] [--validate] [--pipelines N] [--fma exact|fast] [--jobs N] [--dump DIR]
        xnw shader-warm [--drawn|--all] [--jobs N] [--pack <shaders.rpf>]
+       xnw card-sweep [--drawn] [--all] [--list F] [--from-log LOG].. [--bridged] [--out DIR] [--jobs N] [--timeout S] [--abort-after N] [--shard i/n] [--limit N] [--crash-test P] [--hang-test P]
        xnw prebuild [--jobs N] [--shaders-only] [--pack <shaders.rpf>] [--list-slow] [--only P,..] [--skip P,..|@file] [--from N] [--to M] [--timeout S] [--retry-suspects]";
 
 fn main() -> ExitCode {
@@ -85,6 +92,7 @@ fn main() -> ExitCode {
         Some("translate") => translate::run(&args[1..]),
         Some("prebuild") => prebuild::run(&args[1..]),
         Some("shader-warm") => prebuild::warm(&args[1..]),
+        Some("card-sweep") => cardsweep::run(&args[1..]),
         Some("shader-match") => shadermatch::run(&args[1..]),
         Some("pack-info") => packinfo::run(&args[1..]),
         Some("movie-info") => movie::run(&args[1..]),
@@ -94,6 +102,7 @@ fn main() -> ExitCode {
         Some("world-probe-decode") => xnw_frame::decode_cli(&args[1..]).map_err(Into::into),
         Some("world-render") => xnw_frame::render_cli(&args[1..]).map_err(Into::into),
         Some("burst") => worldprobe::burst::run(&args[1..]).map_err(Into::into),
+        Some("shader-reduce") => reduce::run(&args[1..]),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);

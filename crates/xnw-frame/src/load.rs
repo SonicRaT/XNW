@@ -515,7 +515,7 @@ pub fn load_list_with(fdir: &std::path::Path, have: &dyn Fn(&GeomKey) -> bool) -
                 v.insert((vb, idx.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect()));
             }
         }
-        list.draws.push(DrawRecord { geom, world, viewport: hex(f[6]), stage: f[7].parse().unwrap_or(0), palette: f[8].parse().unwrap_or(u32::MAX), inst_first: f[9].parse().unwrap_or(0), inst_count: f[10].parse().unwrap_or(0), bone_first: f.get(13).and_then(|v| v.parse().ok()).unwrap_or(0), bone_count: f.get(14).and_then(|v| v.parse().ok()).unwrap_or(0), effect: hex(f[11]), albedo: Albedo::Flat(xnw_world::flat_colour(hex(f[11]))), material: xnw_world::Material { albedo_desc: f.get(15).map_or(0, |v| hex(v)), alpha_clip: f.get(16) == Some(&"1"), layers: std::array::from_fn(|k| f.get(19 + k).map_or(0, |v| hex(v))), stipple: f.get(23).map_or(0, |v| hex(v) as u8), state_index: f.get(24).map(|v| { let s: Vec<u16> = v.split('/').map(|x| x.parse().unwrap_or(0xFFFF)).collect(); [s.first().copied().unwrap_or(0xFFFF), s.get(1).copied().unwrap_or(0xFFFF), s.get(2).copied().unwrap_or(0xFFFF)] }).unwrap_or([0xFFFF; 3]), ..Default::default() }, state: f.get(25).and_then(|v| rstate_parse(v)), remap: f.get(17).and_then(|v| v.parse().ok()).unwrap_or(xnw_world::NO_REMAP), ped: f.get(18) == Some(&"1") });
+        list.draws.push(DrawRecord { geom, world, viewport: hex(f[6]), stage: f[7].parse().unwrap_or(0), palette: f[8].parse().unwrap_or(u32::MAX), inst_first: f[9].parse().unwrap_or(0), inst_count: f[10].parse().unwrap_or(0), bone_first: f.get(13).and_then(|v| v.parse().ok()).unwrap_or(0), bone_count: f.get(14).and_then(|v| v.parse().ok()).unwrap_or(0), effect: hex(f[11]), albedo: Albedo::Flat(xnw_world::flat_colour(hex(f[11]))), material: xnw_world::Material { albedo_desc: f.get(15).map_or(0, |v| hex(v)), alpha_clip: f.get(16) == Some(&"1"), layers: std::array::from_fn(|k| f.get(19 + k).map_or(0, |v| hex(v))), stipple: f.get(23).map_or(0, |v| hex(v) as u8), state_index: f.get(24).map(|v| { let s: Vec<u16> = v.split('/').map(|x| x.parse().unwrap_or(0xFFFF)).collect(); [s.first().copied().unwrap_or(0xFFFF), s.get(1).copied().unwrap_or(0xFFFF), s.get(2).copied().unwrap_or(0xFFFF)] }).unwrap_or([0xFFFF; 3]), tint_palette: f.get(26).map_or(0, |v| hex(v)), tint_rows: f.get(27).map_or([0xFF; 3], |v| { let r = hex(v); [r as u8, (r >> 8) as u8, (r >> 16) as u8] }), tint_inv: f.get(28).and_then(|v| v.parse().ok()).unwrap_or(0.0), paint: f.get(29).and_then(|v| v.split('|').map(|x| x.parse().ok()).collect::<Option<Vec<f32>>>()).and_then(|v| v.try_into().ok()).unwrap_or([0.0; 6]), paint_on: f.get(29).is_some_and(|v| *v != "-" && v.split('|').count() == 6), ..Default::default() }, state: f.get(25).and_then(|v| rstate_parse(v)), remap: f.get(17).and_then(|v| v.parse().ok()).unwrap_or(xnw_world::NO_REMAP), ped: f.get(18) == Some(&"1") });
     }
     let cams = std::fs::read_to_string(fdir.join("camera.txt")).map_err(|e| e.to_string())?;
     let (mut vp, mut view) = (0u64, None);
@@ -542,6 +542,23 @@ pub fn load_list_with(fdir: &std::path::Path, have: &dyn Fn(&GeomKey) -> bool) -
         list.sun = sun_of(&b);
         list.sky = sky_of(&b);
         list.light = Some(light_of(&b, list.sky.as_ref(), false));
+    }
+    // `lights=on` (LIGHT2): the title's scene lights from the frame's pack.
+    if xnw_world::lamps::asked()
+        && let Ok(Some(p)) = crate::pack::Pack::open(fdir)
+    {
+        list.lamps = p.scene_lights().map(std::sync::Arc::new);
+    }
+    // `post=on` (POST1's instrument): the title's post constants at its composite draws, the first 3 frames loaded.
+    static POST_LINES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if xnw_world::post::asked() != xnw_world::post::OFF
+        && POST_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3
+        && let Ok(Some(p)) = crate::pack::Pack::open(fdir)
+    {
+        let tc: Vec<f32> = std::fs::read(fdir.join("timecycle.bin")).unwrap_or_default().chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+        for l in p.post_probe(&tc) {
+            xnw_core::info!("frame {}: {l}", fdir.file_name().and_then(|n| n.to_str()).unwrap_or("?"));
+        }
     }
     // The sequence's water map (water\<id>.txt/.bin), the first one.
     if let Some(wdir) = fdir.parent().map(|p| p.join("water"))

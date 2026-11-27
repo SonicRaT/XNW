@@ -663,6 +663,11 @@ static DELETE: u8 = 0;
 static READ: u8 = 0;
 static SUBMIT: u8 = 0;
 
+/// The host folder of the game saves (`<scid>\<user>\<container>\v<N>\`).
+pub fn saves_folder() -> PathBuf {
+    storage::folder().with_file_name("saves")
+}
+
 extern "system" fn initialize_async(
     _: This,
     _user: *const c_void,
@@ -670,7 +675,7 @@ extern "system" fn initialize_async(
     _sync_on_demand: bool,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let saves = storage::folder().with_file_name("saves");
+    let saves = saves_folder();
     let config = text(config);
     static LOGGED: std::sync::Once = std::sync::Once::new();
     LOGGED.call_once(|| xnw_core::info!("game saves: {} (configuration {config:?})", saves.display()));

@@ -322,6 +322,11 @@ pub(super) fn stats() -> (Parts, usize) {
     (p, READER.get().and_then(|r| r.in_flight.lock().ok().map(|f| f.len())).unwrap_or(0))
 }
 
+/// Geometries sent to the reader and not taken yet (0: no reader).
+pub(super) fn in_flight() -> usize {
+    READER.get().and_then(|r| r.in_flight.lock().ok().map(|f| f.len())).unwrap_or(0)
+}
+
 static READER: OnceLock<Reader> = OnceLock::new();
 
 /// The process's reader thread (started at the first use).
@@ -330,6 +335,7 @@ fn reader() -> &'static Reader {
         let (jobs, rx) = mpsc::channel::<Job>();
         let (tx, done) = mpsc::channel::<Done>();
         let spawned = std::thread::Builder::new().name("xnw-geom-reader".into()).spawn(move || {
+            xnw_core::win::helper_thread();
             while let Ok(job) = rx.recv() {
                 let mut p = Parts::default();
                 let mut not_ready = 0u32;

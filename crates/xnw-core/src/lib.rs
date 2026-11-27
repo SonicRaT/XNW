@@ -1,7 +1,10 @@
 //! Shared plumbing: the log, the per-run output folder, the `perf`
 //! counters and the Win32 declarations the other crates use.
 
+pub mod framewall;
 pub mod imprec;
+pub mod live;
+pub mod pair;
 pub mod perf;
 pub mod plaincopy;
 pub mod syscalls;

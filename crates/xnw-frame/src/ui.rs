@@ -73,10 +73,31 @@ pub fn row_line(r: &UiSink) -> String {
     format!("sink {} {} {} x{} {}/{}; {}; layout {layout}; blend {blend}; ia {}", r.sink, fp::op::name(r.op), r.count, r.args[0], r.names[0], r.names[1], stage, r.ia.map_or("none (capture before v2.12)".into(), |ia| format!("index {:#x}+{} f{}, vertex {:#x}+{} stride {}", ia.index.0, ia.index.1, ia.index.2, ia.vertex[0].0, ia.vertex[0].1, ia.vertex[0].2)))
 }
 
+/// The layer's first 32 bits of `hash128` (the replay's and the live line's, LIVE1).
+pub fn layer_hash(rgba: &[u8]) -> u32 {
+    (xnw_core::hash128(&[rgba]) >> 96) as u32
+}
+
 /// Whether a row's TLS stage draws the UI plane: stage 30 (HUD, menus,
-/// Scaleform; sub-pass 178), or no stage read (u32::MAX).
+/// Scaleform; sub-pass 178), no stage read (u32::MAX), or stage 0:
+/// the title's threads that record the front end and the credits in a live
+/// run leave the TLS stage at 0 (every UI row 'TLS stage 0', 0
+/// layers drawn in 58-60 of 60 frames with rows; pk10ui2's capture read 30).
+/// Stages 6, 8 and 16 draw into textures.
 pub fn on_plane(stage: u32) -> bool {
-    stage == 30 || stage == u32::MAX
+    matches!(stage, 30 | 0 | u32::MAX)
+}
+
+/// A Bink row (`PS_Bink*`) draws a movie frame into the movie texture, never
+/// the UI plane, whatever its TLS stage reads (UI1: one drawn on the plane
+/// as a strip-as-list made a dark green half screen).
+pub fn movie_row(pixel_name: &str) -> bool {
+    pixel_name.starts_with("PS_Bink")
+}
+
+/// Whether `draw` draws row `r` on the UI plane (it then needs its pair translated).
+pub fn drawn_row(r: &UiSink) -> bool {
+    r.state.is_some() && r.ia.is_some_and(|ia| on_plane(ia.stage)) && !movie_row(&r.names[1])
 }
 
 /// Whether a row is a triangle strip: the recorded topology (D3D 5), or,
@@ -89,7 +110,9 @@ pub fn strip(topology: u32, op: u8, count: u32) -> bool {
 /// name (kept across frames by the live path).
 pub type Translated = HashMap<(u128, u128), Result<(Programs, HashMap<(u16, u32), u32>), String>>;
 
-fn translate(p: &Pack, r: &UiSink) -> Result<(Programs, HashMap<(u16, u32), u32>), String> {
+/// A row's program pair translated, with the slots it names (the live path
+/// runs it on a thread of its own for pairs it has not seen: LIVE1).
+pub fn translate(p: &Pack, r: &UiSink) -> Result<(Programs, HashMap<(u16, u32), u32>), String> {
     let (prog, mut used, _) = crate::bridge::vertex_program(p, r.sink, 0, 0, false)?;
     let psc = p.blob(r.ps).ok_or_else(|| format!("no container bytes for {:032x}", r.ps))?;
     let ps = xnw_shader::emit::translate_with(&psc, xnw_world::bridge::options()).map_err(|e| format!("pixel program {:032x}: {e}", r.ps))?;
@@ -101,19 +124,37 @@ fn translate(p: &Pack, r: &UiSink) -> Result<(Programs, HashMap<(u16, u32), u32>
 /// What one frame's UI came to.
 pub struct Drawn {
     pub layer: Option<xnw_world::ui::Layer>,
+    /// LIVE1 ([`draw_gpu`]): the layer left on the GPU, with the rows drawn.
+    pub gpu: Option<(xnw_world::ui::GpuLayer, usize)>,
     pub lines: Vec<String>,
     pub rows: usize,
 }
 
 /// Draws the frame's UI rows into one layer of `size` on `host`.
 pub fn draw(p: &Pack, host: &xnw_gpu::host::Host, size: (u32, u32), names: &HashMap<u128, String>, cache: &mut Translated) -> Result<Drawn, String> {
+    draw_as(p, host, size, names, cache, false)
+}
+
+/// LIVE1: as [`draw`], the layer left on the GPU ([`xnw_world::ui::draw_layer_gpu`]:
+/// no wait, no readback; our pass composes it after its queue waited for it).
+pub fn draw_gpu(p: &Pack, host: &xnw_gpu::host::Host, size: (u32, u32), names: &HashMap<u128, String>, cache: &mut Translated) -> Result<Drawn, String> {
+    draw_as(p, host, size, names, cache, true)
+}
+
+fn draw_as(p: &Pack, host: &xnw_gpu::host::Host, size: (u32, u32), names: &HashMap<u128, String>, cache: &mut Translated, gpu: bool) -> Result<Drawn, String> {
     let rows = rows_of(p, names);
     let mut lines = Vec::new();
     let counts = std::sync::Arc::new([const { std::sync::atomic::AtomicU64::new(0) }; 3]);
     let mut texels = p.texel_provider(counts);
+    // LIVE1: every row's pair translated first, then the cache read only:
+    // the rows borrow their programs (no copy of both programs' DXIL per row per frame).
+    for r in rows.iter().filter(|r| drawn_row(r)) {
+        cache.entry((r.vs, r.ps)).or_insert_with(|| translate(p, r));
+    }
+    let cache = &*cache;
     // Owned per row first (bytes, loads), then borrowed by the device rows.
-    struct Owned {
-        prog: Programs,
+    struct Owned<'c> {
+        prog: &'c Programs,
         loaded: crate::bridge::Loaded,
         inputs: Vec<Input>,
         vertices: Vec<(u32, Vec<u8>, u32)>,
@@ -129,15 +170,18 @@ pub fn draw(p: &Pack, host: &xnw_gpu::host::Host, size: (u32, u32), names: &Hash
             lines.push(format!("  ui sink {}: no IA bytes or pipeline state (capture before v2.12): not drawn", r.sink));
             continue;
         };
-        if !on_plane(ia.stage) {
+        if !on_plane(ia.stage) || movie_row(&r.names[1]) {
             // Stage 6 Bink frames into a movie texture, stage 8 Scaleform to a texture: not the UI plane.
             lines.push(format!("  ui sink {} {}/{}: TLS stage {}: draws into a texture, not the UI plane: not drawn", r.sink, r.names[0], r.names[1], ia.stage));
             continue;
         }
-        let t = cache.entry((r.vs, r.ps)).or_insert_with(|| translate(p, r));
-        let (prog, used) = match t {
-            Ok(x) => x.clone(),
-            Err(e) => {
+        let (prog, used) = match cache.get(&(r.vs, r.ps)) {
+            Some(Ok((prog, used))) => (prog, used),
+            None => {
+                lines.push(format!("  ui sink {} {}/{}: not translated", r.sink, r.names[0], r.names[1]));
+                continue;
+            }
+            Some(Err(e)) => {
                 lines.push(format!("  ui sink {} {}/{}: not translated: {e}", r.sink, r.names[0], r.names[1]));
                 continue;
             }
@@ -157,7 +201,7 @@ pub fn draw(p: &Pack, host: &xnw_gpu::host::Host, size: (u32, u32), names: &Hash
         };
         let vertices: Vec<(u32, Vec<u8>, u32)> = (0..fp::Ia::default().vertex.len() as u16).filter_map(|k| Some((u32::from(k), data(1 + k)?, ia.vertex[usize::from(k)].2))).collect();
         let inputs: Vec<Input> = state.inputs.iter().map(|i| Input { name: i.name.clone(), index: i.index, format: i.format, slot: i.slot, offset: i.offset, per_instance: i.per_instance, step: i.step }).collect();
-        let loaded = crate::bridge::load(p, r.sink, &crate::bridge::Row::default(), None, &used, &mut texels);
+        let loaded = crate::bridge::load(p, r.sink, &crate::bridge::Row::default(), None, used, &mut texels);
         // `XNW_UI_LACKS=1`: what the bridge's binding of each row lacks (stand-ins, nulls).
         if std::env::var("XNW_UI_LACKS").is_ok_and(|v| v == "1") && !loaded.lacks.is_empty() {
             lines.push(format!("  ui sink {} {}/{} lacks: {}", r.sink, r.names[0], r.names[1], loaded.lacks.iter().cloned().collect::<Vec<_>>().join("; ")));
@@ -169,20 +213,27 @@ pub fn draw(p: &Pack, host: &xnw_gpu::host::Host, size: (u32, u32), names: &Hash
     for (i, o) in owned.iter().enumerate() {
         let d = o.loaded.draw();
         match xnw_world::bridge::bind(&o.prog.ms, &o.prog.ps, &d) {
-            Ok(binding) => dev_rows.push(Row { programs: &o.prog, binding, blend: o.blend, cull: o.cull, inputs: &o.inputs, vertices: o.vertices.iter().map(|v| (v.0, &v.1[..], v.2)).collect(), indices: o.indices.as_ref().map(|x| (&x.0[..], x.1)), draw: o.draw, strip: o.strip }),
+            Ok(binding) => dev_rows.push(Row { programs: o.prog, binding, blend: o.blend, cull: o.cull, inputs: &o.inputs, vertices: o.vertices.iter().map(|v| (v.0, &v.1[..], v.2)).collect(), indices: o.indices.as_ref().map(|x| (&x.0[..], x.1)), draw: o.draw, strip: o.strip }),
             Err(e) => lines.push(format!("  ui row {i}: not bound: {e}")),
         }
     }
     if dev_rows.is_empty() {
-        return Ok(Drawn { layer: None, lines, rows: rows.len() });
+        return Ok(Drawn { layer: None, gpu: None, lines, rows: rows.len() });
     }
     let limit = if host.caps.software { 120.0 } else { 1.0 };
     crate::replay::watchdog_arm();
+    if gpu {
+        let got = xnw_world::ui::draw_layer_gpu(host, &dev_rows, size, limit);
+        crate::replay::watchdog_disarm();
+        let (g, more, drawn) = got?;
+        lines.extend(more);
+        return Ok(Drawn { layer: None, gpu: Some((g, drawn)), lines, rows: rows.len() });
+    }
     let layer = xnw_world::ui::draw_layer(host, &dev_rows, size, limit);
     crate::replay::watchdog_disarm();
     let layer = layer?;
     lines.extend(layer.lines.iter().cloned());
-    Ok(Drawn { layer: Some(layer), lines, rows: rows.len() })
+    Ok(Drawn { layer: Some(layer), gpu: None, lines, rows: rows.len() })
 }
 
 thread_local! {
@@ -213,7 +264,7 @@ pub fn compose_frame(dir: &Path, pass: &xnw_world::Pass, rgba: &mut [u8]) -> Res
     match d.layer {
         Some(layer) => {
             xnw_world::ui::compose(rgba, &layer.rgba);
-            println!("ui: {} rows, {} drawn in {:.3} s on {}; layer pixels covered {}", d.rows, layer.drawn, layer.seconds, host.caps.adapter, xnw_world::ui::covered(&layer.rgba));
+            println!("ui: {} rows, {} drawn in {:.3} s on {}; layer pixels covered {}, layer hash {:08x}", d.rows, layer.drawn, layer.seconds, host.caps.adapter, xnw_world::ui::covered(&layer.rgba), layer_hash(&layer.rgba));
         }
         None => println!("ui: {} rows, 0 drawn", d.rows),
     }
@@ -244,8 +295,9 @@ mod tests {
 
     #[test]
     fn only_stage_30_reaches_the_plane() {
-        assert!(on_plane(30) && on_plane(u32::MAX));
+        assert!(on_plane(30) && on_plane(u32::MAX) && on_plane(0));
         assert!(!on_plane(6) && !on_plane(8) && !on_plane(16));
+        assert!(movie_row("PS_BinkNoAlpha") && !movie_row("FText"));
     }
 
     #[test]

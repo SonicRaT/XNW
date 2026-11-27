@@ -62,17 +62,33 @@ fn f32s<const N: usize>(b: &[u8]) -> [f32; N] {
     std::array::from_fn(|i| f32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap()))
 }
 
+/// `--near-hash h[,h..]`: geometry hashes (hex) for [`fill`]'s `near_hashes`.
+pub fn hashes_arg(args: &[String]) -> Vec<u64> {
+    args.iter().position(|a| a == "--near-hash").and_then(|i| args.get(i + 1)).map(|v| v.split(',').filter_map(|h| u64::from_str_radix(h.trim().trim_start_matches("0x"), 16).ok()).collect()).unwrap_or_default()
+}
+
+/// A capture's bitset (blobs/mask-N.bin, u32 words LSB first) named by a
+/// draws.tsv cell; empty for "-", a missing column or a missing file.
+fn mask_blob(blobs: &Path, cache: &mut HashMap<u32, Vec<u32>>, cell: Option<&str>) -> Vec<u32> {
+    let Some(i) = cell.and_then(|s| s.parse::<u32>().ok()) else { return Vec::new() };
+    cache.entry(i).or_insert_with(|| std::fs::read(blobs.join(format!("mask-{i}.bin"))).map(|b| b.chunks_exact(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect()).unwrap_or_default()).clone()
+}
+
 /// Rebuilds `list`'s instanced rows as device-culled batches (see the module).
 /// `device` false (`--gpucull=cpu`): the rows draw the reference's instances
 /// from the list's CPU buffer instead (the same batches and origins), so a
 /// picture against `--gpucull` isolates the device path.
-/// `near_rows` (`--near-rows k[,k..]`, list rows): every instance of these
-/// rows' batches counts as flagged in the batch's near fade-in bitset (VEH3).
-/// The captures hold no near bitset (nor the hide one), and the fp16 the
-/// rule reads is set on most batch props (h = 60, 150, 300 in pk8a f1030's
-/// stage 21), so "all flagged" for every batch is wrong; this is a lab
-/// instrument for one batch whose flagged instance is known, not a rule.
-pub fn fill(dir: &Path, list: &mut FrameList, device: bool, near_rows: &[u32]) -> Result<Report, String> {
+/// The batch's hide and near fade-in bitsets come from the capture
+/// (draws.tsv inst_hide / inst_near naming blobs/mask-N.bin, VEH3c), as the
+/// live cull takes them; captures made before VEH3c have neither.
+/// `near_rows` (`--near-rows k[,k..]`, list rows) and `near_hashes`
+/// (`--near-hash h[,h..]`, geometry hashes: stable across a sequence's
+/// frames): every instance of these batches counts as flagged in the near
+/// fade-in bitset (VEH3), for those older captures. The fp16 the rule reads
+/// is set on most batch props (h = 60, 150, 300 in pk8a f1030's stage 21),
+/// so "all flagged" for every batch is wrong; this is a lab instrument for
+/// a batch whose flagged instance is known, not a rule.
+pub fn fill(dir: &Path, list: &mut FrameList, device: bool, near_rows: &[u32], near_hashes: &[u64]) -> Result<Report, String> {
     let mut rep = Report::default();
     let rows_v1: HashMap<u32, usize> = std::fs::read_to_string(dir.join("list-draws.tsv")).map_err(|e| format!("list-draws.tsv: {e}"))?.lines().skip(1).filter_map(|l| l.split_once('\t')).filter_map(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?))).collect();
     let tsv = std::fs::read_to_string(dir.join("draws.tsv")).map_err(|e| format!("draws.tsv: {e}"))?;
@@ -80,11 +96,13 @@ pub fn fill(dir: &Path, list: &mut FrameList, device: bool, near_rows: &[u32]) -
     let head: Vec<&str> = lines.next().ok_or("draws.tsv empty")?.split('\t').collect();
     let col = |n: &str| head.iter().position(|h| *h == n).ok_or(format!("draws.tsv: no {n} column"));
     let (cvp, cb, cl, cf, cr, cg) = (col("viewport")?, col("inst_block")?, col("inst_lod")?, col("inst_first_lod")?, col("inst_lodrec")?, col("inst_gpu")?);
+    let (chide, cnear) = (head.iter().position(|h| *h == "inst_hide"), head.iter().position(|h| *h == "inst_near"));
     let draws: Vec<Vec<&str>> = lines.map(|l| l.split('\t').collect()).collect();
     let hex = |s: &str| u64::from_str_radix(s.trim_start_matches("0x"), 16).unwrap_or(0);
     let blobs = dir.join("blobs");
     let mut blocks: HashMap<u32, Arc<Vec<u8>>> = HashMap::new();
     let mut lods: HashMap<u32, [f32; 35]> = HashMap::new();
+    let mut masks: HashMap<u32, Vec<u32>> = HashMap::new();
     let mut batch_of: HashMap<(u32, u64, u32, u32), u32> = HashMap::new();
     let mut seen_blocks: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let t0 = std::time::Instant::now();
@@ -145,8 +163,12 @@ pub fn fill(dir: &Path, list: &mut FrameList, device: bool, near_rows: &[u32]) -
                 };
                 let n = (records.len() / 64) as u32;
                 // The live batch test already passed (the row is listed): every record is tested against the planes.
-                let near = if near_rows.contains(&(row as u32)) { vec![u32::MAX; n.div_ceil(32) as usize] } else { Vec::new() };
-                let Some(i) = list.cull.push(Batch { records: records.clone(), len: n, keep, lod, hide: Vec::new(), near, origin, planes: Some(planes), out_first: 0 }) else {
+                let hide = mask_blob(&blobs, &mut masks, chide.and_then(|c| d.get(c).copied()));
+                let mut near = mask_blob(&blobs, &mut masks, cnear.and_then(|c| d.get(c).copied()));
+                if near_rows.contains(&(row as u32)) || near_hashes.contains(&r.geom.hash) {
+                    near = vec![u32::MAX; n.div_ceil(32) as usize];
+                }
+                let Some(i) = list.cull.push(Batch { records: records.clone(), len: n, keep, lod, hide, near, origin, planes: Some(planes), out_first: 0 }) else {
                     left("cull frame full");
                     continue;
                 };
@@ -295,5 +317,22 @@ mod tests {
         let b = Batch { records: Arc::new(recs.iter().flatten().flat_map(|v| v.to_le_bytes()).collect()), len: 4, lod: Some((t, 0)), hide: vec![0b1000], planes: Some([[0.0, 1.0, 0.0, 0.0], far, far, far, far]), ..Default::default() };
         assert_eq!(at_plane(&b), 1);
         assert_eq!(at_plane(&Batch { planes: None, ..b }), 0, "no planes: nothing to flip");
+    }
+
+    /// A draws.tsv cell names blobs/mask-N.bin (u32 words); "-", no column
+    /// or no file give an empty bitset (VEH3c); `--near-hash` reads hex.
+    #[test]
+    fn mask_blobs_and_hashes() {
+        let dir = std::env::temp_dir().join(format!("xnw-maskblob-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("mask-3.bin"), [0x20u8, 0, 0, 0, 1, 0, 0, 0x80]).unwrap();
+        let mut cache = HashMap::new();
+        assert_eq!(mask_blob(&dir, &mut cache, Some("3")), vec![0x20, 0x8000_0001]);
+        assert_eq!(mask_blob(&dir, &mut cache, Some("-")), Vec::<u32>::new());
+        assert_eq!(mask_blob(&dir, &mut cache, None), Vec::<u32>::new());
+        assert_eq!(mask_blob(&dir, &mut cache, Some("7")), Vec::<u32>::new());
+        let _ = std::fs::remove_dir_all(&dir);
+        let args: Vec<String> = ["burst", "--near-hash", "0x815ea3bf98ab200,ff"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(hashes_arg(&args), vec![0x815ea3bf98ab200, 0xff]);
     }
 }

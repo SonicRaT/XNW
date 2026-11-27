@@ -396,6 +396,73 @@ pub fn on_wheel_sink(d: &xnw_gpu::d3d12x::tap::TapDraw) {
     WHEEL_N[8].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
 }
 
+/// `instrec` (default on, `instrec=off` in `XNW_WORLD_RENDER`): a draw
+/// of a static instanced program (`xnw_frame::instrec::STATIC_INST`: the
+/// `*_inst` effects) is read at the list sink and its row drawn once per
+/// instance record, as the replay's `record_instances` does. The hook's
+/// world of such a draw is the identity at the world origin.
+pub fn instrec_start() -> bool {
+    !std::env::var("XNW_WORLD_RENDER").is_ok_and(|v| v.split(',').any(|p| p.trim() == "instrec=off"))
+}
+
+/// Counters since the last line: sinks seen, rows given their worlds,
+/// refusals by `xnw_frame::instrec::WHY`, no hook draw.
+pub static INSTREC_N: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+thread_local! {
+    static INSTREC_PIPES: std::cell::RefCell<HashMap<usize, Option<xnw_frame::audit::InstSlots>>> = std::cell::RefCell::new(HashMap::new());
+}
+
+fn instrec_slots(pipeline: usize) -> Option<xnw_frame::audit::InstSlots> {
+    INSTREC_PIPES.with(|m| {
+        let mut m = m.borrow_mut();
+        if let Some(s) = m.get(&pipeline) {
+            return *s;
+        }
+        if m.len() > 4096 {
+            m.clear();
+        }
+        let s = xnw_gpu::d3d12x::tap::stages(pipeline).iter().find(|s| s.name == "mesh").and_then(|s| xnw_frame::instrec::slots_of(s.hash));
+        m.insert(pipeline, s);
+        s
+    })
+}
+
+/// The draw tap's filter: a static instanced program.
+pub fn instrec_want(pipeline: usize) -> bool {
+    instrec_slots(pipeline).is_some()
+}
+
+/// The draw tap (title thread, at the list sink, after the draw's hook):
+/// the instance worlds for this thread's last hooked draw.
+pub fn on_instrec_sink(d: &xnw_gpu::d3d12x::tap::TapDraw) {
+    use xnw_gpu::d3d12x::tap::{self, TapRoot};
+    let Some(slots) = instrec_slots(d.pipeline) else { return };
+    if !xnw_core::live::on(xnw_core::live::INSTREC, || u32::from(instrec_start())) {
+        return;
+    }
+    let _site = super::fault_site(super::SITE_WHEELS);
+    INSTREC_N[0].fetch_add(1, Ordering::Relaxed);
+    let view = |root: u16, slot: u32| match d.roots.get(usize::from(root)) {
+        Some(TapRoot::Table { handle, slots, .. }) if slot < *slots => Some(tap::view(handle + tap::SLOT * u64::from(slot))).filter(|v| v.kind != xnw_formats::framepack::view::NONE && v.addr != 0).map(|v| (v.addr, v.bytes)),
+        _ => None,
+    };
+    let mut read = |at: u64, len: usize| -> Option<Vec<u8>> { ((0x1_0000..0x8000_0000_0000).contains(&at) && at.checked_add(len as u64).is_some_and(|e| e <= 0x8000_0000_0000)).then(|| super::dcopy(at, len)).flatten() };
+    // A direct mesh draw gives its groups; an indirect one (its count is the command limit) every record of the view.
+    let groups = if d.op == xnw_formats::framepack::op::MESH { d.count } else { 0 };
+    let why = match xnw_frame::instrec::static_reads(slots, groups, &view, &mut read) {
+        Ok(w) => if super::attach_instrec(w) { 1 } else { 5 },
+        Err(k) => 2 + k,
+    };
+    INSTREC_N[why].fetch_add(1, Ordering::Relaxed);
+}
+
+/// The line (every 60 frames): counters since the last line (taken) and this frame's rows placed.
+pub fn instrec_line(frame: u64, placed: u32) -> String {
+    let n: Vec<u64> = INSTREC_N.iter().map(|a| a.swap(0, Ordering::Relaxed)).collect();
+    let why = xnw_frame::instrec::WHY.iter().zip(&n[2..5]).map(|(w, v)| format!("{w} {v}")).collect::<Vec<_>>().join(", ");
+    format!("world render: frame {frame}: instance records (60 frames): static instanced sinks {}, given to their draw {}; refused: {why}, no hook draw {}; this frame {placed} rows drawn per record", n[0], n[1], n[5])
+}
+
 /// The wheels line (every 60 frames with bit 8): counters since the last
 /// line (taken), and `placed` rows of this frame drawn per instance; `left`:
 /// this frame's rows with reads, and of them left as they were (a remap

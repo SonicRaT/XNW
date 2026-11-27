@@ -493,11 +493,37 @@ fn entry_len(code: &[u8]) -> Option<usize> {
 /// r11 is volatile at a function's entry). An earlier hook's own entry,
 /// `jmp [rip+0]` and its 8-byte target, moves whole (it is absolute and
 /// ends the path), so a second hook on one address runs before the first.
+/// A `jcc rel8` becomes the inverse jcc over `jmp [rip+0]` to its target,
+/// when that target lies outside the moved bytes (handler Draws such as
+/// 0x1435B0DA0 open with `test byte [rcx+..], 2; jnz +7` at entry + 6).
 /// Other relative forms: `None`.
 fn relocate(code: &[u8], from: usize) -> Option<(usize, Vec<u8>)> {
     let (mut n, mut out) = (0, Vec::new());
+    let mut targets = Vec::new();
     while n < 14 {
         let c = code.get(n..)?;
+        // `mov r32, [rip+d32]` (no REX; eax, ecx, edx, ebx, esi, edi) becomes
+        // `mov r64, target; mov r32, [r64]` (the register is written either way;
+        // W16P: the vehicle handler Draw 0x1435A85F0 reads a TLS index so at entry + 10).
+        if c.first() == Some(&0x8B) && c.get(1).is_some_and(|m| m & 0xC7 == 0x05 && !matches!((m >> 3) & 7, 4 | 5)) {
+            let reg = (c[1] >> 3) & 7;
+            let disp = i32::from_le_bytes(c.get(2..6)?.try_into().ok()?);
+            let target = (from + n + 6).wrapping_add(disp as isize as usize);
+            out.extend([0x48, 0xB8 + reg]);
+            out.extend((target as u64).to_le_bytes());
+            out.extend([0x8B, reg << 3 | reg]);
+            n += 6;
+            continue;
+        }
+        if let Some(&op @ 0x70..=0x7F) = c.first() {
+            let rel = *c.get(1)? as i8;
+            let target = (from + n + 2).wrapping_add(rel as isize as usize);
+            out.extend([op ^ 1, 14]);
+            out.extend(jump(target));
+            targets.push(target);
+            n += 2;
+            continue;
+        }
         if c.starts_with(&[0xFF, 0x25, 0, 0, 0, 0]) {
             out.extend(c.get(..14)?);
             n += 14;
@@ -515,6 +541,9 @@ fn relocate(code: &[u8], from: usize) -> Option<(usize, Vec<u8>)> {
         let k = insn_len(c)?;
         out.extend(&c[..k]);
         n += k;
+    }
+    if targets.iter().any(|t| (from..from + n).contains(t)) {
+        return None;
     }
     Some((n, out))
 }
@@ -844,6 +873,28 @@ mod tests {
         assert_eq!(&moved[9..11], &[0x49, 0xBB]);
         assert_eq!(u64::from_le_bytes(moved[11..19].try_into().unwrap()), 0x101E);
         assert_eq!(&moved[19..], &[0x41, 0xFF, 0xD3]);
+        // Title 0x1435B0DA0 (a vehicle handler Draw): push rsi; push rdi; sub rsp,28h;
+        // test byte [rcx+7A4h],2; jnz +7: the jnz becomes jz +14 over jmp [rip+0] to entry + 22.
+        let veh = [0x56, 0x57, 0x48, 0x83, 0xEC, 0x28, 0xF6, 0x81, 0xA4, 0x07, 0x00, 0x00, 0x02, 0x75, 0x07, 0x48];
+        let (n, moved) = relocate(&veh, 0x1000).unwrap();
+        assert_eq!(n, 15);
+        assert_eq!(&moved[..13], &veh[..13]);
+        assert_eq!(&moved[13..15], &[0x74, 14]);
+        assert_eq!(&moved[15..], &jump(0x1000 + 22));
+        // A jcc back into the moved bytes cannot be relocated.
+        let mut back = veh;
+        back[14] = 0xF5; // jnz -11: entry + 4
+        assert_eq!(relocate(&back, 0x1000), None);
+        // W16P: title 0x1435A85F0 (a vehicle handler Draw): pushes, sub rsp,20h, mov eax,[rip+386052Ch].
+        let veh = [0x41, 0x56, 0x56, 0x57, 0x55, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x8B, 0x05, 0x2C, 0x05, 0x86, 0x03];
+        let (n, moved) = relocate(&veh, 0x1000).unwrap();
+        assert_eq!(n, 16);
+        assert_eq!(&moved[..10], &veh[..10]);
+        assert_eq!(&moved[10..12], &[0x48, 0xB8]);
+        assert_eq!(u64::from_le_bytes(moved[12..20].try_into().unwrap()), 0x1000 + 16 + 0x0386_052C);
+        assert_eq!(&moved[20..], &[0x8B, 0x00]);
+        // mov ebp,[rip+..] (rm 5 as a base needs a displacement): not moved.
+        assert_eq!(relocate(&[0x56, 0x57, 0x48, 0x83, 0xEC, 0x28, 0x8B, 0x2D, 0, 0, 0, 0, 0x90, 0x90, 0x90, 0x90], 0x1000), None);
     }
 
     /// A function with 17 bytes of prologue, hooked: the result is intact,
@@ -887,6 +938,68 @@ mod tests {
         unsafe { hook_entry_with(mem, 7, second as usize) }.unwrap();
         assert_eq!(f(40, 2), 42);
         assert_eq!((SECOND.load(Ordering::Relaxed), HOOKS.get().unwrap()[0].count.load(Ordering::Relaxed)), (40, 3));
+    }
+
+    /// A function whose moved bytes end in a `jnz rel8` (as the vehicle
+    /// handler Draws do), hooked: both branches still return the right value
+    /// and the hook sees rcx.
+    #[test]
+    fn hooked_function_with_a_jcc_still_works() {
+        let code = [
+            0x56, 0x57, 0x48, 0x83, 0xEC, 0x28, // push rsi; push rdi; sub rsp,28h
+            0x48, 0x89, 0xC8, // mov rax,rcx
+            0xF6, 0xC1, 0x01, // test cl,1
+            0x75, 0x0A, // jnz +10 (odd: entry + 24)
+            0x48, 0x01, 0xD0, 0x48, 0x83, 0xC4, 0x28, 0x5F, 0x5E, 0xC3, // add rax,rdx; add rsp,28h; pop rdi; pop rsi; ret
+            0x48, 0x29, 0xD0, 0x48, 0x83, 0xC4, 0x28, 0x5F, 0x5E, 0xC3, // sub rax,rdx; ...
+        ];
+        // SAFETY: a fresh executable allocation of ours.
+        let mem = unsafe { VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE) }.cast::<u8>();
+        // SAFETY: inside the allocation.
+        unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), mem, code.len()) };
+        // SAFETY: the function written above.
+        let f: extern "system" fn(usize, usize) -> usize = unsafe { std::mem::transmute(mem) };
+        assert_eq!((f(10, 3), f(11, 3)), (13, 8));
+        static SEEN: AtomicU64 = AtomicU64::new(0);
+        extern "system" fn seen(frame: usize, _id: usize) {
+            // SAFETY: the stub's frame: rcx saved at frame - 24.
+            SEEN.store(unsafe { ((frame - 24) as *const u64).read() }, Ordering::Relaxed);
+        }
+        // SAFETY: nothing runs the function now.
+        unsafe { hook_entry_with(mem, 40, seen as usize) }.unwrap();
+        assert_eq!(f(20, 3), 23);
+        assert_eq!(SEEN.load(Ordering::Relaxed), 20);
+        assert_eq!(f(21, 3), 18);
+        assert_eq!(SEEN.load(Ordering::Relaxed), 21);
+    }
+
+    /// W16P: a function whose moved bytes hold `mov eax, [rip+d32]`, hooked:
+    /// it still returns the word it reads.
+    #[test]
+    fn hooked_function_with_a_rip_load_still_works() {
+        let mut code = vec![
+            0x56, 0x57, 0x48, 0x83, 0xEC, 0x28, // push rsi; push rdi; sub rsp,28h
+            0x8B, 0x05, 20, 0, 0, 0, // mov eax,[rip+20] (the word at 32)
+            0x48, 0x83, 0xC4, 0x28, 0x5F, 0x5E, 0xC3, // add rsp,28h; pop rdi; pop rsi; ret
+        ];
+        code.resize(32, 0xCC);
+        code.extend(0x1234_5678u32.to_le_bytes());
+        // SAFETY: a fresh executable allocation of ours.
+        let mem = unsafe { VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE) }.cast::<u8>();
+        // SAFETY: inside the allocation.
+        unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), mem, code.len()) };
+        // SAFETY: the function written above.
+        let f: extern "system" fn(usize, usize) -> usize = unsafe { std::mem::transmute(mem) };
+        assert_eq!(f(0, 0), 0x1234_5678);
+        static SEEN: AtomicU64 = AtomicU64::new(0);
+        extern "system" fn seen(frame: usize, _id: usize) {
+            // SAFETY: the stub's frame: rcx saved at frame - 24.
+            SEEN.store(unsafe { ((frame - 24) as *const u64).read() }, Ordering::Relaxed);
+        }
+        // SAFETY: nothing runs the function now.
+        unsafe { hook_entry_with(mem, 41, seen as usize) }.unwrap();
+        assert_eq!(f(77, 0), 0x1234_5678);
+        assert_eq!(SEEN.load(Ordering::Relaxed), 77);
     }
 }
 

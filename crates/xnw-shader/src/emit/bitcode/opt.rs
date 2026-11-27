@@ -155,7 +155,7 @@ fn resolve(repl: &[Option<V>], mut v: V) -> V {
 }
 
 /// Replaces every value `op` reads by `f` of it.
-fn map_operands(op: &mut Op, mut f: impl FnMut(V) -> V) {
+pub(super) fn map_operands(op: &mut Op, mut f: impl FnMut(V) -> V) {
     match op {
         Op::Bin(_, a, b) | Op::Cmp(_, a, b) | Op::Store(a, b) | Op::AtomicRmw(_, a, b) => {
             *a = f(*a);
@@ -1071,6 +1071,24 @@ impl Module {
     /// phis and bodies), for measuring the passes and the shader gate.
     pub(crate) fn inst_count(&self) -> usize {
         self.blocks.iter().map(|b| b.body.len() + b.phis.len()).sum()
+    }
+
+    /// XNW (SWEEP1): the names of the functions called from reached
+    /// blocks, sorted (`dx.op.discard`, `dx.op.waveReadLaneAt`...), for the
+    /// card sweep's class columns.
+    pub(crate) fn called(&self) -> Vec<String> {
+        let reached = self.reached();
+        let mut ids = std::collections::BTreeSet::new();
+        for (_, blk) in self.blocks.iter().enumerate().filter(|(b, _)| reached[*b]) {
+            for &i in &blk.body {
+                if let Op::Call(f, _) = &self.insts[i as usize].op {
+                    ids.insert(*f);
+                }
+            }
+        }
+        let mut names: Vec<String> = ids.into_iter().map(|f| self.funcs[f as usize].name.clone()).collect();
+        names.sort();
+        names
     }
 
     pub(crate) fn usage(&self) -> Usage {

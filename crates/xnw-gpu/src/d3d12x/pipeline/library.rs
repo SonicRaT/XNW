@@ -203,6 +203,51 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     format!("{:032x}", xnw_core::hash128(&parts))
 }
 
+/// Programs a hardware adapter's compiler crashes on, by console container
+/// hash: never handed to the driver there (the software adapter makes
+/// them). Unlike `crashed.txt` (pipeline names, which change with every
+/// translator version) these hold across versions. `XNW_DENY_ALLOW=
+/// <first 8 hex>+...|all` lets listed ones through (a card sample).
+/// Evidence (V): `xnw card-sweep` on the RX 5700 XT (driver amdxc64,
+/// Agility 1.610), `<out>/card-sweep\hw\sweep.tsv`, 2026-11-26: each
+/// row `crash 0xc0000005 amdxc64.dll+0x12748ea write 0x2000000c`, the
+/// signature of two earlier card runs' crashes. The other
+/// 222 `CS_RaytracingResolve` pipelines of the sweep compile, among them
+/// `ped_standard_skin`'s two variants (e28b9c8d, 6adbc0d4); WARP 1.0.22
+/// makes the three b1139868 ones (1.1-1.3 s; the ae7b7f3c ones pass its
+/// 90 s limit, as every ae7b7f3c variant does there).
+const DENY_HW_PROGRAMS: [(u128, &str); 6] = [
+    // pipeline 99c24b13, 6171 ms to the crash
+    (0xbac3aea9213a007389b58c4ecbf90448, "ped_standard_head:CS_RaytracingResolve_b1139868"),
+    // pipeline 76ec6d68, 6452 ms
+    (0x94e7b483baacf758a402f9201ebd039e, "ped_standard_lod_head:CS_RaytracingResolve_b1139868"),
+    // pipeline f3ea3132, 5832 ms
+    (0xf4797158477b142f96a27c656d1eed27, "ped_standard_lod_skin:CS_RaytracingResolve_b1139868"),
+    // pipeline 0a27d2be, 6979 ms
+    (0xaad993120f38603fbdac36e641df9c26, "ped_standard_head:CS_RaytracingResolve_ae7b7f3c"),
+    // pipeline 78f7542d, 6862 ms
+    (0x2c766e13cf187de4996b07d0759e1fc6, "ped_standard_lod_head:CS_RaytracingResolve_ae7b7f3c"),
+    // pipeline bc137a50, 7096 ms
+    (0xfa998cfe66856ff91cb6eeee0e1f4708, "ped_standard_lod_skin:CS_RaytracingResolve_ae7b7f3c"),
+];
+
+/// Why `s` is not made on this adapter ([`DENY_HW_PROGRAMS`]); None: it may be.
+pub(crate) fn denied_program(s: &super::Shader) -> Option<String> {
+    let allow = std::env::var("XNW_DENY_ALLOW").unwrap_or_default();
+    let container = s.container_hash().unwrap_or(s.hash);
+    let software = super::super::host::host_device().is_none_or(|h| h.caps.software);
+    denied_with(container, software, &allow)
+}
+
+fn denied_with(container: u128, software: bool, allow: &str) -> Option<String> {
+    let (_, name) = DENY_HW_PROGRAMS.iter().find(|d| d.0 == container)?;
+    let short = (container >> 96) as u32;
+    if software || allow.trim() == "all" || allow.split('+').filter_map(|h| u32::from_str_radix(h.trim(), 16).ok()).any(|h| h == short) {
+        return None;
+    }
+    Some(format!("program {short:08x} ({name}) is not made on the hardware adapter: its compiler crashes on it (amdxc64.dll+0x12748ea, card-sweep)"))
+}
+
 /// Pipelines a driver's compiler crashed on (names, one per line).
 const CRASHED_FILE: &str = "crashed.txt";
 
@@ -431,6 +476,16 @@ unsafe extern "system" fn compiler_crashed(info: *mut xnw_core::win::ExceptionPo
     }
 }
 
+/// SWEEP1: [`pipeline`] always calls the driver ([`bypass`]).
+static BYPASS: AtomicBool = AtomicBool::new(false);
+
+/// SWEEP1: from now on every pipeline is made by the driver: the library,
+/// the crash list and the compile watchdog are left out (the card sweep's
+/// child processes; their parent records crashes and time limits).
+pub(crate) fn bypass() {
+    BYPASS.store(true, Ordering::Relaxed);
+}
+
 /// The pipeline named `name`: loaded from the library by `load` if it is
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
@@ -438,6 +493,13 @@ pub(crate) fn pipeline(
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
+    // The card sweep: every pipeline compiled by the driver here and now
+    // (no library, no crash list, no watchdog: the sweep's parent process
+    // times and records each).
+    if BYPASS.load(Ordering::Relaxed) {
+        MADE.fetch_add(1, Ordering::Relaxed);
+        return create();
+    }
     if crashed(name) {
         // E_FAIL.
         return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x8000_4005_u32 as i32)));
@@ -916,6 +978,18 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crashing_programs_are_denied_on_hardware_only() {
+        let head = 0xaad993120f38603fbdac36e641df9c26;
+        assert!(denied_with(head, false, "").is_some_and(|w| w.contains("aad99312")));
+        assert!(denied_with(head, true, "").is_none(), "the software adapter makes them");
+        assert!(denied_with(head, false, "aad99312").is_none());
+        assert!(denied_with(head, false, "1234abcd+aad99312").is_none());
+        assert!(denied_with(head, false, "all").is_none());
+        // ped_standard_skin's variant compiles on the card.
+        assert!(denied_with(0xe28b9c8d3562d9eeef21b474fbc5e375, false, "").is_none());
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {

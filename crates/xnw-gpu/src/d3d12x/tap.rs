@@ -147,6 +147,30 @@ pub fn replay(d: &TapDraw) {
     }
 }
 
+/// LIVE1: the frame pack's own tap for a sink rebuilt from a capture, as
+/// draw.rs `tap` / `tap_dispatch` hand it (a draw through the tap's draw
+/// filter with its IA views; a direct dispatch when the pack wants the
+/// pipeline; an indirect dispatch without a draw filter), with the title's (phase, stage)
+/// the sink was recorded in ([`title_stage`] while it runs). True when handed.
+pub fn replay_pack(d: &TapDraw, ia: Option<TapIa>, stage: Option<(u32, u32)>) -> bool {
+    use xnw_formats::framepack::op;
+    let Some(f) = get() else { return false };
+    let wanted = match d.op {
+        op::INDIRECT_DISPATCH => tap_want().is_none(),
+        op::DISPATCH => dispatch_want().is_some_and(|want| want(d.pipeline)),
+        _ => tap_want().is_none_or(|want| want(d.pipeline)),
+    };
+    if !wanted {
+        return false;
+    }
+    set_ia(ia.filter(|_| matches!(d.op, op::DRAW | op::INDEXED)));
+    STAGE.with(|c| c.set(stage));
+    f(d);
+    STAGE.with(|c| c.set(None));
+    set_ia(None);
+    true
+}
+
 /// A captured frame's objects, served in place of our device's while a
 /// burst runs: pipelines by their object number (the capture's), each
 /// stage with its bytes; view and sampler heaps by number (first slot,
@@ -160,6 +184,10 @@ pub struct Served {
     pub sampler_heaps: HashMap<usize, (u64, u32)>,
     pub views: HashMap<u64, TapView>,
     pub buffers: std::collections::BTreeMap<u64, u64>,
+    /// LIVE1: graphics pipelines' state bytes (the capture's GSTATE records).
+    pub gstates: HashMap<usize, Vec<u8>>,
+    /// LIVE1: sampler records as the capture resolved them (raw words -> form, words).
+    pub samplers: HashMap<[u32; 4], (u32, [u32; 27])>,
 }
 
 static SERVING: AtomicBool = AtomicBool::new(false);
@@ -228,6 +256,9 @@ pub fn sampler_heap(heap: usize) -> Option<(u64, u32)> {
 /// they are a record this device wrote: (13, the D3D12 description's
 /// words) or (27, the console description's words), padded to 27.
 pub fn sampler(raw: [u32; 4]) -> Option<(u32, [u32; 27])> {
+    if let Some(got) = served(|s| s.samplers.get(&raw).copied()) {
+        return got;
+    }
     // The record reader may look at a second 16 bytes: give it zeros.
     let rec = [raw[0], raw[1], raw[2], raw[3], 0, 0, 0, 0];
     match descriptor::view(rec.as_ptr() as u64)? {
@@ -271,6 +302,8 @@ pub const IA_SLOTS: usize = 4;
 
 thread_local! {
     static IA: std::cell::Cell<Option<TapIa>> = const { std::cell::Cell::new(None) };
+    /// The (phase, stage) of a sink [`replay_pack`] hands (None: the title's TLS).
+    static STAGE: std::cell::Cell<Option<(u32, u32)>> = const { std::cell::Cell::new(None) };
 }
 
 /// Sets (draw.rs, around a Draw or DrawIndexed tap) the IA views the
@@ -288,16 +321,19 @@ pub fn ia() -> Option<TapIa> {
 /// UI1: the title's (pass phase, stage) on this thread, read from its TLS
 /// as `ui=keep` reads it (uikeep.rs; phase u32::MAX = outside a pass).
 pub fn title_stage() -> Option<(u32, u32)> {
+    if let Some(st) = STAGE.with(|c| c.get()) {
+        return Some(st);
+    }
     super::uikeep::here()
 }
 
 /// UI1: a graphics pipeline's host state as the warm cache encodes it
 /// (blend, rasterizer, depth, topology, targets, input layout; decode with
-/// [`PipeState::decode`]); None for compute pipelines, unknown objects and
-/// served (burst) pipelines.
+/// [`PipeState::decode`]); None for compute pipelines and unknown objects
+/// (a burst serves the capture's).
 pub fn graphics_state(p: usize) -> Option<Vec<u8>> {
-    if SERVING.load(Ordering::Relaxed) {
-        return None;
+    if let Some(got) = served(|s| s.gstates.get(&p).cloned()) {
+        return got;
     }
     pipeline::graphics_state(p as This).map(|g| g.encode())
 }

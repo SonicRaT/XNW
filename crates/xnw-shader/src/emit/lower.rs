@@ -631,7 +631,7 @@ mod tests {
         let p = ir::build(&native.code, wave64, 256).unwrap();
         let res = resource::track(&p, &native.layout, native.stage).unwrap();
         let io = io::raise(&p, &native).unwrap();
-        let st = structure::structure(&p).unwrap();
+        let st = structure::structure_with(&p, stage == HwStage::Cs).unwrap();
         lower(&Parts {
             native: &native,
             p: &p,
@@ -663,6 +663,13 @@ mod tests {
         let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
         let io = StageIo::Cs(ComputeIo { rsrc2: 1 << 15 | sgprs.max(2) << 1, threads: [1, 1, 1] });
         lower_with(words, HwStage::Cs, wave64, io, layout, used)
+    }
+
+    /// FACE1: a branch skipping a whole-wave section (168936d7's shape)
+    /// lowers wave-wide (`WaveAllTrue`), its region under guards.
+    #[test]
+    fn a_branch_skipping_a_whole_wave_section_lowers() {
+        lower_wave(&crate::structure::tests::SKIPPED_SECTION, vec![], vec![], true).unwrap();
     }
 
     /// VIctory (open pull request, 39ba8d3, GPL-3.0-or-later).

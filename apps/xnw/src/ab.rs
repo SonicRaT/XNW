@@ -5,11 +5,16 @@
 //!   while the title runs (`patches::LIVE`: every changed byte of every
 //!   entry inside one aligned 8-byte word, written by one locked
 //!   compare-exchange, whole instructions for whole instructions, and a
-//!   switch the title reads every frame rather than a size made at start);
+//!   switch the title reads every frame rather than a size made at start),
+//!   and `noencode`, `noencodebatch` (`encode.rs`: flags of our own hooks);
 //! - `XNW_AB_SKIP=<stage ids>`: stages whose callbacks are skipped from
 //!   then on (the meter's own flags, as `XNW_STAGE_SKIP`);
 //! - `XNW_AB_WORLD=<name=on|off,...>`: our world pass switches that are
-//!   read every frame (`LIVE_WORLD`); the others are read once at start.
+//!   read every frame (`LIVE_WORLD`); the others are read once at start;
+//! - `XNW_AB_LIVE=<name=value,...>`: the live switches (SW1,
+//!   `xnw_core::live`: bridgeps, bridgefam, ournormals, ourlight, decal,
+//!   lag, hold, ui, hair, tex), each change logged `live: ...`; the flicker
+//!   lines (`XNW_FRAME_LUMA=1`) close their window there and carry [A]/[B].
 //!
 //! The stage meter closes its window at the switch, so its lines before
 //! are `title stages [A]: ...` and after `title stages [B]: ...`; the line
@@ -39,6 +44,7 @@ struct Plan {
     patches: Vec<String>,
     skip: Vec<usize>,
     world: String,
+    live: Vec<(String, String)>,
 }
 static PLAN: OnceLock<Plan> = OnceLock::new();
 
@@ -52,11 +58,11 @@ fn parse_frames(v: &str) -> Result<Option<u64>, ()> {
 
 /// The plan of the A/B switches: patches that are live-safe, stage ids,
 /// world items that are live; and the items refused, with why.
-fn plan(patch: &str, skip: &str, world: &str) -> (Plan, Vec<String>) {
+fn plan(patch: &str, skip: &str, world: &str, live: &str) -> (Plan, Vec<String>) {
     let mut bad = Vec::new();
     let mut patches = Vec::new();
     for name in patch.split(',').map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty()) {
-        if crate::patches::LIVE.contains(&name.as_str()) {
+        if crate::patches::LIVE.contains(&name.as_str()) || crate::encode::NAMES.contains(&name.as_str()) {
             patches.push(name);
         } else {
             bad.push(format!("XNW_AB_PATCH {name}: not a live-safe patch (patches::LIVE: {})", crate::patches::LIVE.join(",")));
@@ -78,7 +84,15 @@ fn plan(patch: &str, skip: &str, world: &str) -> (Plan, Vec<String>) {
             bad.push(format!("XNW_AB_WORLD {item}: not a live switch name=on|off ({})", LIVE_WORLD.join(",")));
         }
     }
-    (Plan { patches, skip: ids, world: items.join(",") }, bad)
+    let mut sets = Vec::new();
+    for (n, v) in xnw_core::live::items(live) {
+        if xnw_core::live::find(&n).is_some() {
+            sets.push((n, v));
+        } else {
+            bad.push(format!("XNW_AB_LIVE {n}={v}: not a live switch ({})", xnw_core::live::names()));
+        }
+    }
+    (Plan { patches, skip: ids, world: items.join(","), live: sets }, bad)
 }
 
 /// Reads `XNW_AB*` and `XNW_STOP_WORLD_FRAMES`; whether the stage detour
@@ -104,11 +118,12 @@ pub(crate) fn configure(base: usize) -> bool {
         }
     };
     if at != 0 {
-        let (p, bad) = plan(&env("XNW_AB_PATCH"), &env("XNW_AB_SKIP"), &env("XNW_AB_WORLD"));
+        let (p, bad) = plan(&env("XNW_AB_PATCH"), &env("XNW_AB_SKIP"), &env("XNW_AB_WORLD"), &env("XNW_AB_LIVE"));
         for b in &bad {
             xnw_core::warn!("{b}; ignored");
         }
-        xnw_core::info!("ab: A until world frame {at}, then B: patches [{}], skipped stages {:?}, world [{}]", p.patches.join(","), p.skip, p.world);
+        xnw_core::info!("ab: A until world frame {at}, then B: patches [{}], skipped stages {:?}, world [{}], live [{}]", p.patches.join(","), p.skip, p.world, live_text(&p.live));
+        xnw_core::live::set_phase(1);
         let _ = PLAN.set(p);
         BASE.store(base, Ordering::Relaxed);
         AT.store(at, Ordering::Relaxed);
@@ -161,11 +176,20 @@ pub(crate) fn switch(n: u64) {
     let Some(p) = PLAN.get() else { return };
     crate::stagemeter::skip_more(&p.skip);
     B.store(true, Ordering::Relaxed);
+    xnw_core::live::set_phase(2);
+    // SW1: the live switches (each change logged; refusals warned).
+    crate::live::apply(&p.live, "XNW_AB_LIVE", xnw_gpu::d3d12x::presented());
     let base = BASE.load(Ordering::Relaxed);
     // SAFETY: the mapped title of this build (configure came from detours::install);
     // apply_live writes only LIVE entries, each with one atomic word.
-    let done = if base == 0 { Vec::new() } else { unsafe { crate::patches::apply_live(base, &p.patches) } };
-    xnw_core::info!("ab: B on at world frame {n} (patches applied [{}], skipped stages {:?}, world [{}])", done.join(","), p.skip, p.world);
+    let mut done = if base == 0 { Vec::new() } else { unsafe { crate::patches::apply_live(base, &p.patches) } };
+    // `noencode` and `noencodebatch` are switches of our own hooks (`encode.rs`, in place since the start).
+    done.extend(crate::encode::skip_live(&p.patches));
+    xnw_core::info!("ab: B on at world frame {n} (patches applied [{}], skipped stages {:?}, world [{}], live [{}])", done.join(","), p.skip, p.world, live_text(&p.live));
+}
+
+fn live_text(l: &[(String, String)]) -> String {
+    l.iter().map(|(n, v)| format!("{n}={v}")).collect::<Vec<_>>().join(",")
 }
 
 /// Ends the run after the last window was printed.
@@ -183,11 +207,12 @@ mod tests {
     #[test]
     fn frame_counts_and_the_plan_parse() {
         assert_eq!((parse_frames(""), parse_frames(" 600 "), parse_frames("0"), parse_frames("x")), (Ok(None), Ok(Some(600)), Err(()), Err(())));
-        let (p, bad) = plan("nolocalshadows, NoPrepass,watchdog,cbalign", "21,x,65", "gpucull=on,geomasync=on,grass");
+        let (p, bad) = plan("nolocalshadows, NoPrepass,watchdog,cbalign", "21,x,65", "gpucull=on,geomasync=on,grass", "bridgeps=off, ui=0,nope=1");
         assert_eq!(p.patches, ["nolocalshadows", "noprepass"]);
         assert_eq!(p.skip, [21, 65]);
         assert_eq!(p.world, "gpucull=on");
-        assert_eq!(bad.len(), 5, "{bad:?}");
+        assert_eq!(live_text(&p.live), "bridgeps=off,ui=0");
+        assert_eq!(bad.len(), 6, "{bad:?}");
     }
 
     #[test]

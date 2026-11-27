@@ -267,11 +267,23 @@ fn cell(text: &str) -> String {
     if line.is_empty() { "-".into() } else { line.chars().take(200).collect() }
 }
 
+/// The runtime's options, and with `XNW_ONE_RETURN=1` the bridge's form of a
+/// pixel program (`Options::one_return`, KILL1): its returns joined.
+/// `XNW_CONFINE=1`: the bridge's confined form (`Options::confine`, BND1).
+fn gate_options(stage: &str, h: u128) -> xnw_shader::emit::Options {
+    let mut o = xnw_shader::emit::runtime_options(stage, h, false, None);
+    o.one_return = stage == "pixel" && std::env::var("XNW_ONE_RETURN").is_ok_and(|v| v.trim() == "1");
+    // BND1: `XNW_CONFINE=1`, the bridge's confined form of every program (`Options::confine`); its
+    // pixel loop budget is `XNW_LOOP_LIMIT_PIXEL=16`.
+    o.confine = std::env::var("XNW_CONFINE").is_ok_and(|v| v.trim() == "1");
+    o
+}
+
 /// The build line: the git head of the current folder, the hash of this
 /// binary and of the switches a translation reads.
 fn build_line(select: &str, shard: (u128, u128)) -> (String, String) {
     let exe = std::env::current_exe().ok().and_then(|p| std::fs::read(p).ok()).unwrap_or_default();
-    let switches: Vec<String> = ["XNW_DESC", "XNW_FMA", "XNW_FMA_EXACT", "XNW_PAGETABLE", "XNW_HEAP_NONUNIFORM", "XNW_HEAP_UNIFORMITY", "XNW_ADAPTER", "XNW_SHADER_OPT", "XNW_WAVE_SIZE", "XNW_LOOP_LIMIT_PIXEL", "XNW_LOOP_LIMIT_COMPUTE", "XNW_LOOP_LIMIT_MESH", "XNW_LOOP_LIMIT_VERTEX"]
+    let switches: Vec<String> = ["XNW_DESC", "XNW_FMA", "XNW_FMA_EXACT", "XNW_PAGETABLE", "XNW_HEAP_NONUNIFORM", "XNW_HEAP_UNIFORMITY", "XNW_ADAPTER", "XNW_SHADER_OPT", "XNW_WAVE_SIZE", "XNW_LOOP_LIMIT_PIXEL", "XNW_LOOP_LIMIT_COMPUTE", "XNW_LOOP_LIMIT_MESH", "XNW_LOOP_LIMIT_VERTEX", "XNW_ONE_RETURN", "XNW_CONFINE"]
         .iter()
         .map(|k| format!("{k}={}", std::env::var(k).unwrap_or_default()))
         .collect();
@@ -611,7 +623,7 @@ fn uniformity_row(row: &Row, (marked, varying, handles): (usize, usize, usize)) 
 /// unless the baseline holds the same DXIL with a verdict.
 fn gate_one(bytes: &[u8], h: u128, hash: String, name: &str, base: Option<&Row>, validator: Option<&mut Validator>) -> Row {
     let stage = stage_of(bytes);
-    let opts = xnw_shader::emit::runtime_options(stage, h, false, None);
+    let opts = gate_options(stage, h);
     let t0 = Instant::now();
     let c0 = thread_cycles();
     let r = std::panic::catch_unwind(|| xnw_shader::emit::translate_with(bytes, opts));
@@ -669,7 +681,7 @@ fn thread_cycles() -> u64 {
 /// is slow in a slow translation.
 fn stage_times(bytes: &[u8], h: u128) -> String {
     use xnw_shader::emit::Descriptors;
-    let opts = xnw_shader::emit::runtime_options(stage_of(bytes), h, false, None);
+    let opts = gate_options(stage_of(bytes), h);
     let mut t = Instant::now();
     let mut lap = |name: &str, out: &mut Vec<String>| {
         out.push(format!("{name} {:.1}", t.elapsed().as_secs_f64() * 1e3));

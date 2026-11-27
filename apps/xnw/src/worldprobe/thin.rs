@@ -120,6 +120,7 @@ fn decode_one(d: &mut Draw, tex: &crate::worldtex::TexGlobals, p: &mut Part) {
     if f & TEX != 0 {
         (d.tex_desc, d.alpha_clip) = crate::worldtex::tail(tex, &d.thin.tex, true);
         d.layer_desc = if d.thin.tex.fx == 0 { [0; 4] } else { crate::worldtex::last_layers() };
+        d.extra = crate::worldtex::last_extra();
         why = crate::worldtex::last_why();
     }
     if f & CENSUS != 0 {
@@ -157,6 +158,7 @@ fn pool() -> &'static [Mutex<mpsc::Sender<Job>>] {
                 std::thread::Builder::new()
                     .name(format!("xnw-thin-{k}"))
                     .spawn(move || {
+                        xnw_core::win::helper_thread();
                         for job in rx {
                             // SAFETY: `decode` hands out disjoint shares of its
                             // capture's draws and waits for every share's answer
@@ -281,6 +283,23 @@ mod tests {
         icdraw: u64,
         g: Globals,
         view_vtbl: u64,
+        /// `add_batches`: many instanced calls (in place of the one `icdraw`)
+        /// and the hide bitsets the contexts bind (ctx+0xA10).
+        batches: Vec<FakeBatch>,
+        hides: Vec<u64>,
+    }
+
+    /// One instanced call of `add_batches`: IcDraw -> IcRec -> desc, its
+    /// records (kind S through a list L, else kind C), and a second desc.
+    #[derive(Clone, Copy)]
+    struct FakeBatch {
+        icdraw: u64,
+        rec: u64,
+        desc: u64,
+        alt: u64,
+        records: u64,
+        n: u32,
+        kind_s: bool,
     }
 
     /// worldtex's globals, set once for the process: the handle table is a
@@ -312,7 +331,7 @@ mod tests {
         /// (as many CPU matrix blocks), `geoms` geometries.
         fn new(mb: usize, stride: usize, threads: usize, shaders: usize, geoms: usize, salt: u64) -> Fake {
             let tex = tex_globals();
-            let mut f = Fake { arena: vec![0u64; mb << 17], next: 0, stride, threads: Vec::new(), shaders: Vec::new(), models: Vec::new(), geoms: Vec::new(), blocks: Vec::new(), palette: 0, icdraw: 0, g: Globals::default(), view_vtbl: tex.view_vtbl };
+            let mut f = Fake { arena: vec![0u64; mb << 17], next: 0, stride, threads: Vec::new(), shaders: Vec::new(), models: Vec::new(), geoms: Vec::new(), blocks: Vec::new(), palette: 0, icdraw: 0, g: Globals::default(), view_vtbl: tex.view_vtbl, batches: Vec::new(), hides: Vec::new() };
             // Title globals: slot word, transform cache, per-draw records, palette.
             let slot_word = f.alloc(8);
             f.put(slot_word, 5u16 << 2);
@@ -477,14 +496,93 @@ mod tests {
             self.put(ctx + 0x1_2360, u64::MAX - (i % 2) as u64);
             self.put(ctx + 0x1_2368, (i % 7) as u16);
             self.put(ctx + 0x1_2378, (i % 13) as u16);
+            if !self.hides.is_empty() {
+                self.put(ctx + 0xA10, if i % 5 == 0 { 0 } else { self.hides[i % self.hides.len()] });
+            }
             self.geoms[(i * 7 + frame as usize) % self.geoms.len()]
+        }
+
+        /// Draw `g`'s instanced call (every third draw has one).
+        fn icdraw_of(&self, g: usize) -> u64 {
+            if self.batches.is_empty() { self.icdraw } else { self.batches[g / 3 % self.batches.len()].icdraw }
+        }
+
+        /// A bitset object {bits, words +8, bits +0xC} of `words` words.
+        fn bitset(&mut self, words: u32, seed: u32) -> u64 {
+            let bits = self.alloc(4 * words as usize);
+            for w in 0..words {
+                self.put(bits + 4 * u64::from(w), (seed.wrapping_mul(0x9E37_79B9) ^ w.wrapping_mul(0x85EB_CA6B)) & 0x0F0F_F0F0);
+            }
+            let p = self.alloc(16);
+            self.put(p, bits);
+            self.put(p + 8, words);
+            self.put(p + 0xC, 32 * words);
+            p
+        }
+
+        /// `k` instanced calls of 1..=`max` instances: kind C every
+        /// `cpu_every`-th (b % cpu_every == 1), else kind S (accepted, or
+        /// refused for a count that differs), with their LOD records,
+        /// handlers, near bitsets on every third; 8 hide bitsets.
+        fn add_batches(&mut self, k: usize, max: u32, cpu_every: usize) {
+            for b in 0..k {
+                let n = 1 + (b as u32 * 7) % max;
+                let records = self.alloc(64 * n as usize);
+                for i in 0..16 * u64::from(n) {
+                    self.put(records + 4 * i, ((b as u64 * 31 + i) % 97) as f32 * 0.5);
+                }
+                let lodrec = self.alloc(140);
+                for i in 0..35u64 {
+                    self.put(lodrec + 4 * i, (b as u64 + i) as f32);
+                }
+                let desc = self.alloc(0x90);
+                self.put(desc + 8, n);
+                let kind_s = b % cpu_every != 1;
+                if kind_s {
+                    let l = self.alloc(0xA0);
+                    self.put(l + 0x90, records);
+                    self.put(l + 0x98, if b % 10 == 4 { n as u16 + 1 } else { n as u16 });
+                    self.put(desc, l);
+                    self.put(desc + 0x68, 0x5555_0000u64 + b as u64);
+                } else {
+                    self.put(desc + 0x78, records);
+                }
+                // A second desc over the same records (kind C, one fewer).
+                let alt = self.alloc(0x90);
+                self.put(alt + 8, n.max(2) - 1);
+                self.put(alt + 0x78, records);
+                let handler = self.alloc(0x340);
+                self.put(handler + 0x228, b as u32);
+                self.put(handler + 0x33C, (b % 7) as u16);
+                let rec = self.alloc(0xA4);
+                self.put(rec, desc);
+                self.put(rec + 8, handler + 0x2C4);
+                self.put(rec + 0x10, lodrec);
+                self.put(rec + 0xA0, 1u32 << (15 + b % 4) | 7);
+                if b % 3 == 0 {
+                    let p = self.bitset(n.div_ceil(32), b as u32);
+                    self.put(rec + 0x20, p);
+                }
+                let icdraw = self.alloc(16);
+                self.put(icdraw, rec);
+                self.put(icdraw + 8, (b % 4) as u32);
+                self.batches.push(FakeBatch { icdraw, rec, desc, alt, records, n, kind_s });
+            }
+            for h in 0..8u32 {
+                let p = self.bitset(2, 1000 + h);
+                self.hides.push(p);
+            }
         }
     }
 
     fn state(f: &Fake, thin: bool, census: bool) -> State {
+        state_with(f, thin, census, false)
+    }
+
+    fn state_with(f: &Fake, thin: bool, census: bool, cache: bool) -> State {
         let (tx, _rx) = mpsc::channel::<Capture>();
-        let cfg = Config { dir: std::env::temp_dir(), frames: 3, max: 100_000, at: Vec::new(), raw: 0, render: true, seq: false, skinlog: 0, census, auto: None, auto_veh: 0, cut_present: false, pack: false, scan_exit: false, hookin: false };
-        State { cfg, title: 0, tls_index: 0, g: f.g, base: AtomicU64::new(0), wait_world: false, done: AtomicBool::new(false), pending: AtomicU64::new(u64::MAX), slots: Mutex::new(Vec::new()), sent: AtomicU64::new(u64::MAX), late: [AtomicU64::new(0), AtomicU64::new(0)], tx: Mutex::new(tx), thin }
+        let cfg = Config { dir: std::env::temp_dir(), frames: 3, max: 100_000, at: Vec::new(), raw: 0, render: true, seq: false, skinlog: 0, census, auto: None, auto_veh: 0, cut_present: false, pack: false, scan_exit: false, hookin: false, clock: Vec::new(), clock_frames: 1 };
+        State { cfg, title: 0, tls_index: 0, g: f.g, base: AtomicU64::new(0), wait_world: false, done: AtomicBool::new(false), pending: AtomicU64::new(u64::MAX), slots: Mutex::new(Vec::new()), sent: AtomicU64::new(u64::MAX), late: [AtomicU64::new(0), AtomicU64::new(0)], tx: Mutex::new(tx), thin, cache }
     }
 
     /// The title's recording threads: long-lived (their caches stay warm
@@ -497,6 +595,11 @@ mod tests {
 
     impl<'a> Title<'a> {
         fn start<'s>(sc: &'s std::thread::Scope<'s, 'a>, f: &'a Mutex<Fake>, s: &'a State, threads: usize, draws: usize) -> Title<'a> {
+            Title::start_with(sc, f, s, threads, draws, true)
+        }
+
+        /// `inst` false: the same draws without their instanced calls (a baseline).
+        fn start_with<'s>(sc: &'s std::thread::Scope<'s, 'a>, f: &'a Mutex<Fake>, s: &'a State, threads: usize, draws: usize, inst: bool) -> Title<'a> {
             let (dtx, done) = mpsc::channel();
             let go = (0..threads)
                 .map(|t| {
@@ -507,9 +610,9 @@ mod tests {
                             for i in 0..draws {
                                 let (geom, tls, ic) = {
                                     let mut f = f.lock().unwrap();
-                                    (f.set(t, t * draws + i, now), f.threads[t][0], f.icdraw)
+                                    (f.set(t, t * draws + i, now), f.threads[t][0], f.icdraw_of(t * draws + i))
                                 };
-                                hook_with(s, now, geom, 0x1_4000_1000 + i as u64, (i % 3 == 0).then_some(ic), tls);
+                                hook_with(s, now, geom, 0x1_4000_1000 + i as u64, (inst && i % 3 == 0).then_some(ic), tls);
                             }
                             let _ = dtx.send(());
                         }
@@ -669,6 +772,176 @@ mod tests {
             let _ = line();
             eprintln!("hook on the title's threads, cold frame, 5 x {DRAWS} draws: full {:.3} us a draw [{}]; thin {:.3} us a draw [{}]; thin decode {:.2} ms wall a frame ({:.3} us a draw, {} threads)", best_full.0, best_full.1, best_thin.0, best_thin.1, best_decode.0, best_decode.1, threads());
             assert!(best_thin.0 < best_full.0 || !std::env::var("XNW_TEST_TIMING").is_ok_and(|v| v == "1"));
+        });
+    }
+
+    /// What the title changes between the frames of the cache test, before frame `now`.
+    fn mutate(f: &mut Fake, now: u64, threads: usize, draws: usize) {
+        let k = f.batches.len();
+        // SAFETY: a qword inside the fake's arena.
+        let rd = |at: u64| unsafe { (at as *const u64).read_unaligned() };
+        for (b, fb) in f.batches.clone().into_iter().enumerate() {
+            match now {
+                // Descs swapped (rec+0), then back.
+                9 | 11 if b % 5 == 1 => f.put(fb.rec, if now == 9 { fb.alt } else { fb.desc }),
+                // LOD masks (rec+0xA0).
+                10 if b % 4 == 2 => f.put(fb.rec + 0xA0, 1u32 << (15 + (b + 1) % 4) | 7),
+                // A desc changed in place (kind C, one fewer), its drawables unloaded.
+                11 if b % 6 == 3 => {
+                    f.put(fb.desc + 8, fb.n.max(2) - 1);
+                    // Every drawable an instanced draw of the batch has (Title::start: draw i of thread t is g = t * draws + i).
+                    for g in (0..threads).flat_map(|t| (0..draws).step_by(3).map(move |i| t * draws + i)).filter(|g| g / 3 % k == b) {
+                        crate::worldahead::test_unload(0x1234_0000 + g as u64);
+                    }
+                }
+                // LOD records moved (rec+0x10: the next batch's).
+                12 if b % 7 == 5 => {
+                    let other = rd(f.batches[(b + 1) % k].rec + 0x10);
+                    f.put(fb.rec + 0x10, other);
+                }
+                _ => {}
+            }
+            // CPU records rewritten (kind C: copied every frame).
+            if now == 10 && !fb.kind_s {
+                f.put(fb.records, now as f32);
+            }
+        }
+        if now == 10 {
+            for h in f.hides.clone() {
+                let bits = rd(h);
+                f.put(bits, 0xFFFF_0000u32);
+            }
+        }
+    }
+
+    /// The instance-batch cache (`XNW_HOOK_CACHE=on`, instcache.rs) gives
+    /// every draw, instance block, LOD record and bitset of the uncached hook,
+    /// and its counts, over 7 frames in which the title swaps descs (rec+0),
+    /// LOD masks (rec+0xA0) and LOD records (rec+0x10), rewrites hide bits and
+    /// CPU records, and changes a desc in place with its drawables unloaded.
+    #[test]
+    fn cached_instances_equal_the_uncached_hook() {
+        let _heavy = super::super::tests::heavy();
+        const THREADS: usize = 3;
+        const DRAWS: usize = 700;
+        let salt = Instant::now().elapsed().as_nanos() as u64 ^ 0xCAC4_0000_0000;
+        let mut fk = Fake::new(96, 192, THREADS, 900, 400, salt << 20);
+        fk.add_batches(240, 40, 2);
+        let f = Mutex::new(fk);
+        let (plain, cached) = {
+            let g = f.lock().unwrap();
+            (state_with(&g, false, true, false), state_with(&g, false, true, true))
+        };
+        let s0 = super::super::instcache::stats();
+        std::thread::scope(|sc| {
+            let (ta, tb) = (Title::start(sc, &f, &plain, THREADS, DRAWS), Title::start(sc, &f, &cached, THREADS, DRAWS));
+            for now in 7u64..=13 {
+                mutate(&mut f.lock().unwrap(), now, THREADS, DRAWS);
+                let mut a = ta.frame(now);
+                let mut b = tb.frame(now);
+                assert_eq!((a.len(), b.len()), (THREADS, THREADS));
+                a.sort_by_key(|c| c.draws.first().map(|d| d.drawable));
+                b.sort_by_key(|c| c.draws.first().map(|d| d.drawable));
+                let (mut inst, mut blocks, mut masked, mut near) = (0, 0, 0, 0);
+                let mut calls = [0u64; 7];
+                for (ca, cb) in a.iter().zip(&b) {
+                    assert_eq!(ca.draws.len(), cb.draws.len());
+                    for (da, db) in ca.draws.iter().zip(&cb.draws) {
+                        assert_eq!(fields(da), fields(db), "draw {} of frame {now}", da.seq_no);
+                        if let Some(i) = da.inst {
+                            inst += 1;
+                            blocks += usize::from(i.block != NO_PAL);
+                            masked += usize::from(i.mask != NO_PAL);
+                            near += usize::from(i.near != NO_PAL);
+                        }
+                    }
+                    let bytes = |c: &Capture| c.inst_list.iter().map(|x| x.as_slice().to_vec()).collect::<Vec<_>>();
+                    assert_eq!(bytes(ca), bytes(cb), "instance blocks of frame {now}");
+                    assert_eq!(ca.inst_src, cb.inst_src);
+                    let lods = |c: &Capture| c.lod_list.clone();
+                    assert_eq!(lods(ca), lods(cb), "LOD records of frame {now}");
+                    assert_eq!(ca.mask_list, cb.mask_list, "bitsets of frame {now}");
+                    assert_eq!((ca.inst_calls, ca.copied), (cb.inst_calls, cb.copied), "counts of frame {now}");
+                    for (x, y) in calls.iter_mut().zip(ca.inst_calls) {
+                        *x += y;
+                    }
+                }
+                eprintln!("frame {now}: {inst} instanced draws equal ({blocks} with a block, {masked} hide-masked, {near} near-masked; calls {calls:?})");
+                assert!(inst > 500 && blocks > 300 && masked > 300 && near > 100 && calls[0] > 50 && calls[1] > 100 && calls[3] > 10, "the fixture covers every path");
+                for c in a.into_iter().chain(b) {
+                    c.recycle();
+                }
+            }
+            drop((ta, tb));
+        });
+        let s1 = super::super::instcache::stats();
+        let d: [u64; 5] = std::array::from_fn(|k| s1[k] - s0[k]);
+        eprintln!("instance cache: {} hits, {} decoded ({} stale), {} unloaded", d[0], d[1], d[2], d[3]);
+        assert!(d[0] > 2000 && d[2] > 50 && d[3] > 10, "hits, stale entries and unloads all seen: {d:?}");
+    }
+
+    /// The hook's instances part on the title's threads, uncached against
+    /// cached, over memory cold at each frame's start (a 64 MiB sweep): 5
+    /// threads x 1,200 draws, every third an instanced call over 600 batches
+    /// of 1-64 instances; best of 5 frames each, the two in turn.
+    #[test]
+    fn instance_cache_cost_cold() {
+        let _heavy = super::super::tests::heavy();
+        const THREADS: usize = 5;
+        const DRAWS: usize = 1_200;
+        let salt = Instant::now().elapsed().as_nanos() as u64 ^ 0xCAC5_0000_0000;
+        let mut fk = Fake::new(320, 4160, THREADS, 6_000, 3_000, salt << 20);
+        fk.add_batches(600, 64, 6);
+        let f = Mutex::new(fk);
+        let (plain, cached) = {
+            let g = f.lock().unwrap();
+            (state_with(&g, false, false, false), state_with(&g, false, false, true))
+        };
+        let mut sweep = vec![0u64; 8 << 20];
+        let mut cold = |k: u64| {
+            for (i, w) in sweep.iter_mut().enumerate().step_by(8) {
+                *w = w.wrapping_add(i as u64 ^ k);
+            }
+            std::hint::black_box(&sweep);
+        };
+        // (instanced calls ms, every one timed; hook ms; instanced draws) of a frame.
+        let cost = |cs: &[Capture]| {
+            let inst = cs.iter().map(|c| c.inst_ns).sum::<u64>() as f64 / 1e6;
+            let hook = cs.iter().map(|c| c.hook_ns).sum::<u64>() as f64 / 1e6;
+            (inst, hook, cs.iter().flat_map(|c| &c.draws).filter(|d| d.inst.is_some()).count())
+        };
+        std::thread::scope(|sc| {
+            let (ta, tb) = (Title::start(sc, &f, &plain, THREADS, DRAWS), Title::start(sc, &f, &cached, THREADS, DRAWS));
+            for c in ta.frame(1).into_iter().chain(tb.frame(1)) {
+                c.recycle();
+            }
+            // Best instanced-calls ms of [uncached, cached] x [cold, warm] frames.
+            let mut best = [[f64::MAX; 2]; 2];
+            let mut calls = 0;
+            for round in 0..40u64 {
+                for (k, t) in [&ta, &tb].into_iter().enumerate() {
+                    // Even rounds cold; odd rounds as warm as the frame before left them.
+                    let w = (round % 2) as usize;
+                    if w == 0 {
+                        cold(2 * round + k as u64);
+                    }
+                    let cs = t.frame(2 + 2 * round + k as u64);
+                    let (ms, _, n) = cost(&cs);
+                    best[k][w] = best[k][w].min(ms);
+                    calls = n;
+                    for c in cs {
+                        c.recycle();
+                    }
+                }
+            }
+            drop((ta, tb));
+            let us = |ms: f64| ms * 1e3 / calls.max(1) as f64;
+            let cut = |w: usize| 100.0 * (1.0 - best[1][w] / best[0][w]);
+            eprintln!(
+                "instanced calls on the title's threads, {THREADS} x {DRAWS} draws, {calls} calls a frame: cold frame {:.3} ms ({:.3} us a call) uncached, {:.3} ms ({:.3} us) cached: -{:.0} %; warm frame {:.3} ms ({:.3} us) uncached, {:.3} ms ({:.3} us) cached: -{:.0} %",
+                best[0][0], us(best[0][0]), best[1][0], us(best[1][0]), cut(0), best[0][1], us(best[0][1]), best[1][1], us(best[1][1]), cut(1)
+            );
+            assert!(best[1][0] < best[0][0] || !std::env::var("XNW_TEST_TIMING").is_ok_and(|v| v == "1"));
         });
     }
 }

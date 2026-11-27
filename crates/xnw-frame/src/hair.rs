@@ -82,10 +82,14 @@ pub fn hair_cmd(args: &[String]) -> Result<(), String> {
     // Frame directories (the lab appends `--adapter hw`: its value is no directory).
     let dirs: Vec<&String> = args.iter().filter(|a| !a.starts_with("--") && Path::new(a).is_dir()).collect();
     if dirs.is_empty() {
-        return Err("usage: xnw-lab hair <frame dirs...> [--draws] [--chain-refs]".into());
+        return Err("usage: xnw-lab hair <frame dirs...> [--draws] [--chain-refs] [--ribbons]".into());
     }
     if args.iter().any(|a| a == "--chain") {
         return dirs.iter().try_for_each(|d| crate::hair_chain::chain_cmd(Path::new(d)).map(|_| ()));
+    }
+    // HAIR10: our guide ribbons from the frame's strand records (CPU only).
+    if args.iter().any(|a| a == "--ribbons") {
+        return dirs.iter().try_for_each(|d| crate::hair_ribbon::ribbons_cmd(Path::new(d), (1920, 1080)));
     }
     if args.iter().any(|a| a == "--chain-refs") {
         return dirs.iter().try_for_each(|d| chain_refs(Path::new(d)));
@@ -156,7 +160,7 @@ pub fn bridge_cli(args: &[String], dir: &Path, host: &xnw_gpu::host::Host, size:
         let rgba: Vec<u8> = union.depth.iter().flat_map(|&z| if z != union.far { [255, 140, 20, 255] } else { [0, 0, 0, 255] }).collect();
         crate::replay::write_png(Path::new(out), size.0, size.1, &rgba).map_err(|e| e.to_string())?;
     }
-    println!("hair bridge: {n} strand draws run, {} pixels covered in all", union.covered());
+    println!("hair bridge: {n} strand draws run, {} pixels covered in all, depth hash {:08x}", union.covered(), union.hash());
     Ok(union)
 }
 
@@ -188,10 +192,16 @@ pub fn draw_strands(p: &Pack, host: &xnw_gpu::host::Host, size: (u32, u32), chai
         if probe && let Some(pool) = loaded.slot_bytes_mut(0, hair::POINTS_SLOT) {
             probe_points(s, pool);
         }
-        if let Some(c) = chain
-            && let Some(pool) = loaded.slot_bytes_mut(0, hair::POINTS_SLOT)
-        {
-            pool.clone_from(&c.pool);
+        if let Some(c) = chain {
+            match loaded.slot_bytes_mut(0, hair::POINTS_SLOT) {
+                Some(pool) => pool.clone_from(&c.pool),
+                // HAIR7: a live pack leaves the pool in place (no bytes): the chain's pool stands there.
+                None => {
+                    if let Some(kind) = pool_kind(p, s.sink, &used) {
+                        loaded.set_buffer(0, hair::POINTS_SLOT, kind, c.pool.clone());
+                    }
+                }
+            }
         }
         let lacks: Vec<&String> = loaded.lacks.iter().filter(|l| !l.starts_with("the group count") && !l.starts_with("sampler heap") && !l.starts_with("the targets")).collect();
         let d = loaded.draw();
@@ -232,6 +242,109 @@ pub fn draw_strands(p: &Pack, host: &xnw_gpu::host::Host, size: (u32, u32), chai
     Ok((union, lines, draws.len()))
 }
 
+/// HAIR7, the live path: every main-view strand draw of `p` as
+/// [`draw_strands`] draws them, the chain's pool read where the chain wrote
+/// it on our device (`pool`, `Runner::resource`; none: the view reads as
+/// the record has it), and all of one vertex program's draws in one
+/// submission into one depth target (`xnw_world::bridge::run_vertex_batch`):
+/// no pool copy, no target and readback a draw. The union is the same: the
+/// nearest strand per pixel. One vertex program (every capture so far): its
+/// depth stays on the device for our pass ([`Drawn::device`]); `read`, or
+/// more than one program: read back as well ([`Drawn::read`], their union).
+pub fn draw_strands_device(p: &Pack, host: &xnw_gpu::host::Host, size: (u32, u32), chain: &crate::hair_chain::Chain, pool: Option<&xnw_world::bridge::DeviceBuffer>, vertex: &mut Vertex, read: bool) -> Result<Drawn, String> {
+    let (draws, c) = strands(p, None);
+    let mut lines = vec![format!("{}: {}", p.dir.display(), c.line())];
+    let counts = std::sync::Arc::new([const { std::sync::atomic::AtomicU64::new(0) }; 3]);
+    let mut texels = p.texel_provider(counts);
+    let mut union = Strands { depth: vec![0.0; (size.0 * size.1) as usize], far: 0.0 };
+    let mut shared = xnw_world::bridge::Shared::default();
+    // The view's address as `Loaded::addrs` gives it (the GPU alias folded onto the CPU view).
+    let fold = xnw_core::pair::fold;
+    if let Some(b) = pool {
+        shared.put_device(fold(chain.pool_at), b);
+    }
+    // (vertex program, its translation, the draw's record as bindings, (vertices, instances, strip))
+    let mut loads: Vec<(u128, xnw_world::bridge::Programs, crate::bridge::Loaded, (u32, u32, bool))> = Vec::new();
+    for s in &draws {
+        let vs = crate::bridge::vertex_container(p, s.sink)?;
+        let (prog, used) = match vertex.entry(vs).or_insert_with(|| crate::bridge::vertex_program(p, s.sink, 0, 0, true).map(|(prog, used, _)| (prog, used))) {
+            Ok((prog, used)) => (prog.clone(), used.clone()),
+            Err(e) => return Err(e.clone()),
+        };
+        let mut loaded = crate::bridge::load(p, s.sink, &crate::bridge::Row::default(), None, &used, &mut texels);
+        // The pool slot stands for the chain's pool on the device: its bytes
+        // are never put there (zero pages the allocator maps on touch).
+        if pool.is_some()
+            && let Some(kind) = pool_kind(p, s.sink, &used)
+        {
+            loaded.set_buffer(0, hair::POINTS_SLOT, kind, vec![0; chain.pool_len as usize]);
+        }
+        loads.push((vs, prog, loaded, (s.draw.vertices, s.group.strands, true)));
+    }
+    for l in &loads {
+        shared.addrs.extend(l.2.addrs());
+    }
+    let target = xnw_world::bridge::Target { width: size.0, height: size.1, depth: Some((true, 7)), limit: if host.caps.software { 120.0 } else { 1.0 }, depth_only: true, records: false };
+    let mut programs: Vec<u128> = loads.iter().map(|l| l.0).collect();
+    programs.sort_unstable();
+    programs.dedup();
+    let read = read || programs.len() > 1;
+    let mut out = Drawn { read: None, device: None, lines: Vec::new(), draws: draws.len() };
+    let ds: Vec<_> = loads.iter().map(|l| l.2.draw()).collect();
+    for vs in programs {
+        let mut batch = Vec::new();
+        let mut first = None;
+        for (l, d) in loads.iter().zip(&ds).filter(|(l, _)| l.0 == vs) {
+            let b = xnw_world::bridge::bind(&l.1.ms, &l.1.ps, d)?;
+            batch.push((b, l.3));
+            first.get_or_insert(l);
+        }
+        let Some(l) = first else { continue };
+        let prog = xnw_world::bridge::Programs { vertex: Some(l.3), ..l.1.clone() };
+        let pairs: Vec<(&xnw_world::bridge::Binding, (u32, u32, bool))> = batch.iter().map(|(b, c)| (b, *c)).collect();
+        crate::replay::watchdog_arm();
+        let f = xnw_world::bridge::run_vertex_batch(host, &prog, &pairs, &target, &mut shared, read);
+        crate::replay::watchdog_disarm();
+        let (f, kept) = f?;
+        union.far = f.far;
+        let mut n = 0;
+        for (i, z) in f.depth.iter().enumerate() {
+            if *z != f.far {
+                n += 1;
+                union.depth[i] = if union.depth[i] == f.far { *z } else { union.depth[i].max(*z) };
+            }
+        }
+        let px = if read { format!("{n} pixels") } else { "depth kept on the device".to_string() };
+        lines.push(format!("vs {:08x}: {} strand draws in one submission on {} in {:.3} s: {px}; pool views on the device {}", vs >> 96, pairs.len(), host.caps.adapter, f.seconds, shared.on_device));
+        out.device = Some(kept);
+    }
+    out.lines = lines;
+    if read {
+        out.read = Some(union);
+    }
+    Ok(out)
+}
+
+/// HAIR7: how the strand draw `sink` binds the pool view (frame table
+/// slot 15), as `bridge::load` binds a buffer view; None: no pool view.
+fn pool_kind(p: &Pack, sink: u32, used: &HashMap<(u16, u32), u32>) -> Option<xnw_world::preskin::Kind> {
+    let v = p.tables(sink).into_iter().find(|t| t.0 == 0)?.2.into_iter().find(|v| v.slot == hair::POINTS_SLOT)?;
+    Some(match (v.kind, v.format, used.get(&(0, hair::POINTS_SLOT))) {
+        (fp::view::BUFFER, f, _) if f != 0 && f != 39 => xnw_world::preskin::Kind::Typed { format: f as i32, bytes: v.width.max(1) as u32 },
+        (_, _, Some(&stride)) if stride > 4 && stride != u32::MAX => xnw_world::preskin::Kind::Structured(stride),
+        _ => xnw_world::preskin::Kind::Raw,
+    })
+}
+
+/// HAIR7: [`draw_strands_device`]'s result: the union read back (when
+/// asked), the last program's depth on the device, the lines, the strand draws.
+pub struct Drawn {
+    pub read: Option<Strands>,
+    pub device: Option<xnw_world::hair::StrandDepth>,
+    pub lines: Vec<String>,
+    pub draws: usize,
+}
+
 /// The strand draws' pixels: per pixel the nearest strand's depth (reverse
 /// depth, as the pass: the greatest), `far` where no strand drew.
 #[derive(Clone, Debug, Default)]
@@ -243,6 +356,12 @@ pub struct Strands {
 impl Strands {
     pub fn covered(&self) -> usize {
         self.depth.iter().filter(|z| **z != self.far).count()
+    }
+
+    /// The depth target's first 32 bits of `hash128` (the replay's and the live line's, LIVE1).
+    pub fn hash(&self) -> u32 {
+        let b: Vec<u8> = self.depth.iter().flat_map(|z| z.to_le_bytes()).collect();
+        (xnw_core::hash128(&[&b]) >> 96) as u32
     }
 
     /// Whether pixel `i` shows a strand over `scene` (our pass's depth): the

@@ -25,6 +25,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
+use xnw_core::pair::Pair;
 use xnw_formats::framepack::{self as fp, kind, reason, view};
 use xnw_world::bridge::{self, Draw, Root, Slot};
 use xnw_world::preskin::{Kind, View};
@@ -36,8 +37,6 @@ use crate::le32;
 use crate::load::load_list;
 use crate::pack::Pack;
 
-/// A buffer's address as the title's GPU sees it, past its CPU address.
-const GPU_ALIAS: u64 = 0x4_0000_0000;
 /// The frame table's slot of the buffer holding the bindless words.
 const BINDLESS_SLOT: u32 = 86;
 /// Bindless words written when the capture has none.
@@ -81,6 +80,8 @@ pub struct Loaded {
     /// (root, slot): the copy's length and the ranges written (the row's own
     /// words; [`bridge::TitleView`], ZC3).
     own: HashMap<(u16, u32), (usize, Vec<(usize, usize)>)>,
+    /// The paired reservation the row's addresses fold by ([`Row::pair`]).
+    pair: Pair,
 }
 
 /// Range `r` of slot `key`'s bytes written by `load` over a copy of
@@ -100,7 +101,7 @@ impl Loaded {
     /// Each view's copied length and the ranges `load` wrote as the row's
     /// own words go with it (ZC3): the rest of its bytes is padding.
     pub fn addrs(&self) -> Vec<(usize, bridge::TitleView)> {
-        let fold = |a: u64| if (0x5_0000_0000..0x9_0000_0000).contains(&a) { a - GPU_ALIAS } else { a };
+        let fold = |a: u64| self.pair.fold(a);
         self.addrs
             .iter()
             .filter_map(|&(root, slot, addr)| match self.roots.get(usize::from(root)) {
@@ -117,7 +118,7 @@ impl Loaded {
     /// The title ranges (address, bytes, unit) of the binding's table buffer
     /// views of at least `min` bytes, as [`Loaded::addrs`] folds them.
     pub fn ranges(&self, min: usize) -> Vec<(u64, u64, u64)> {
-        let fold = |a: u64| if (0x5_0000_0000..0x9_0000_0000).contains(&a) { a - GPU_ALIAS } else { a };
+        let fold = |a: u64| self.pair.fold(a);
         self.addrs
             .iter()
             .filter_map(|&(root, slot, addr)| match self.roots.get(usize::from(root)) {
@@ -221,11 +222,14 @@ pub struct Row {
     /// its first bone, bytes): the bones around the draw's own (wheels'
     /// instance bases).
     pub window: Option<(u64, Vec<u8>)>,
+    /// The paired reservation its addresses fold by: the one published
+    /// (`xnw_core::pair`, ALIAS1), else the default.
+    pub pair: Pair,
 }
 
 impl Row {
     pub fn of(r: &DrawRecord) -> Row {
-        Row { mesh_at: r.geom.mesh_at, vb_at: r.geom.vb_at, handles: std::iter::once(r.material.albedo_desc).chain(r.material.layers).collect(), palette: None, window: None }
+        Row { mesh_at: r.geom.mesh_at, vb_at: r.geom.vb_at, handles: std::iter::once(r.material.albedo_desc).chain(r.material.layers).collect(), palette: None, window: None, pair: xnw_core::pair::pair() }
     }
 
     /// The same, with the hook's palette span of hook draw `draw` and the
@@ -252,14 +256,15 @@ const STAND_IN_AT: u64 = 0xF000_0000_0000;
 /// the list's copy of the row's vertex buffer; `texels` gives a texture by
 /// its descriptor handle.
 pub fn load(pack: &Pack, sink: u32, row: &Row, vb: Option<&[u8]>, used: &HashMap<(u16, u32), u32>, texels: &mut Provider) -> Loaded {
-    let mut out = Loaded::default();
+    let mut out = Loaded { pair: row.pair, ..Loaded::default() };
     let put = |roots: &mut Vec<LRoot>, i: u16, r: LRoot| {
         if roots.len() <= usize::from(i) {
             roots.resize_with(usize::from(i) + 1, LRoot::default);
         }
         roots[usize::from(i)] = r;
     };
-    let bytes = |r: &fp::Ref| reason::has_bytes(r.reason).then(|| pack.blob(r.hash)).flatten();
+    // HAIR7: `bytes_of` also reads a view a live sink left in place.
+    let bytes = |r: &fp::Ref| pack.bytes_of(r);
     for r in pack.data.refs_of(sink) {
         match r.kind {
             kind::ROOTS => {
@@ -269,7 +274,7 @@ pub fn load(pack: &Pack, sink: u32, row: &Row, vb: Option<&[u8]>, used: &HashMap
             }
             kind::ROOT_VIEW => match (bytes(r), vb) {
                 (Some(b), _) => put(&mut out.roots, r.slot, LRoot::View(b)),
-                (None, Some(vb)) if r.addr == row.vb_at || r.addr == row.vb_at + GPU_ALIAS => {
+                (None, Some(vb)) if r.addr == row.vb_at || r.addr == row.pair.to_gpu(row.vb_at) => {
                     out.lacks.push(format!("root view {} at {:#x} (reason {}): the list's vertex buffer {:#x} ({} B) stands in", r.slot, r.addr, r.reason, row.vb_at, vb.len()));
                     put(&mut out.roots, r.slot, LRoot::View(vb.to_vec()));
                 }
@@ -284,6 +289,15 @@ pub fn load(pack: &Pack, sink: u32, row: &Row, vb: Option<&[u8]>, used: &HashMap
             let wanted = used.get(&(root, v.slot));
             match v.kind {
                 view::CONSTANT | view::BUFFER | view::PLACED_BUFFER => {
+                    // HAIR7: a large view a live sink left in place that the
+                    // programs do not name is not read (as a large copy is not bound).
+                    let at = fp::table_slot(u32::from(root), v.slot);
+                    if wanted.is_none() && pack.data.refs_of(sink).any(|r| r.kind == kind::BUFFER && r.slot == at && Pack::in_place(r)) {
+                        if v.addr != 0 {
+                            out.addrs.push((root, v.slot, v.addr));
+                        }
+                        continue;
+                    }
                     let got = pack.slot_bytes(sink, root, v.slot).ok().map(|(_, b)| b);
                     let got = if (root, v.slot) == PALETTE {
                         let (before, mut placed) = (got.as_ref().map_or(0, Vec::len), Vec::new());
@@ -310,7 +324,7 @@ pub fn load(pack: &Pack, sink: u32, row: &Row, vb: Option<&[u8]>, used: &HashMap
                         }
                         continue;
                     };
-                    if v.addr.wrapping_sub(row.mesh_at) % GPU_ALIAS == 0 && v.addr >= row.mesh_at {
+                    if v.addr >= row.mesh_at && row.pair.same(v.addr, row.mesh_at) {
                         out.groups = le32(&b, 0) & 0x1FFFF;
                     }
                     if wanted.is_none() && b.len() > SMALL {
@@ -367,7 +381,7 @@ pub fn load(pack: &Pack, sink: u32, row: &Row, vb: Option<&[u8]>, used: &HashMap
 fn palette(row: &Row, v: &fp::SlotView, got: Option<Vec<u8>>, lacks: &mut Vec<String>, placed: &mut Vec<(usize, usize)>) -> Option<Vec<u8>> {
     let Some((at, bones)) = row.palette.as_ref().filter(|p| !p.1.is_empty()) else { return got };
     let place = |at: u64, len: usize| {
-        let off = (at % GPU_ALIAS).wrapping_sub(v.addr % GPU_ALIAS);
+        let off = row.pair.fold(at).wrapping_sub(row.pair.fold(v.addr));
         (off % 48 == 0 && off + len as u64 <= v.bytes).then_some(off as usize)
     };
     let Some(off) = place(*at, bones.len()) else {
@@ -693,7 +707,7 @@ pub fn pixel_refused(pack: &Pack, hashes: &[u128; 2], software: bool) -> Option<
 /// The table slots a console container's programs name, with the widest
 /// stride each is read at, into `used`; `wave` becomes 64 for a mesh
 /// program of 64-lane waves.
-pub(crate) fn named(container: &[u8], used: &mut HashMap<(u16, u32), u32>, wave: &mut u32) -> Result<(), String> {
+pub fn named(container: &[u8], used: &mut HashMap<(u16, u32), u32>, wave: &mut u32) -> Result<(), String> {
     let parsed = xnw_shader::Container::parse(container).map_err(|e| e.to_string())?;
     let part = parsed.part(xnw_shader::FourCC::DXIL).ok_or("no DXIL part")?;
     for p in xnw_shader::native_programs(part.data).map_err(|e| e.to_string())? {
@@ -1250,10 +1264,18 @@ mod tests {
     /// bindless buffer at slot 86 among 70 views) and a per-draw table (the
     /// meshlet buffer by its GPU address, a constant buffer, a large view
     /// nobody names). The record comes back as a binding input, with the
-    /// stand-ins named.
+    /// stand-ins named. ALIAS1: by the default pair and by a moved one.
     #[test]
     fn a_record_as_a_binding_input() {
-        let root = std::env::temp_dir().join(format!("xnw-frame-bridge-{}", std::process::id()));
+        record_as_binding_input(Pair::DEFAULT, "default");
+        record_as_binding_input(Pair { cpu: 0x1_0000_0000, gpu: 0x6_6720_0000, len: 0x4_0000_0000 }, "moved");
+    }
+
+    /// The made-up frame of [`a_record_as_a_binding_input`] at the
+    /// addresses of `pair`'s views.
+    fn record_as_binding_input(pair: Pair, tag: &str) {
+        let (mesh_at, vb_at) = (pair.cpu + 0x5000, pair.cpu + 0x8000);
+        let root = std::env::temp_dir().join(format!("xnw-frame-bridge-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let dir = root.join("frame-0001");
         let blobs = fp::blob_dir(&dir);
@@ -1264,19 +1286,19 @@ mod tests {
         put(1, &[0x96, 0x60, 0, 0x10, 0x40, 0, 0, 0]);
         put(2, &fp::encode_slots(&frame));
         put(3, &[9; 8]);
-        put(4, &fp::encode_slots(&[buf(2, 0x5000 + GPU_ALIAS, 16), SlotView { slot: 0, kind: view::CONSTANT, addr: 0x6000, bytes: 32, ..SlotView::default() }, buf(5, 0x7000, 1 << 20)]));
+        put(4, &fp::encode_slots(&[buf(2, pair.to_gpu(mesh_at), 16), SlotView { slot: 0, kind: view::CONSTANT, addr: 0x6000, bytes: 32, ..SlotView::default() }, buf(5, 0x7000, 1 << 20)]));
         put(5, &[3, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         put(6, &[7; 32]);
         put(7, &vec![1; SMALL + 4]);
         put(8, &fp::encode_slots(&[SlotView { slot: 300, kind: view::PLACED, addr: 0x9000, bytes: 64, ..SlotView::default() }]));
         let r = |kind, slot, hash| Ref { owner: 0, kind, slot, addr: 0, len: 0, reason: 0, hash };
-        let mut refs = vec![r(kind::ROOTS, 4, 1), Ref { addr: 0x8000 + GPU_ALIAS, reason: reason::IMPLAUSIBLE, ..r(kind::ROOT_VIEW, 3, 0) }, Ref { addr: 0x10_0000, ..r(kind::TABLE, 0, 2) }, Ref { addr: 0x20_0000, ..r(kind::TABLE, 1, 4) }, r(kind::BUFFER, 96 + 2, 5), r(kind::CBV, 96, 6), r(kind::BUFFER, 96 + 5, 7), Ref { owner: fp::FRAME_SCOPE, addr: 0x4_0000, ..r(kind::HEAP_SLOT, 0, 8) }];
+        let mut refs = vec![r(kind::ROOTS, 4, 1), Ref { addr: pair.to_gpu(vb_at), reason: reason::IMPLAUSIBLE, ..r(kind::ROOT_VIEW, 3, 0) }, Ref { addr: 0x10_0000, ..r(kind::TABLE, 0, 2) }, Ref { addr: 0x20_0000, ..r(kind::TABLE, 1, 4) }, r(kind::BUFFER, 96 + 2, 5), r(kind::CBV, 96, 6), r(kind::BUFFER, 96 + 5, 7), Ref { owner: fp::FRAME_SCOPE, addr: 0x4_0000, ..r(kind::HEAP_SLOT, 0, 8) }];
         refs.extend((0..70).map(|s| r(kind::BUFFER, s, 3)));
         refs.push(Ref { reason: reason::CUT, ..r(kind::BUFFER, BINDLESS_SLOT as u16, 3) });
         let mut p = FramePack { manifest: Manifest { version: fp::VERSION, frame: 1, ..Manifest::default() }, refs, sinks: vec![Sink { index: 0, thread: 1, hook_draw: Some(0), op: fp::op::INDIRECT_MESH, count: 1, pipeline: 1 }], ..FramePack::default() };
         p.write(&dir).unwrap();
         let pack = Pack::open(&dir).unwrap().unwrap();
-        let row = Row { mesh_at: 0x5000, vb_at: 0x8000, handles: vec![0x4_0000 + 32 * 300, 0], palette: None, window: None };
+        let row = Row { mesh_at, vb_at, handles: vec![0x4_0000 + 32 * 300, 0], palette: None, window: None, pair };
         let used: HashMap<(u16, u32), u32> = [((1, 2), 0), ((1, 0), 0), ((0, BINDLESS_SLOT), 0)].into();
         let mut texels: Provider = Box::new(|h| (h == 0x4_0000 + 32 * 300).then(|| Provided { width: 1, height: 1, format: 28, rows: vec![0; 4], row_bytes: 4, row_count: 1, dim: xnw_world::textures::TEX_2D, depth: 1, mips: 1 }));
         let l = load(&pack, 0, &row, Some(&[5; 24]), &used, &mut texels);
@@ -1293,6 +1315,15 @@ mod tests {
         assert!(matches!(d.heap[..], [(300, Slot::Texture(_))]));
         for part in ["root view 3", "the group count", "the bindless words at slot 86 + 0x40", "sampler heap entries", "the targets' formats"] {
             assert!(l.lacks.iter().any(|x| x.contains(part)), "{part}: {:?}", l.lacks);
+        }
+        // The views fold onto the CPU view by the row's pair.
+        assert!(l.addrs().iter().any(|(_, v)| v.addr == mesh_at), "{tag}: the meshlet view's title address");
+        // Folded by another pair, the meshlet view and the root view are not the row's.
+        if pair != Pair::DEFAULT {
+            let other = Row { pair: Pair::DEFAULT, ..row };
+            let l = load(&pack, 0, &other, Some(&[5; 24]), &used, &mut texels);
+            assert_eq!(l.draw().groups, 0, "{tag} by the default pair");
+            assert!(l.lacks.iter().any(|x| x.contains("root view 3") && x.contains("nothing stands in")), "{:?}", l.lacks);
         }
         let _ = std::fs::remove_dir_all(root);
     }

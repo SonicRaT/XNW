@@ -98,7 +98,15 @@ fn parse_recipe(text: &str) -> Option<Recipe> {
             Some(ShaderRef { stage, form, hash, container })
         })
         .collect::<Option<Vec<_>>>()?;
-    let graphics = if state == "-" { None } else { Some(GraphicsState::decode(&unhex(state)?)?) };
+    let mut graphics = if state == "-" { None } else { Some(GraphicsState::decode(&unhex(state)?)?) };
+    // As the run makes it (`Desc::graphics_state`): no blending on integer
+    // targets. Recipes listed before 1efe0565 keep the title's blend there
+    // (SWEEP1: pipeline 80e918ca, WindshieldWiperMask, targets R32_FLOAT,
+    // B4G4R4A4_UNORM, R8_UINT with blend on target 2, refused 0x80070057 by
+    // the RX 5700 XT and WARP in `card-sweep`).
+    if let Some(g) = graphics.as_mut() {
+        g.apply_integer_blend_bypass();
+    }
     Some(Recipe { shaders, graphics })
 }
 
@@ -463,6 +471,102 @@ pub fn warm(s: &Settings) -> Result<Outcome, String> {
     }
     out.seconds = started.elapsed().as_secs_f64();
     Ok(out)
+}
+
+pub mod sweep {
+    //! SWEEP1: the card sweep's view of the pipeline list (`xnw card-sweep`,
+    //! apps/xnw `cardsweep.rs`): the listed pipelines, their programs read
+    //! from the pack, and one host pipeline made from a recipe exactly as
+    //! the prebuild makes it ([`HostPipeline::new`]), the driver compiling
+    //! it here and now (the library bypassed).
+    use super::*;
+
+    /// One listed pipeline: key, first use (ms after the story load), recipe.
+    pub struct Entry {
+        pub key: String,
+        pub ms: i64,
+        pub recipe: Option<String>,
+    }
+
+    /// One program of a recipe.
+    pub struct Program {
+        pub stage: &'static str,
+        /// The hash of the title's bytes (pipeline key, multiply-add list).
+        pub hash: u128,
+        /// The console container's hash, its pack name and bytes (None:
+        /// neither in the pack nor kept).
+        pub container_hash: u128,
+        pub name: Option<String>,
+        pub container: Option<Vec<u8>>,
+    }
+
+    /// The made pipeline: per program its translated DXIL (or why not),
+    /// then the creation (Ok, or the refusal) and its milliseconds.
+    pub struct Made {
+        pub dxil: Vec<Result<Vec<u8>, String>>,
+        pub create: Result<(), String>,
+        pub create_ms: f64,
+    }
+
+    /// The sweep's setup: the pack (else `XNW_SHADER_PACK`/`XNW_GAME_DRIVE`),
+    /// the cache folder, and the library bypassed from now on.
+    pub fn begin(pack: Option<PathBuf>) {
+        if let Some(p) = pack {
+            let _ = crate::d3d12x::pipeline::PACK_PATH.set(p);
+        }
+        crate::d3d12x::pipeline::init_cache_dir();
+        library::bypass();
+    }
+
+    /// The listed pipelines (`<cache>/pipelines/pipeline-list.txt`).
+    pub fn list() -> Vec<Entry> {
+        crate::d3d12x::pipeline::init_cache_dir();
+        library::rows().into_iter().map(|(key, r)| Entry { key, ms: r.ms, recipe: r.recipe }).collect()
+    }
+
+    /// The recipe's programs: (stage, title hash, container hash) only.
+    pub fn parse(recipe: &str) -> Option<Vec<(&'static str, u128, u128)>> {
+        Some(parse_recipe(recipe)?.shaders.iter().map(|s| (s.stage, s.hash, s.container)).collect())
+    }
+
+    /// The recipe's programs with their pack names and bytes.
+    pub fn programs(recipe: &str) -> Result<Vec<Program>, String> {
+        let r = parse_recipe(recipe).ok_or("recipe does not parse")?;
+        let pack = crate::d3d12x::pipeline::pack();
+        let dir = shader_cache::dir();
+        Ok(r.shaders
+            .iter()
+            .map(|s| {
+                let place = pack.and_then(|p| p.by_hash(s.container));
+                let container = place.and_then(|pl| pack?.container(pl)).or_else(|| dir.and_then(|d| shader_cache::kept_container(d, s.container)));
+                Program { stage: s.stage, hash: s.hash, container_hash: s.container, name: place.map(|pl| pl.name.clone()), container }
+            })
+            .collect())
+    }
+
+    /// The options the runtime translates a `stage` program with title
+    /// hash `hash` (`options_for`: the device's barycentrics included).
+    pub fn options(stage: &str, hash: u128) -> xnw_shader::emit::Options {
+        crate::d3d12x::pipeline::options_for(stage, hash)
+    }
+
+    /// Makes the recipe's host pipeline as the prebuild does.
+    pub fn make(recipe: &str, programs: &[Program]) -> Result<Made, String> {
+        let r = parse_recipe(recipe).ok_or("recipe does not parse")?;
+        let form = |f: u8| if f == 0 { Form::Container } else { Form::CacheCode };
+        let mut shaders = Vec::new();
+        for (x, p) in r.shaders.iter().zip(programs) {
+            let bytes = p.container.clone().ok_or("listed container neither in the pack nor kept")?;
+            shaders.push(Shader::packed(x.stage, form(x.form), x.hash, bytes));
+        }
+        let dxil = shaders.iter().map(|s| s.translation().map(|t| t.host.dxil.clone()).map_err(String::clone)).collect();
+        crate::d3d12x::pipeline::LAST_FAILURE.with(|l| l.borrow_mut().clear());
+        let at = Instant::now();
+        let ok = HostPipeline::new(&shaders, r.graphics.as_ref()).is_some();
+        let create_ms = at.elapsed().as_secs_f64() * 1e3;
+        let why = crate::d3d12x::pipeline::LAST_FAILURE.with(|l| l.borrow().clone());
+        Ok(Made { dxil, create: if ok { Ok(()) } else { Err(if why.is_empty() { "refused (no reason noted)".into() } else { why }) }, create_ms })
+    }
 }
 
 /// The launch prebuild (`xnw run --execute`, before the title starts):

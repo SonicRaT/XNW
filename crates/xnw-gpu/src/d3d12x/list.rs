@@ -205,6 +205,13 @@ fn kept(list: &HostList, c: super::uikeep::Command) -> bool {
     k
 }
 
+/// [`kept`] for a plain draw; the instrument sees its target (uikeep.rs).
+fn kept_draw(list: &HostList, s: &super::draw::State) -> Option<super::uikeep::Drawing> {
+    let k = kept(list, Command::Draw);
+    s.ui_seen(k);
+    k.then(super::uikeep::Drawing::begin)
+}
+
 /// The host list behind a title list, if there is a host GPU.
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a HostList> {
     if this.is_null() {
@@ -309,6 +316,10 @@ extern "system" fn list_release(this: This) -> u32 {
     guard_check(this);
     match object::count_down(this) {
         Some(0) => {
+            // PASS1: a submission of it sent without a wait has run before its memory goes.
+            if let Some(host) = &ours(this).host {
+                host.settle();
+            }
             object::drop_private(this);
             let at = this.cast_mut().cast::<u8>();
             // SAFETY: the last reference: our part is dropped, then the
@@ -340,7 +351,12 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     if allocator.is_null() {
         return E_INVALIDARG;
     }
-    // Every submission of the list has run (submissions are waited for).
+    // Every submission of the list has run (submissions are waited for;
+    // PASS1: one sent without a wait is waited for here, before its upload
+    // memory and allocator are reused).
+    if let Some(host) = host_list(this) {
+        host.settle();
+    }
     let uploads = &ours(this).uploads;
     uploads.lock().unwrap_or_else(|e| e.into_inner()).clear();
     super::pipeline::bind(this, pipeline);
@@ -517,6 +533,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         return;
     };
     whole_for_write(list, dst);
+    super::uikeep::copy_seen(super::uikeep::keep_now(), dst as usize, src as usize);
     if super::resource::host_copy(src).is_some_and(|c| c.dropped > 0) {
         // A source without its top mips does not match the title's.
         super::resource::skipped_copy();
@@ -583,7 +600,9 @@ extern "system" fn copy_texture_region(this: This, dst: *const CopyLocation, x: 
     let (Some(list), Some(&dst), Some(&src)) = (host_list(this), unsafe { dst.as_ref() }, unsafe { src.as_ref() }) else {
         return;
     };
-    if !kept(list, Command::Copy) {
+    let k = kept(list, Command::Copy);
+    super::uikeep::copy_seen(k, dst.resource as usize, src.resource as usize);
+    if !k {
         return;
     }
     whole_for_write(list, dst.resource);
@@ -710,17 +729,32 @@ pub(crate) struct Rect {
 extern "system" fn clear_rtv(this: This, handle: u64, color: *const [f32; 4], count: u32, rects: *const Rect) {
     let _call = super::counters::call(super::counters::CLEAR_TARGET);
     let Some(list) = host_list(this) else { return };
-    if !kept(list, Command::Clear) {
+    let mut k = kept(list, Command::Clear);
+    if super::uikeep::on()
+        && let Some(record) = super::descriptor::rtv_record(handle)
+    {
+        if !k {
+            match super::uikeep::clear_admit(record.resource as usize) {
+                1 => {
+                    list.kept.store(true, Ordering::Relaxed);
+                    k = true;
+                }
+                // A whole clear of a UI-written texture waits for a kept
+                // draw into it in this frame (`clear_held`).
+                // SAFETY: the title passes four floats (null is tolerated).
+                2 if count == 0 => {
+                    if let Some(color) = unsafe { color.as_ref() } {
+                        super::uikeep::hold_clear(record.resource as usize, handle, *color);
+                    }
+                }
+                _ => {}
+            }
+        }
+        super::uikeep::clear_seen(k, record.resource as usize);
+    }
+    if !k {
         return;
     }
-    let Some(record) = super::descriptor::rtv_record(handle) else {
-        not_recorded("target clear of a view not recorded");
-        return;
-    };
-    let (Some(texture), Some(host)) = (super::resource::host_resource(record.resource), super::host::host()) else {
-        not_recorded("target clear of a texture without a host copy");
-        return;
-    };
     // SAFETY: the title passes four floats (null is tolerated).
     let Some(color) = (unsafe { color.as_ref() }) else {
         return;
@@ -729,6 +763,28 @@ extern "system" fn clear_rtv(this: This, handle: u64, color: *const [f32; 4], co
         // SAFETY: the title passes `count` rectangles, laid out as the host's.
         unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
     });
+    clear_target(list, handle, color, rects);
+}
+
+/// KEEP1: the clear held for the target of the kept draw being recorded
+/// (uikeep::held_clear) is done now, on the draw's list, before the draw.
+pub(crate) fn clear_held(list: &HostList) {
+    if let Some((target, handle, color)) = super::uikeep::held_clear() {
+        super::uikeep::clear_seen(true, target);
+        clear_target(list, handle, &color, None);
+    }
+}
+
+/// Records a target clear on `list`.
+fn clear_target(list: &HostList, handle: u64, color: &[f32; 4], rects: Option<&[windows::Win32::Foundation::RECT]>) {
+    let Some(record) = super::descriptor::rtv_record(handle) else {
+        not_recorded("target clear of a view not recorded");
+        return;
+    };
+    let (Some(texture), Some(host)) = (super::resource::host_resource(record.resource), super::host::host()) else {
+        not_recorded("target clear of a texture without a host copy");
+        return;
+    };
     const RENDER_TARGET: u32 = 0x4;
     let rtv = host.rtv(texture, record.desc().as_ref());
     ensure_state(list, record.resource, RENDER_TARGET);
@@ -1010,8 +1066,11 @@ mod state {
         let _call = super::super::counters::call(super::super::counters::DRAW);
         super::super::pipeline::used(this, "draw");
         with_state(this, |list, s| {
-            if super::kept(list, super::super::uikeep::Command::Draw) {
+            if let Some(_drawing) = super::kept_draw(list, s) {
                 s.draw(list, vertices, instances, first, first_instance)
+            } else {
+                // A test run: a draw ui=keep drops still feeds the recorder (our pass reads it).
+                s.tap(xnw_formats::framepack::op::DRAW, vertices, [instances, first, 0, first_instance]);
             }
         });
     }
@@ -1021,7 +1080,8 @@ mod state {
         with_state(this, |list, s| {
             s.tap_dispatch(x, y, z);
             if super::kept(list, super::super::uikeep::Command::Dispatch) {
-                s.dispatch(list, x, y, z)
+                s.dispatch(list, x, y, z);
+                super::super::uikeep::done();
             }
         });
     }
@@ -1036,8 +1096,11 @@ mod state {
             ONCE.call_once(|| xnw_core::warn!("d3d12x: a mesh dispatch with y or z groups ({x}, {y}, {z})"));
         }
         with_state(this, |list, s| {
-            if super::kept(list, super::super::uikeep::Command::Draw) {
+            if super::kept(list, super::super::uikeep::Command::Mesh) {
                 s.dispatch_mesh(list, x, false)
+            } else {
+                // A test run: no ped drawn under ui=keep (PreSkinD sinks 0): the dropped mesh draw never reached the tap.
+                s.tap(xnw_formats::framepack::op::MESH, x, [0; 4]);
             }
         });
     }
@@ -1049,15 +1112,20 @@ mod state {
         super::super::pipeline::note_mesh_draw();
         if indirect != 0 {
             with_state(this, |list, s| {
-                if super::kept(list, super::super::uikeep::Command::Indirect) {
+                if super::kept(list, super::super::uikeep::Command::Mesh) {
                     s.dispatch_mesh_x_indirect(list, indirect)
+                } else {
+                    s.tap(xnw_formats::framepack::op::MESH_X, 0, [0; 4]);
                 }
             });
             return;
         }
         with_state(this, |list, s| {
-            if super::kept(list, super::super::uikeep::Command::Draw) {
+            if super::kept(list, super::super::uikeep::Command::Mesh) {
                 s.dispatch_mesh(list, x, false)
+            } else {
+                // A test run: no ped drawn under ui=keep (PreSkinD sinks 0): the dropped mesh draw never reached the tap.
+                s.tap(xnw_formats::framepack::op::MESH, x, [0; 4]);
             }
         });
     }
@@ -1066,8 +1134,10 @@ mod state {
         let _call = super::super::counters::call(super::super::counters::DRAW_INDEXED);
         super::super::pipeline::used(this, "draw");
         with_state(this, |list, s| {
-            if super::kept(list, super::super::uikeep::Command::Draw) {
+            if let Some(_drawing) = super::kept_draw(list, s) {
                 s.draw_indexed(list, indices, instances, first, base, first_instance)
+            } else {
+                s.tap(xnw_formats::framepack::op::INDEXED, indices, [instances, first, base as u32, first_instance]);
             }
         });
     }
@@ -1103,12 +1173,24 @@ extern "system" fn execute_indirect(this: This, signature: This, max: u32, argum
             // The arguments as the title gave them (bytes read at report time).
             let bytes = match kind { 0 => 16, 1 => 20, _ => 12 };
             list.crumbs().note_args(
-                format!("execute indirect: kind {kind}, stride {stride}, max {max}, title arguments at {address:#x} (resource {:#x} + {offset:#x}), count {}", arguments as usize, counter.map_or("none".into(), |c| format!("at {c:#x} (resource {:#x} + {count_offset:#x})", count as usize))),
+                || format!("execute indirect: kind {kind}, stride {stride}, max {max}, title arguments at {address:#x} (resource {:#x} + {offset:#x}), count {}", arguments as usize, counter.map_or("none".into(), |c| format!("at {c:#x} (resource {:#x} + {count_offset:#x})", count as usize))),
                 address,
                 bytes,
             );
             // A dropped one counts as run (it is not "dropped" for want of support).
-            ran = !kept(list, Command::Indirect) || s.execute_indirect(list, (kind, stride, max), address, counter);
+            ran = if kept(list, Command::Indirect) {
+                s.execute_indirect(list, (kind, stride, max), address, counter)
+            } else {
+                // A test run: an indirect ui=keep drops still feeds the recorder, as execute_indirect does first.
+                let op = match kind {
+                    10 => xnw_formats::framepack::op::INDIRECT_MESH,
+                    2 => xnw_formats::framepack::op::INDIRECT_DISPATCH,
+                    _ => xnw_formats::framepack::op::INDIRECT,
+                };
+                let args = if kind == 2 { [address as u32, (address >> 32) as u32, stride, 0] } else { [0; 4] };
+                s.tap(op, max, args);
+                true
+            };
         });
     }
     if ran {
